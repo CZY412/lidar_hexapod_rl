@@ -285,12 +285,9 @@ class ElSpiderRayCast(LeggedRobotDepth):
         sync_reward = (sync_group1 + sync_group2) / 2
         
         re = sync_reward + async_reward
-        if self.cfg.commands.heading_command:
-            re = re * torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
-                                    torch.abs(self.commands[:, 3]) >= self.speed_min/ 2)
-        else:
-            re = re * torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
-                                    torch.abs(self.commands[:, 2]) >= self.speed_min/ 2)
+
+        re = re * torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
+                                torch.abs(self.commands[:, 2]) >= self.speed_min/ 2)
         return re
     
     def check_termination(self):
@@ -301,3 +298,13 @@ class ElSpiderRayCast(LeggedRobotDepth):
         # Add new termination condition - terminate if robot is upside down (z-component of projected gravity > 0)
         self.reset_buf |= (self.projected_gravity[:, 2] > 0) # Robot is upside down
         # self.reset_buf |= (self.base_lin_vel[:, 2] < -2.0)   # Fall off the terrain out of border
+
+    def _reward_shank_perp2ground(self):
+        if not hasattr(self, 'hfe_indices'):
+            self.hfe_indices = [self.dof_names.index(name) for name in [
+                'RF_HFE', 'RM_HFE', 'RB_HFE', 'LF_HFE', 'LM_HFE', 'LB_HFE']]
+        if not hasattr(self, 'kfe_indices'):
+            self.kfe_indices = [self.dof_names.index(name) for name in [
+                'RF_KFE', 'RM_KFE', 'RB_KFE', 'LF_KFE', 'LM_KFE', 'LB_KFE']]
+        return torch.square(self.dof_pos[:, self.hfe_indices] - self.dof_pos[:, self.kfe_indices]).sum(dim=1)
+       

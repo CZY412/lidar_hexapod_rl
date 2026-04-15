@@ -71,11 +71,14 @@ from .cassie.cassie_traj_grad_sampling import CassieTrajGradSampling
 from .cassie.cassie_traj_grad_sampling_config import CassieTrajGradSamplingCfg, CassieTrajGradSamplingCfgPPO
 from .a1.a1_config import A1RoughCfg, A1RoughCfgPPO
 
-from .elspider_air.elspider import ElSpider, PoseElSpider, FootTrackElSpider
+from .elspider_air.elspider import ElSpider, ElSpiderStudent
+from .elspider_air.elspider_tasks import PoseElSpider, FootTrackElSpider
 from .elspider_air.mixed_terrains.elspider_air_rough_config import ElSpiderAirRoughCfg, ElSpiderAirRoughCfgPPO
-from .elspider_air.mixed_terrains.elspider_air_rough_train_config import ElSpiderAirRoughTrainCfg, ElSpiderAirRoughTrainCfgPPO
+from .elspider_air.mixed_terrains.elspider_air_rough_train_config import ElSpiderAirRoughStage0Cfg, ElSpiderAirRoughStage1Cfg, ElSpiderAirRoughTrainCfg, ElSpiderAirRoughTrainCfgPPO
+# from .elspider_air.mixed_terrains.elspider_air_rough_train2_config import ElSpiderAirRoughTrain2Cfg, ElSpiderAirRoughTrain2CfgPPO
 from .elspider_air.mixed_terrains.elspider_air_rough_raycast_config import ElSpiderAirRoughRaycastCfg, ElSpiderAirRoughRaycastCfgPPO
-from .elspider_air.flat.elspider_air_flat_config import ElSpiderAirFlatCfg, ElSpiderAirFlatCfgPPO
+from .elspider_air.mixed_terrains.elspider_air_rough_student_config import ElSpiderAirRoughStudentCfg, ElSpiderAirRoughStudentCfgPPO
+from .elspider_air.flat.elspider_air_flat_config import ElSpiderAirFlatCfg, ElSpiderAirSlightRoughCfg, ElSpiderAirFlatCfgPPO
 from .elspider_air.flat.pose_elspider_air_flat_config import PoseElSpiderAirFlatCfg, PoseElSpiderAirFlatCfgPPO
 from .elspider_air.flat.foot_track_elspider_air_flat_config import FootTrackElSpiderAirFlatCfg, FootTrackElSpiderAirFlatCfgPPO
 from .elspider_air.flat.foot_track_elspider_air_hang_config import FootTrackElSpiderAirHangCfg, FootTrackElSpiderAirHangCfgPPO
@@ -105,6 +108,7 @@ from .elspider_air.elspider_lidar_confined_config import (
     ElSpiderLidarConfinedSimpleCfg, ElSpiderLidarConfinedSimpleCfgPPO,
     ElSpiderLidarTimberPileCfg, ElSpiderLidarTimberPileCfgPPO,
     ElSpiderLidarTunnelCfg, ElSpiderLidarTunnelCfgPPO,
+    ElSpiderLidarCaveCfg, ElSpiderLidarCaveCfgPPO,
     ElSpiderLidarPoseAdaptSameDimCfg, ElSpiderLidarPoseAdaptSameDimCfgPPO,
     ElSpiderLidarFlatSkillSameDimCfg, ElSpiderLidarFlatSkillSameDimCfgPPO,
     ElSpiderLidarMixedTerrainSameDimCfg, ElSpiderLidarMixedTerrainSameDimCfgPPO,
@@ -170,9 +174,12 @@ task_registry.register("cassie_traj_grad_sampling", CassieTrajGradSampling,
 
 
 task_registry.register("elspider_air_rough", ElSpider, ElSpiderAirRoughTrainCfg(), ElSpiderAirRoughTrainCfgPPO())
+task_registry.register("elspider_air_rough_multi_stage0", ElSpider, ElSpiderAirRoughStage0Cfg(), ElSpiderAirRoughTrainCfgPPO())
+task_registry.register("elspider_air_rough_multi_stage1", ElSpider, ElSpiderAirRoughStage1Cfg(), ElSpiderAirRoughTrainCfgPPO())
 task_registry.register("elspider_air_rough_raycast", ElSpiderRayCast,
                        ElSpiderAirRoughRaycastCfg(), ElSpiderAirRoughRaycastCfgPPO())
 task_registry.register("elspider_air_flat", ElSpider, ElSpiderAirFlatCfg(), ElSpiderAirFlatCfgPPO())
+task_registry.register("elspider_air_slight_rough", ElSpider, ElSpiderAirSlightRoughCfg(), ElSpiderAirFlatCfgPPO())
 task_registry.register("pose_elspider_air_flat", PoseElSpider, PoseElSpiderAirFlatCfg(), PoseElSpiderAirFlatCfgPPO())
 task_registry.register("foot_track_elspider_air_flat", FootTrackElSpider,
                        FootTrackElSpiderAirFlatCfg(), FootTrackElSpiderAirFlatCfgPPO())
@@ -213,6 +220,7 @@ task_registry.register("cyber2_walk", CyberWalkEnv, CyberWalkConfig(), CyberWalk
 # Register teacher-student tasks
 task_registry.register("anymal_c_rough_teacher", Anymal, AnymalCRoughTeacherCfg(), AnymalCRoughTeacherCfgPPO())
 task_registry.register("anymal_c_rough_student", AnymalStudent, AnymalCRoughStudentCfg(), AnymalCRoughStudentCfgPPO())
+task_registry.register("elspider_air_rough_student", ElSpiderStudent, ElSpiderAirRoughStudentCfg(), ElSpiderAirRoughStudentCfgPPO())
 
 # Register franka environments
 task_registry.register("franka", Franka, FrankaCfg(), FrankaCfgPPO())
@@ -227,6 +235,8 @@ task_registry.register("elspider_lidar_timber_pile", ElSpiderLidar,
                        ElSpiderLidarTimberPileCfg(), ElSpiderLidarTimberPileCfgPPO())
 task_registry.register("elspider_lidar_tunnel", ElSpiderLidar,
                        ElSpiderLidarTunnelCfg(), ElSpiderLidarTunnelCfgPPO())
+task_registry.register("elspider_lidar_cave", ElSpiderLidar,
+                       ElSpiderLidarCaveCfg(), ElSpiderLidarCaveCfgPPO())
 task_registry.register("elspider_lidar_pose_adapt_same_dim", ElSpiderLidar,
                        ElSpiderLidarPoseAdaptSameDimCfg(), ElSpiderLidarPoseAdaptSameDimCfgPPO())
 task_registry.register("elspider_lidar_flat_same_dim", ElSpiderLidar,

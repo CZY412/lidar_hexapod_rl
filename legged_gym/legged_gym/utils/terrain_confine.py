@@ -364,8 +364,8 @@ def timber_piles_terrain(terrain_ground, terrain_ceiling, timber_spacing=1.0, ti
                 hanging_height = pile_height_units + int(0.3 / terrain_ceiling.vertical_scale)
                 terrain_ceiling.ceiling_height_field_raw[pile_x1:pile_x2, pile_y1:pile_y2] = hanging_height
 
-    # Create raised platform for spawn area
-    platform_height = pile_height_units
+    # Create flat platform for spawn area
+    platform_height = 0 if spawn_platform_height is None else int(spawn_platform_height / terrain_ground.vertical_scale)
     terrain_ground.ground_height_field_raw[spawn_x1:spawn_x2, spawn_y1:spawn_y2] = platform_height
     terrain_ceiling.ceiling_height_field_raw[spawn_x1:spawn_x2, spawn_y1:spawn_y2] = int(3.0 / terrain_ceiling.vertical_scale)
 
@@ -1034,6 +1034,7 @@ class TerrainConfined:
         density = 0.06 + 0.08 * difficulty          # Fewer columns overall while keeping some variation
 
         # Optional task-level overrides for sparse, passable pillar fields.
+        timber_spacing_override = getattr(self.cfg, 'timber_spacing_override', None)
         column_spacing_override = getattr(self.cfg, 'column_spacing_override', None)
         column_density_override = getattr(self.cfg, 'column_density_override', None)
         column_radius_override = getattr(self.cfg, 'column_radius_override', None)
@@ -1045,6 +1046,8 @@ class TerrainConfined:
 
         if column_spacing_override is not None:
             column_spacing = float(column_spacing_override)
+        if timber_spacing_override is not None:
+            timber_spacing = float(timber_spacing_override)
         if column_density_override is not None:
             density = float(column_density_override)
         if column_radius_override is not None:
