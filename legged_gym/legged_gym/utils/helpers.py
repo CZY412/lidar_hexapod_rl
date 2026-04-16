@@ -119,7 +119,10 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
     if load_run == -1:
         load_run = last_run
     else:
-        load_run = os.path.join(root, load_run)
+        if os.path.isabs(load_run) or os.path.isdir(load_run):
+            load_run = load_run
+        else:
+            load_run = os.path.join(root, load_run)
 
     if checkpoint == -1:
         models = [file for file in os.listdir(load_run) if 'model' in file]
@@ -304,10 +307,16 @@ def export_policy_as_jit(actor_critic, path):
         # assumes LSTM: TODO add GRU
         exporter = PolicyExporterLSTM(actor_critic)
         exporter.export(path)
-    else:
+    elif hasattr(actor_critic, 'actor'):
         os.makedirs(path, exist_ok=True)
         path = os.path.join(path, 'policy_1.pt')
         model = copy.deepcopy(actor_critic.actor).to('cpu')
+        traced_script_module = torch.jit.script(model)
+        traced_script_module.save(path)
+    elif hasattr(actor_critic, 'student'):
+        os.makedirs(path, exist_ok=True)
+        path = os.path.join(path, 'policy_1.pt')
+        model = copy.deepcopy(actor_critic.student).to('cpu')
         traced_script_module = torch.jit.script(model)
         traced_script_module.save(path)
 

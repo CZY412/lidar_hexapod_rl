@@ -150,6 +150,7 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
         self.last_root_vel[:] = self.root_states[:, 7:13]
 
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
+            print("Debug visualization enabled, drawing debug visuals")
             self._draw_debug_vis()
 
     def check_termination(self):
@@ -435,7 +436,7 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
                 self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
 
         # set small commands to zero
-        self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
+        # self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > self.speed_min).unsqueeze(1)
 
     def _compute_torques(self, actions):
         """ Compute torques from actions.
@@ -685,8 +686,14 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
             self.reward_functions.append(getattr(self, name))
 
         # reward episode sums
-        self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-                             for name in self.reward_scales.keys()}
+        if self.init_done:
+            # This means we are adjusting reward scales & functions during training
+            for name in self.reward_scales.keys():
+                if name not in self.episode_sums:
+                    self.episode_sums[name] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        else:
+            self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+                                for name in self.reward_scales.keys()}
 
     def _create_ground_plane(self):
         """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
