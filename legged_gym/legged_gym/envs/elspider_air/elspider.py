@@ -47,6 +47,7 @@ from legged_gym.utils import GaitScheduler, GaitSchedulerCfg, AsyncGaitScheduler
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.math_utils import quat_apply_yaw
 from legged_gym.utils.gym_visualizer import GymVisualizer
+from legged_gym.utils.gym_visualizer import GymVisualizer
 
 @torch.no_grad()
 def get_elair_xysym_obs_act(obs: torch.Tensor = None, actions: torch.Tensor = None, env = None, obs_type: str = "policy") -> Tuple[torch.Tensor, torch.Tensor]:
@@ -358,6 +359,9 @@ class ElSpider(LeggedRobot):
         
         self.create_viewer()
 
+        
+        self.create_viewer()
+
 
     def _draw_debug_vis(self):
         # draw base vel
@@ -434,6 +438,12 @@ class ElSpider(LeggedRobot):
         """ Check if environments need to be reset
         """
         super().check_termination()
+        
+        # Get protection steps (grace period during early training)
+        if hasattr(self.cfg.rewards, 'allow_initial_contact_steps'):
+            min_steps = self.cfg.rewards.allow_initial_contact_steps
+        else:
+            min_steps = 5  # Default: 5 steps grace period
         
         # Get protection steps (grace period during early training)
         if hasattr(self.cfg.rewards, 'allow_initial_contact_steps'):
