@@ -36,8 +36,27 @@ class ElSpiderAirFlatCfg(ElSpiderAirRoughCfg):
         num_observations = 66
 
     class terrain(ElSpiderAirRoughCfg.terrain):
-        mesh_type = 'plane'
+        mesh_type = 'plane'  # "heightfield" # none, plane, heightfield or trimesh
+        horizontal_scale = 0.05  # [m]
+        vertical_scale = 0.005  # [m]
+        border_size = 10  # [m]
+        curriculum = False
+        static_friction = 1.0
+        dynamic_friction = 1.0
+        restitution = 0.
         measure_heights = False
+        selected = False  # select a unique terrain type and pass all arguments
+        terrain_kwargs = None  # Dict of arguments for selected terrain
+        terrain_length = 5.
+        terrain_width = 5.
+        num_rows = 8  # number of terrain rows (levels)
+        num_cols = 8  # number of terrain cols (types)
+        # terrain types: [smooth slope, rough slope, stairs up, stairs down, discrete]
+        terrain_proportions = [0.0, 0.0, 0.0, 0.0, 1.0]
+        difficulty_scale = 0.0
+        # trimesh only:
+        slope_treshold = 0.75  # slopes above this threshold will be corrected to vertical surfaces
+
 
     class asset(ElSpiderAirRoughCfg.asset):
         self_collisions = 0  # 1 to disable, 0 to enable...bitwise filter
@@ -66,12 +85,12 @@ class ElSpiderAirFlatCfg(ElSpiderAirRoughCfg):
             "LM_HAA": 0.0,
             "LB_HAA": 0.0,
 
-            "RF_HFE": 0.3,
-            "RM_HFE": 0.3,
-            "RB_HFE": 0.3,
-            "LF_HFE": 0.3,
-            "LM_HFE": 0.3,
-            "LB_HFE": 0.3,
+            "RF_HFE": 0.2,
+            "RM_HFE": 0.2,
+            "RB_HFE": 0.2,
+            "LF_HFE": 0.2,
+            "LM_HFE": 0.2,
+            "LB_HFE": 0.2,
 
             "RF_KFE": 0.3,
             "RM_KFE": 0.3,
@@ -81,16 +100,16 @@ class ElSpiderAirFlatCfg(ElSpiderAirRoughCfg):
             "LB_KFE": 0.3,
         }
 
-    ## Rewards V1 (normal dof_acc)
+    ## Rewards V2 (faster&smoother gait, zzl-style)
     class rewards(ElSpiderAirRoughCfg.rewards):
         max_contact_force = 500.
-        base_height_target = 0.28
+        base_height_target = 0.24
         only_positive_rewards = False
         # Multi-stage
         # Stage 0: Learn to walk with tripod gait (with / w\o actuator net)
         # Stage 1: Correct DOF and FootZ positions / Prevent Slip
         multi_stage_rewards = True  # if true, reward scales should be list
-        reward_stage_threshold = 6.0
+        reward_stage_threshold = 2.0
         reward_min_stage = 0  # Start from 0
         reward_max_stage = 1
 
@@ -98,25 +117,68 @@ class ElSpiderAirFlatCfg(ElSpiderAirRoughCfg):
             termination = -0.0
             tracking_lin_vel = 1.0
             tracking_ang_vel = 0.5
-            lin_vel_z = -2.0
-            ang_vel_xy = -0.05
-            orientation = [-5.0, -5.0]
+            lin_vel_z = -3.0
+            ang_vel_xy = -0.2
+            orientation = [-5.0, -3.0]
             torques = -0.0001
-            dof_vel = [-0.0002, -0.001]
-            dof_acc = [-5e-8, -2.5e-7]
-            base_height = [-4.0, -1.0]
+            dof_vel = [-0.0002, -0.0004]
+            dof_acc = [-5e-8, -1.5e-7]
+            base_height = [-2.0, -0.4]
             feet_slip = [-0.0, -0.2]  # Before feet_air_time
-            feet_air_time = [1.0, 0.5]
+            feet_air_time = [0.5, 0.1]
             collision = -1.
-            feet_stumble = -0.0
-            action_rate = [-0.005, -0.01]
-            stand_still = -0.4  # May affect spot turning
+            feet_stumble = [-0.0, -0.2]
+            action_rate = [-0.005, -0.005]
+            stand_still2 = -0.6  # May affect spot turning
             dof_pos_limits = -1.0
-            feet_contact_forces = [-0.05, -0.1]
+            feet_contact_forces = [-0.2, -0.5]
             
             # gait_scheduler = -18.0
-            # async_gait_scheduler = -0.4
-            gait_2_step = [-3.0, -0.0]
+            # async_gait_scheduler = -0.2  # Shanks to be perpendicular to the ground
+            shank_perp2ground = -0.05
+            gait_2_step = [-1.0, -0.0]
+            # gait_3_step = [-3.0, -3.0]
+
+        class async_gait_scheduler:
+            # Reward for the Shanks to be perpendicular to the ground
+            dof_align = 1.0
+            dof_nominal_pos = 0.0
+            reward_foot_z_align = 0.0
+
+    # ## Rewards V1 (normal dof_acc)
+    # class rewards(ElSpiderAirRoughCfg.rewards):
+    #     max_contact_force = 500.
+    #     base_height_target = 0.28
+    #     only_positive_rewards = False
+    #     # Multi-stage
+    #     # Stage 0: Learn to walk with tripod gait (with / w\o actuator net)
+    #     # Stage 1: Correct DOF and FootZ positions / Prevent Slip
+    #     multi_stage_rewards = True  # if true, reward scales should be list
+    #     reward_stage_threshold = 6.0
+    #     reward_min_stage = 0  # Start from 0
+    #     reward_max_stage = 1
+
+    #     class scales:
+    #         termination = -0.0
+    #         tracking_lin_vel = 1.0
+    #         tracking_ang_vel = 0.5
+    #         lin_vel_z = -2.0
+    #         ang_vel_xy = -0.05
+    #         orientation = [-5.0, -5.0]
+    #         torques = -0.0001
+    #         dof_vel = [-0.0002, -0.001]
+    #         dof_acc = [-5e-8, -2.5e-7]
+    #         base_height = [-4.0, -1.0]
+    #         feet_slip = [-0.0, -0.2]  # Before feet_air_time
+    #         feet_air_time = [1.0, 0.5]
+    #         collision = -1.
+    #         feet_stumble = -0.0
+    #         action_rate = [-0.005, -0.01]
+    #         stand_still = -0.4  # May affect spot turning
+    #         dof_pos_limits = -1.0
+    #         feet_contact_forces = [-0.05, -0.1]
+    #         gait_2_step = [-3.0, -0.0]
+    #         # gait_3_step = [-3.0, -3.0]
 
     ## Rewards V0 (small dof_acc)
     # class rewards(ElSpiderAirRoughCfg.rewards):
@@ -164,7 +226,7 @@ class ElSpiderAirFlatCfg(ElSpiderAirRoughCfg):
 
     class commands(ElSpiderAirRoughCfg.commands):
         curriculum = True
-        max_curriculum = 1.5
+        max_curriculum = 1.7
         # default: lin_vel_x, lin_vel_y, ang_vel_yaw, heading (in heading mode ang_vel_yaw is recomputed from heading error)
         num_commands = 4
         resampling_time = 4.  # time before command are changed[s]
@@ -172,8 +234,8 @@ class ElSpiderAirFlatCfg(ElSpiderAirRoughCfg):
 
         class ranges(ElSpiderAirRoughCfg.commands.ranges):
             lin_vel_x = [-0.5, 0.5]  # min max [m/s]
-            lin_vel_y = [-0.8, 0.8]   # min max [m/s]
-            ang_vel_yaw = [-1.0, 1.0]    # min max [rad/s]
+            lin_vel_y = [-1.0, 1.0]   # min max [m/s]
+            ang_vel_yaw = [-1.5, 1.5]    # min max [rad/s]
             heading = [-3.14, 3.14]
 
     class domain_rand(ElSpiderAirRoughCfg.domain_rand):
@@ -197,6 +259,23 @@ class ElSpiderAirFlatCfg(ElSpiderAirRoughCfg):
             ang_vel = 0.2
             gravity = 0.05
             height_measurements = 0.1
+
+class ElSpiderAirSlightRoughCfg(ElSpiderAirFlatCfg):
+    class terrain(ElSpiderAirFlatCfg.terrain):
+        mesh_type = 'trimesh'  # "heightfield" # none, plane, heightfield or trimesh
+
+    class rewards(ElSpiderAirFlatCfg.rewards):
+        reward_stage_threshold = 1.0
+        reward_min_stage = 1  # Start from 1
+
+        class scales(ElSpiderAirFlatCfg.rewards.scales):
+            haa_nominal_pos = -0.4
+
+    class commands(ElSpiderAirFlatCfg.commands):
+        max_curriculum = 1.7
+        class ranges(ElSpiderAirFlatCfg.commands.ranges):
+            lin_vel_x = [-1.5, 1.5]  # min max [m/s]
+
 
 class ElSpiderAirFlatCfgPPO(ElSpiderAirRoughCfgPPO):
     class policy(ElSpiderAirRoughCfgPPO.policy):

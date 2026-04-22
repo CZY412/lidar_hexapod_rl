@@ -46,6 +46,8 @@ from legged_gym.utils import GaitScheduler, GaitSchedulerCfg, AsyncGaitScheduler
     SimpleRaibertPlannerConfig, SimpleRaibertPlanner, RaibertPlanner, RaibertPlannerConfig
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.math_utils import quat_apply_yaw
+from legged_gym.utils.gym_visualizer import GymVisualizer
+from legged_gym.utils.gym_visualizer import GymVisualizer
 
 @torch.no_grad()
 def get_elair_xysym_obs_act(obs: torch.Tensor = None, actions: torch.Tensor = None, env = None, obs_type: str = "policy") -> Tuple[torch.Tensor, torch.Tensor]:
@@ -335,6 +337,13 @@ class ElSpider(LeggedRobot):
                                             cfg)
 
         cfg = AsyncGaitSchedulerCfg()
+        # Make sure shanks are perpendicular to the ground
+        cfg.dof_align_sets = [['RF_HFE', 'RF_KFE'],
+                    ['RM_HFE', 'RM_KFE'],
+                    ['RB_HFE', 'RB_KFE'],
+                    ['LF_HFE', 'LF_KFE'],
+                    ['LM_HFE', 'LM_KFE'],
+                    ['LB_HFE', 'LB_KFE'],]
         self.async_gait_scheduler = AsyncGaitScheduler(self.height_samples,
                                                        self.base_quat,
                                                        self.base_lin_vel,
@@ -347,6 +356,12 @@ class ElSpider(LeggedRobot):
                                                        self.num_envs,
                                                        self.device,
                                                        cfg)
+        
+        self.create_viewer()
+
+        
+        self.create_viewer()
+
 
     def _draw_debug_vis(self):
         # draw base vel
@@ -424,9 +439,47 @@ class ElSpider(LeggedRobot):
         """
         super().check_termination()
         
+        # Get protection steps (grace period during early training)
+        if hasattr(self.cfg.rewards, 'allow_initial_contact_steps'):
+            min_steps = self.cfg.rewards.allow_initial_contact_steps
+        else:
+            min_steps = 5  # Default: 5 steps grace period
+        
+        # Get protection steps (grace period during early training)
+        if hasattr(self.cfg.rewards, 'allow_initial_contact_steps'):
+            min_steps = self.cfg.rewards.allow_initial_contact_steps
+        else:
+            min_steps = 5  # Default: 5 steps grace period
+        
         # Add new termination condition - terminate if robot is upside down (z-component of projected gravity > 0)
-        self.reset_buf |= (self.projected_gravity[:, 2] > 0)
+        # Only check after grace period to avoid early termination due to initialization
+        upside_down = self.projected_gravity[:, 2] > 0
+        upside_down_termination = upside_down & (self.episode_length_buf > min_steps)
+        self.reset_buf |= upside_down_termination
 
+    def _update_terrain_curriculum(self, env_ids):
+        """ Implements the game-inspired curriculum.
+
+        Args:
+            env_ids (List[int]): ids of environments being reset
+        """
+        # Implement Terrain curriculum
+        if not self.init_done:
+            # don't change on initial reset
+            return
+        distance = torch.norm(self.root_states[env_ids, :2] - self.env_origins[env_ids, :2], dim=1)
+        # robots that walked far enough progress to harder terains
+        move_up = distance > self.terrain.env_length * 0.6
+        # robots that walked less than half of their required distance go to simpler terrains
+        move_down = (distance < torch.norm(self.commands[env_ids, :2], dim=1)*self.max_episode_length_s*0.5) * ~move_up
+        self.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
+        # Robots that solve the last level are sent to a random one
+        self.terrain_levels[env_ids] = torch.where(self.terrain_levels[env_ids] >= self.max_terrain_level,
+                                                   torch.randint_like(self.terrain_levels[env_ids], self.max_terrain_level),
+                                                   torch.clip(self.terrain_levels[env_ids], 0))  # (the minumum level is zero)
+        self.env_origins[env_ids] = self.terrain_origins[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
+
+    # Rewards
     def _reward_gait_scheduler(self):
         # Reward for tracking the gait scheduler
         return self.gait_scheduler.reward_foot_z_track()
@@ -492,12 +545,8 @@ class ElSpider(LeggedRobot):
         sync_all_reward = sum(sync_all_pairs) / len(sync_all_pairs)
         
         # Determine command magnitude
-        if self.cfg.commands.heading_command:
-            command_magnitude = torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
-                                               torch.abs(self.commands[:, 3]) >= self.speed_min / 2)
-        else:
-            command_magnitude = torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
-                                               torch.abs(self.commands[:, 2]) > self.speed_min)
+        command_magnitude = torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
+                                            torch.abs(self.commands[:, 2]) > self.speed_min)
         
         # Use gait reward for large commands, sync all legs reward for small commands
         re = torch.where(command_magnitude, 
@@ -506,281 +555,91 @@ class ElSpider(LeggedRobot):
         
         return re
     
-class LoadAdaptElSpider(ElSpider):
-    def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
-        super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
+    def _reward_gait_3_step(self):
+        # Foot index (alphabet): 0 LB, 1 LF, 2 LM, 3 RB, 4 RF, 5 RM
+        # Hexapod 3-step gait: first group (1-4) synchronized, second group (2-5) synchronized, third group (0-3) synchronized
+        # The three groups are asynchronized with each other
+        
+        # First group internal synchronization rewards (1-4): LF, RF
+        sync_group1 = self._sync_reward_func(1, 4)
+        
+        # Second group internal synchronization rewards (2-5): LM, RM
+        sync_group2 = self._sync_reward_func(2, 5)
+        
+        # Third group internal synchronization rewards (0-3): LB, RB
+        sync_group3 = self._sync_reward_func(0, 3)
+        
+        # Asynchronization rewards between group 1 and group 2
+        async_lf_lm = self._async_reward_func(1, 2)
+        async_lf_rm = self._async_reward_func(1, 5)
+        async_rf_lm = self._async_reward_func(4, 2)
+        async_rf_rm = self._async_reward_func(4, 5)
+        async_group1_group2 = (async_lf_lm + async_lf_rm + async_rf_lm + async_rf_rm) / 4
+        
+        # Asynchronization rewards between group 1 and group 3
+        async_lf_lb = self._async_reward_func(1, 0)
+        async_lf_rb = self._async_reward_func(1, 3)
+        async_rf_lb = self._async_reward_func(4, 0)
+        async_rf_rb = self._async_reward_func(4, 3)
+        async_group1_group3 = (async_lf_lb + async_lf_rb + async_rf_lb + async_rf_rb) / 4
+        
+        # Asynchronization rewards between group 2 and group 3
+        async_lm_lb = self._async_reward_func(2, 0)
+        async_lm_rb = self._async_reward_func(2, 3)
+        async_rm_lb = self._async_reward_func(5, 0)
+        async_rm_rb = self._async_reward_func(5, 3)
+        async_group2_group3 = (async_lm_lb + async_lm_rb + async_rm_lb + async_rm_rb) / 4
+        
+        # Calculate average asynchronization reward across all group pairs
+        async_reward = (async_group1_group2 + async_group1_group3 + async_group2_group3) / 3
+        async_reward *= 0.0 # 3-step gait does not require strong asynchronization
 
-    def _draw_debug_vis(self):
-        # draw base vel
-        self.gym.clear_lines(self.viewer)
-        lin_vel = self.root_states[:, 7:10].cpu().numpy()
-        lin_acc = quat_rotate(self.base_quat[:], self.base_lin_acc).cpu().numpy()
-        z_base = quat_rotate(self.base_quat[:], self.gravity_vec).cpu().numpy()
-        for i in range(self.num_envs):
-            base_pos = self.root_states[i, :3].cpu().numpy()
-            self.vis.draw_arrow(i, base_pos, base_pos + lin_vel[i], color=(0, 1, 0))
-            acc_tot = lin_acc[i] + np.array([0, 0, 9.8])
-            self.vis.draw_arrow(i, base_pos, base_pos + acc_tot/np.linalg.norm(acc_tot)*2, color=(1, 1, 0))
-            self.vis.draw_arrow(i, base_pos, base_pos - z_base[i]/np.linalg.norm(z_base[i])*2, color=(0, 1, 1))
-        return super()._draw_debug_vis()
+        # Calculate total synchronization reward
+        sync_reward = (sync_group1 + sync_group2 + sync_group3) / 3
+        
+        # Calculate sync all legs reward for small commands (standing still)
+        sync_all_pairs = [
+            sync_group1, sync_group2, sync_group3,  # Within-group sync
+            self._sync_reward_func(1, 2), self._sync_reward_func(1, 5),  # Group 1 with group 2
+            self._sync_reward_func(4, 2), self._sync_reward_func(4, 5),
+            self._sync_reward_func(1, 0), self._sync_reward_func(1, 3),  # Group 1 with group 3
+            self._sync_reward_func(4, 0), self._sync_reward_func(4, 3),
+            self._sync_reward_func(2, 0), self._sync_reward_func(2, 3),  # Group 2 with group 3
+            self._sync_reward_func(5, 0), self._sync_reward_func(5, 3)
+        ]
+        sync_all_reward = sum(sync_all_pairs) / len(sync_all_pairs)
+        
+        # Determine command magnitude
+        command_magnitude = torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
+                                            torch.abs(self.commands[:, 2]) > self.speed_min)
+        
+        # Use gait reward for large commands, sync all legs reward for small commands
+        re = torch.where(command_magnitude, 
+                        sync_reward + async_reward,  # 3-step gait for movement
+                        sync_all_reward)             # sync all legs for standing still
+        
+        return re
+    
+    def _reward_shank_perp2ground(self):
+        if not hasattr(self, 'hfe_indices'):
+            self.hfe_indices = [self.dof_names.index(name) for name in [
+                'RF_HFE', 'RM_HFE', 'RB_HFE', 'LF_HFE', 'LM_HFE', 'LB_HFE']]
+        if not hasattr(self, 'kfe_indices'):
+            self.kfe_indices = [self.dof_names.index(name) for name in [
+                'RF_KFE', 'RM_KFE', 'RB_KFE', 'LF_KFE', 'LM_KFE', 'LB_KFE']]
+        return torch.square(self.dof_pos[:, self.hfe_indices] - self.dof_pos[:, self.kfe_indices]).sum(dim=1)
 
-    # Rewards
-    def _reward_ang_vel_xy(self):
-        # Penalize xy axes base angular velocity
-        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
-
-    def _reward_orientation(self):
-        # Stable orientation reward
-        # Penalize base orientation perpendicular to acc+gravity
-        return torch.sum(torch.square(self.projected_gravity[:, :2] - self.base_lin_acc[:, :2]/9.81), dim=1)
-
-    # def _reward_orientation(self):
-    #     # Velocity orientation reward
-    #     return torch.sum(torch.square(self.projected_gravity[:, :2] - self.base_lin_vel[:, :2]*0.6), dim=1)
-
-
-class PoseElSpider(ElSpider):
-    def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
-        super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
-
-    def compute_observations(self):
-        """ Computes observations
-        """
-        self.obs_buf = torch.cat((self.base_lin_vel * self.obs_scales.lin_vel,
-                                  self.base_ang_vel * self.obs_scales.ang_vel,
-                                  self.projected_gravity,
-                                  self.commands[:, :3] * self.commands_scale,
-                                  self.commands[:, 4:],  # TODO: add scales for pose commands
-                                  (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                                  self.dof_vel * self.obs_scales.dof_vel,
-                                  self.actions
-                                  ), dim=-1)
-        # add perceptive inputs if not blind
-        if self.cfg.terrain.measure_heights:
-            heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 -
-                                 self.measured_heights, -1, 1.) * self.obs_scales.height_measurements
-            self.obs_buf = torch.cat((self.obs_buf, heights), dim=-1)
-        # add noise if needed
-        if self.add_noise:
-            self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec
-
-    def _init_buffers(self):
-        super()._init_buffers()
-        # Additional buffers for pose commands
-        self.exp_quat = torch.zeros(self.num_envs, 4, device=self.device, requires_grad=False)
-
-    def _draw_debug_vis(self):
-        # draw base vel
-        self.gym.clear_lines(self.viewer)
-        lin_vel = self.root_states[:, 7:10].cpu().numpy()
-        z_base_exp = quat_rotate(self.exp_quat, self.gravity_vec).cpu().numpy()
-        z_base = quat_rotate(self.base_quat, self.gravity_vec).cpu().numpy()
-        for i in range(self.num_envs):
-            base_pos = self.root_states[i, :3].cpu().numpy()
-            base_pos[2] = self.commands[i, 7]  # Expected base height
-            self.vis.draw_arrow(i, base_pos, base_pos + lin_vel[i], color=(0, 1, 0))
-            self.vis.draw_arrow(i, base_pos, base_pos - z_base_exp[i]/np.linalg.norm(z_base_exp[i]), color=(1, 1, 0))
-            self.vis.draw_arrow(i, base_pos, base_pos - z_base[i]/np.linalg.norm(z_base[i]), color=(0, 1, 1))
-        return super()._draw_debug_vis()
-
-    def _resample_commands(self, env_ids):
-        """ Randommly select commands of some environments
-
-        Args:
-            env_ids (List[int]): Environments ids for which new commands are needed
-        """
-        self.commands[env_ids, 0] = torch_rand_float(
-            self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        self.commands[env_ids, 1] = torch_rand_float(
-            self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        if self.cfg.commands.heading_command:
-            self.commands[env_ids, 3] = torch_rand_float(
-                self.command_ranges["heading"][0], self.command_ranges["heading"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        else:
-            self.commands[env_ids, 2] = torch_rand_float(
-                self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        # Pose commands
-        self.commands[env_ids, 4] = torch_rand_float(
-            self.command_ranges["base_yaw_shift"][0], self.command_ranges["base_yaw_shift"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        self.commands[env_ids, 5] = torch_rand_float(
-            self.command_ranges["base_pitch_shift"][0], self.command_ranges["base_pitch_shift"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        self.commands[env_ids, 6] = torch_rand_float(
-            self.command_ranges["base_roll_shift"][0], self.command_ranges["base_roll_shift"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        self.commands[env_ids, 7] = torch_rand_float(
-            self.command_ranges["base_height"][0], self.command_ranges["base_height"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-
-        # set small commands to zero
-        self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
-
-        pitch_shift = self.commands[:, 5]
-        roll_shift = self.commands[:, 6]
-        cos_pitch_2 = torch.cos(pitch_shift/2)
-        sin_pitch_2 = torch.sin(pitch_shift/2)
-        cos_roll_2 = torch.cos(roll_shift/2)
-        sin_roll_2 = torch.sin(roll_shift/2)
-        quat_pitch = torch.stack([torch.zeros_like(sin_pitch_2), -sin_pitch_2,
-                                  torch.zeros_like(sin_pitch_2), cos_pitch_2], dim=-1)
-
-        quat_roll = torch.stack([sin_roll_2, torch.zeros_like(sin_pitch_2),
-                                 torch.zeros_like(sin_pitch_2), cos_roll_2], dim=-1)
-
-        forward = quat_apply(self.base_quat, self.forward_vec)
-        heading = torch.atan2(forward[:, 1], forward[:, 0])
-        self.quat_heading = torch.stack([torch.zeros_like(heading), torch.zeros_like(heading),
-                                         torch.sin(heading/2), torch.cos(heading/2)], dim=-1)
-
-        self.exp_quat = quat_mul(self.quat_heading, quat_mul(quat_pitch, quat_roll))
-
-    def _reward_orientation(self):
-        expect_projected_gravity = quat_rotate_inverse(self.exp_quat, self.gravity_vec).squeeze(-1)
-        gravity_diff = expect_projected_gravity - self.projected_gravity
-        return torch.sum(torch.square(gravity_diff[:, :2]), dim=1)
-
-    def _reward_base_height(self):
-        # Penalize base height away from target
-        base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
-        return torch.square(base_height - self.commands[:, 7])
-
-
-class FootTrackElSpider(ElSpider):
-
-    def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
-        super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
-        if self.cfg.rewards.raibert_planner.planner_type == 0:
-            cfg = SimpleRaibertPlannerConfig()
-            cfg.dt = self.dt
-            self.raibert_planner = SimpleRaibertPlanner(self.num_envs, self.device, cfg)
-            self.raibert_planner.init(self.base_pos, self.base_quat)
-        elif self.cfg.rewards.raibert_planner.planner_type == 1:
-            cfg = RaibertPlannerConfig()
-            cfg.dt = self.dt
-            self.raibert_planner = RaibertPlanner(self.num_envs, self.device, cfg)
-            self.raibert_planner.init(self.base_pos, self.base_quat)
-        else:
-            raise ValueError("Invalid planner type")
-
-    def compute_observations(self):
-        """ Computes observations
-        """
-        self.obs_buf = torch.cat((self.base_lin_vel * self.obs_scales.lin_vel,
-                                  self.base_ang_vel * self.obs_scales.ang_vel,
-                                  self.projected_gravity,
-                                  self.raibert_planner.get_obs_tensor(self.base_pos, self.base_quat),
-                                  (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                                  self.dof_vel * self.obs_scales.dof_vel,
-                                  self.actions,
-                                  ), dim=-1)
-        # add perceptive inputs if not blind
-        if self.cfg.terrain.measure_heights:
-            heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 -
-                                 self.measured_heights, -1, 1.) * self.obs_scales.height_measurements
-            self.obs_buf = torch.cat((self.obs_buf, heights), dim=-1)
-        # add noise if needed
-        if self.add_noise:
-            self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec
-
-    def check_termination(self):
-        """ Check if environments need to be reset
-        """
-        super().check_termination()
-        self.raibert_pos_diff = torch.norm(self.base_pos - self.raibert_planner.base_pos, dim=1)
-        self.reset_buf |= self.raibert_pos_diff > 0.5
-
-    def reset_idx(self, env_ids):
-        super().reset_idx(env_ids)
-        self.raibert_planner.reset_idx(self.base_pos, self.base_quat, env_ids)
-
-    def post_physics_step(self):
-        super().post_physics_step()
-        # Update raiber planner
-        self.raibert_planner.step(self.commands[:, :3])
-
-    def _draw_debug_vis(self):
-        # draw base vel
-        self.gym.clear_lines(self.viewer)
-        # lin_vel = self.root_states[:, 7:10].cpu().numpy()
-        # z_base = quat_rotate(self.base_quat, self.gravity_vec).cpu().numpy()
-        raibert_base_pos = self.raibert_planner.base_pos_shift.cpu().numpy()
-        raibert_foot_pos = self.raibert_planner.foot_pos.view(-1, 3).cpu().numpy()
-        for i in range(self.num_envs):
-            base_quat_shift = self.raibert_planner.base_quat_shift[i].cpu().numpy()
-            base_pos_shift = self.raibert_planner.base_pos_shift[i].cpu().numpy()
-            self.vis.draw_frame_from_quat(i, base_quat_shift, base_pos_shift, length=0.4)
-        self.vis.draw_points(0, raibert_base_pos, color=(1, 0, 0), size=0.03)
-        self.vis.draw_points(0, raibert_foot_pos, color=(0, 1, 1), size=0.03)
-        return super()._draw_debug_vis()
-
-    def _resample_commands(self, env_ids):
-        """ Randommly select commands of some environments
-
-        Args:
-            env_ids (List[int]): Environments ids for which new commands are needed
-        """
-        self.commands[env_ids, 0] = torch_rand_float(
-            self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        self.commands[env_ids, 1] = torch_rand_float(
-            self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        if self.cfg.commands.heading_command:
-            self.commands[env_ids, 3] = torch_rand_float(
-                self.command_ranges["heading"][0], self.command_ranges["heading"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        else:
-            self.commands[env_ids, 2] = torch_rand_float(
-                self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-
-        # set small commands to zero
-        # self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
-
-    def _reward_feet_air_time(self):
-        # Reward long steps
-        # Need to filter the contacts because the contact reporting of PhysX is unreliable on meshes
-        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
-        contact_filt = torch.logical_or(contact, self.last_contacts)
-        self.last_contacts = contact
-        first_contact = (self.feet_air_time > 0.) * contact_filt
-        self.feet_air_time += self.dt
-        rew_airTime = torch.sum((self.feet_air_time - 0.5) * first_contact, dim=1)  # reward only on first contact with the ground
-        self.feet_air_time *= ~contact_filt
-        return rew_airTime
-
-    def _reward_raibert_planner(self):
-        # Reward for RaiBert Planner
-        reward_scales = class_to_dict(self.cfg.rewards.raibert_planner)
-
-        def get_weight(key, stage):
-            if isinstance(reward_scales[key], list):
-                return reward_scales[key][min(stage, len(reward_scales[key])-1)]
-            else:
-                return reward_scales[key]
-
-        return self.raibert_planner.reward_base_pos_track(self.root_states[:, :3])*get_weight('base_pos_track', self.reward_scales_stage) + \
-            self.raibert_planner.reward_base_quat_track(self.base_quat)*get_weight('base_quat_track', self.reward_scales_stage) + \
-            self.raibert_planner.reward_foot_pos_track(self.foot_positions)*get_weight('foot_pos_track', self.reward_scales_stage)
-
-    # Separate reward functions for base pos, base quat and foot pos
-    def _reward_raibert_base_pos_track(self):
-        return self.raibert_planner.penalty_base_pos_track(self.root_states[:, :3])
-
-    def _reward_raibert_base_quat_track(self):
-        return self.raibert_planner.penalty_base_quat_track(self.base_quat)
-
-    def _reward_raibert_foot_swing_contact(self):
-        return self.raibert_planner.penalty_foot_swing_contact(self.contact_forces, self.feet_indices)
-
-    def _reward_raibert_foot_pos_track(self):
-        return self.raibert_planner.reward_foot_pos_track(self.foot_positions)
-
-    def _reward_raibert_foot_pos_track_z(self):
-        return self.raibert_planner.penalty_foot_pos_track_z(self.foot_positions)
-
-
-class StandElSpider(ElSpider):
-    def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
-        super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
-        self.last_contacts = torch.zeros(self.num_envs, 2, dtype=torch.bool,
-                                         device=self.device, requires_grad=False)
-        self.feet_air_time = torch.zeros(
-            self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
-    # Rewards
+    def _reward_haa_nominal_pos(self):
+        if not hasattr(self, 'haa_indices'):
+            self.haa_indices = [self.dof_names.index(name) for name in [
+                'RF_HAA', 'RM_HAA', 'RB_HAA', 'LF_HAA', 'LM_HAA', 'LB_HAA']]
+        haa_nominal_pos = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=self.device)
+        # use ema to smooth the reward
+        ema = 0.01
+        self.haa_nominal_pos_ema = getattr(self, 'haa_nominal_pos_ema', torch.zeros(self.num_envs, device=self.device))
+        current_deviation = torch.square(self.dof_pos[:, self.haa_indices] - haa_nominal_pos).sum(dim=1)
+        self.haa_nominal_pos_ema = ema * current_deviation + (1 - ema) * self.haa_nominal_pos_ema
+        return self.haa_nominal_pos_ema
 
     def _reward_ang_vel_xy(self):
         # Penalize yz axes base angular velocity
@@ -796,23 +655,22 @@ class StandElSpider(ElSpider):
         return torch.sum(torch.square(self.base_lin_acc[:, 2] - 9.81), dim=1)
 
     def _reward_tracking_lin_vel(self):
-        # Tracking of linear velocity commands (yz axes in base frame)
-        # TODO: check
-        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] + self.base_lin_vel[:, 1:]), dim=1)
+        # Tracking of linear velocity commands (xy axes in base frame)
+        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
         return torch.exp(-lin_vel_error/self.cfg.rewards.tracking_sigma)
 
     def _reward_tracking_ang_vel(self):
-        # Tracking of angular velocity commands (yaw)
-        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 0])
+        # Tracking of angular velocity commands (yaw around z axis)
+        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma)
 
     def _reward_feet_air_time(self):
         # Reward long steps
         # Need to filter the contacts because the contact reporting of PhysX is unreliable on meshes
-        hind_feet_indices = [self.feet_indices[1], self.feet_indices[3]]
-        contact = self.contact_forces[:, hind_feet_indices, 2] > 1.
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
         contact_filt = torch.logical_or(contact, self.last_contacts)
         self.last_contacts = contact
+
         first_contact = (self.feet_air_time > 0.) * contact_filt
         self.feet_air_time += self.dt
         rew_airTime = torch.sum((self.feet_air_time - 0.5) * first_contact, dim=1)  # reward only on first contact with the ground
@@ -827,3 +685,84 @@ class StandElSpider(ElSpider):
         second_foot_contact = contact_filt[:, 1]
         reward = ~(first_foot_contact | second_foot_contact)
         return reward
+
+    def create_viewer(self):
+        # create viewer
+        if self.headless == True:
+            self.viewer = None
+            print("Running in headless mode")
+        else:
+            self.debug_viz = True
+            self.viewer = self.gym.create_viewer(
+                self.sim, gymapi.CameraProperties())
+            if self.viewer is None:
+                print("*** Failed to create viewer")
+                quit()
+            self.gym.subscribe_viewer_keyboard_event(
+                self.viewer, gymapi.KEY_ESCAPE, "QUIT") # 按 Esc 关闭仿真窗口。
+            self.gym.subscribe_viewer_keyboard_event(
+                self.viewer, gymapi.KEY_V, "toggle_viewer_sync") # 焦点在仿真与显示之间切换
+            
+            self.vis = GymVisualizer(self.gym, self.sim, self.viewer, self.envs)
+
+class ElSpiderStudent(ElSpider):
+    """ElSpiderStudent class for distillation training with observation history."""
+
+    def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
+        # Set history length from config
+        self.history_length = getattr(cfg.env, 'history_length', 3)
+        super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
+
+    def _init_buffers(self):
+        super()._init_buffers()
+        # Initialize observation history buffer
+        # Student obs: 66 (proprio) * history_length
+        self.proprio_obs_size = 66
+        self.obs_history = torch.zeros(
+            self.num_envs, self.history_length, self.proprio_obs_size,
+            device=self.device, dtype=torch.float, requires_grad=False
+        )
+
+    def reset_idx(self, env_ids):
+        super().reset_idx(env_ids)
+        # Clear observation history for reset environments
+        self.obs_history[env_ids] = 0.
+
+    def compute_observations(self):
+        """Compute observations for student (history) and privileged observations for teacher."""
+        # Compute current proprioceptive observations (66 dim)
+        current_proprio = torch.cat((
+            self.base_lin_vel * self.obs_scales.lin_vel,                    # 3
+            self.base_ang_vel * self.obs_scales.ang_vel,                    # 3
+            self.projected_gravity,                                         # 3
+            self.commands[:, :3] * self.commands_scale,                     # 3
+            (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,  # 18
+            self.dof_vel * self.obs_scales.dof_vel,                         # 18
+            self.actions                                                    # 18
+        ), dim=-1)  # Total: 66 dims
+
+        # Update observation history (shift and add new observation)
+        self.obs_history = torch.roll(self.obs_history, shifts=1, dims=1)
+        self.obs_history[:, 0] = current_proprio
+
+        # Student observations: flattened history (66 * history_length)
+        self.obs_buf = self.obs_history.view(self.num_envs, -1)
+
+        # Privileged observations for teacher: current proprio + height measurements (66 + 187 = 253)
+        privileged_obs = current_proprio.clone()
+
+        # Add height measurements if enabled
+        if self.cfg.terrain.measure_heights:
+            heights = torch.clip(
+                self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights,
+                -1, 1.
+            ) * self.obs_scales.height_measurements
+            privileged_obs = torch.cat((privileged_obs, heights), dim=-1)
+
+        # Store privileged observations
+        if hasattr(self, 'privileged_obs_buf'):
+            self.privileged_obs_buf = privileged_obs
+
+        # Add noise if needed
+        if self.add_noise:
+            self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec[:self.obs_buf.shape[1]]
