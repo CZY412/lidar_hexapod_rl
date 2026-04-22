@@ -74,8 +74,8 @@ from .a1.a1_config import A1RoughCfg, A1RoughCfgPPO
 from .elspider_air.elspider import ElSpider, ElSpiderStudent
 from .elspider_air.elspider_tasks import PoseElSpider, FootTrackElSpider
 from .elspider_air.mixed_terrains.elspider_air_rough_config import ElSpiderAirRoughCfg, ElSpiderAirRoughCfgPPO
-from .elspider_air.mixed_terrains.elspider_air_rough_train_config import ElSpiderAirRoughStage0Cfg, ElSpiderAirRoughStage1Cfg, ElSpiderAirRoughTrainCfg, ElSpiderAirRoughTrainCfgPPO
-# from .elspider_air.mixed_terrains.elspider_air_rough_train2_config import ElSpiderAirRoughTrain2Cfg, ElSpiderAirRoughTrain2CfgPPO
+from .elspider_air.mixed_terrains.elspider_air_rough_train_config import ElSpiderAirRoughTrainCfg, ElSpiderAirRoughTrainCfgPPO
+from .elspider_air.mixed_terrains.elspider_air_rough_train2_config import ElSpiderAirRoughTrain2Cfg, ElSpiderAirRoughTrain2CfgPPO
 from .elspider_air.mixed_terrains.elspider_air_rough_raycast_config import ElSpiderAirRoughRaycastCfg, ElSpiderAirRoughRaycastCfgPPO
 from .elspider_air.mixed_terrains.elspider_air_rough_student_config import ElSpiderAirRoughStudentCfg, ElSpiderAirRoughStudentCfgPPO
 from .elspider_air.flat.elspider_air_flat_config import ElSpiderAirFlatCfg, ElSpiderAirSlightRoughCfg, ElSpiderAirFlatCfgPPO
@@ -136,6 +136,13 @@ from .anymal_c.mixed_terrains.anymal_c_rough_teacher_config import AnymalCRoughT
 from .anymal_c.mixed_terrains.anymal_c_rough_student_config import AnymalCRoughStudentCfg, AnymalCRoughStudentCfgPPO
 from .anymal_c.anymal import AnymalStudent
 
+from .el_4090.spider_nomal.el_4090 import EL_4090
+from .el_4090.spider_nomal.el4090_spider_config import El4090SpiderCfg, El4090SpiderCfgPPO
+
+from .el_4090.safe.el_4090_safe import EL_4090_Safe
+from .el_4090.safe.el_4090_safe_config import El4090SafeCfg, El4090SafeCfgPPO
+
+
 task_registry.register("anymal_c_rough", Anymal, AnymalCRoughCfg(), AnymalCRoughCfgPPO())
 task_registry.register("anymal_c_flat", Anymal, AnymalCFlatCfg(), AnymalCFlatCfgPPO())
 task_registry.register("pose_anymal_c_flat", PoseAnymal, PoseAnymalCFlatCfg(), PoseAnymalCFlatCfgPPO())
@@ -173,9 +180,7 @@ task_registry.register("cassie_traj_grad_sampling", CassieTrajGradSampling,
                        CassieTrajGradSamplingCfg(), CassieTrajGradSamplingCfgPPO())
 
 
-task_registry.register("elspider_air_rough", ElSpider, ElSpiderAirRoughTrainCfg(), ElSpiderAirRoughTrainCfgPPO())
-task_registry.register("elspider_air_rough_multi_stage0", ElSpider, ElSpiderAirRoughStage0Cfg(), ElSpiderAirRoughTrainCfgPPO())
-task_registry.register("elspider_air_rough_multi_stage1", ElSpider, ElSpiderAirRoughStage1Cfg(), ElSpiderAirRoughTrainCfgPPO())
+task_registry.register("elspider_air_rough", ElSpider, ElSpiderAirRoughTrain2Cfg(), ElSpiderAirRoughTrain2CfgPPO())
 task_registry.register("elspider_air_rough_raycast", ElSpiderRayCast,
                        ElSpiderAirRoughRaycastCfg(), ElSpiderAirRoughRaycastCfgPPO())
 task_registry.register("elspider_air_flat", ElSpider, ElSpiderAirFlatCfg(), ElSpiderAirFlatCfgPPO())
@@ -226,6 +231,10 @@ task_registry.register("elspider_air_rough_student", ElSpiderStudent, ElSpiderAi
 task_registry.register("franka", Franka, FrankaCfg(), FrankaCfgPPO())
 task_registry.register("franka_batch_rollout", FrankaBatchRollout, FrankaBatchRolloutCfg(), FrankaBatchRolloutCfgPPO)
 
+
+
+task_registry.register("el4090_spider_normal", EL_4090, El4090SpiderCfg(), El4090SpiderCfgPPO())
+task_registry.register("el_4090_safe", EL_4090_Safe, El4090SafeCfg(), El4090SafeCfgPPO())
 # Register ElSpider LiDAR confined space tasks (基于激光雷达的六足机器人受限空间避障)
 task_registry.register("elspider_lidar_confined", ElSpiderLidar,
                        ElSpiderLidarConfinedCfg(), ElSpiderLidarConfinedCfgPPO())

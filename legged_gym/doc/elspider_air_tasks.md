@@ -27,73 +27,16 @@ conda activate pdplanner
 - 500 epoch: walking good
 
 ```bash
-python legged_gym/scripts/train.py --task=elspider_air_flat --num_envs=4096 --headless --resume
-python legged_gym/scripts/play.py --task=elspider_air_flat --num_envs=48 --checkpoint=-1  --load_run=Jan22_11-24-04_ --resume
+python legged_gym/scripts/train.py --task=elspider_air_flat --num_envs=6144 --headless --resume
+python legged_gym/scripts/play.py --task=elspider_air_flat --num_envs=48 --checkpoint=-1  --load_run=Dec02_20-16-21_ --resume
 ```
 
-**Slight Rough for Better Sim2Sim Robustness**:
-Training Profile(grey):
-![alt text](imgs/elspider_air_slight_rough.png)
-
+ElSpider4090
 ```bash
-# For 500 eps to warmup
-python legged_gym/scripts/train.py --task=elspider_air_flat --num_envs=4096 --headless --max_iterations=700
-python legged_gym/scripts/train.py --task=elspider_air_slight_rough --num_envs=4096 --headless --resume
-python legged_gym/scripts/play.py --task=elspider_air_slight_rough --num_envs=48 --checkpoint=-1  --load_run=Feb02_17-14-09_ --resume
-```
-
-### ElSpiderAir Rough Terrain
-
-**Training Tip:**
-IMPORTANT
-
-Use multi-stage training to achieve better performance. Stage0 focuses on basic walking skills on `plane`, while Stage1 introduces rough terrain for fine-tuning.
-
-- Stage0: Pretrain model on flat terrain to learn basic walking skills (gaits, etc.).
-- Stage1: Use the pretrained model to finetune on rough terrain.
-
-**Training Profile:**
-
-
-
-**Single Stage(Test only)**
-```bash
-python legged_gym/scripts/train.py --task=elspider_air_rough --num_envs=4096 --resume --headless
-python legged_gym/scripts/play.py --task=elspider_air_rough --num_envs=48 --checkpoint=-1
-```
-
-**Multi Stage**
-```bash
-# Train Stage 0 for ~550 epochs
-python legged_gym/scripts/train.py --task=elspider_air_rough_multi_stage0 --num_envs=4096 --headless --max_iterations=550
-python legged_gym/scripts/train.py --task=elspider_air_rough_multi_stage1 --num_envs=4096 --headless --resume
-python legged_gym/scripts/play.py --task=elspider_air_rough_multi_stage1 --num_envs=48 --checkpoint=-1
-```
-
-**Distillation (Teacher-Student)**
-
-Train a student policy using distillation from a trained teacher model. The teacher uses privileged terrain information (height scans), while the student only uses proprioceptive history.
-
-```bash
-# First, train a teacher model (use multi-stage training for best results)
-python legged_gym/scripts/train.py --task=elspider_air_rough_multi_stage0 --num_envs=4096 --headless
-python legged_gym/scripts/train.py --task=elspider_air_rough_multi_stage1 --num_envs=4096 --headless --resume
-
-# Update teacher_model_path in elspider_air_rough_student_config.py with the trained teacher checkpoint
-# Then train the student policy via distillation
-# PROBLEM: The distilled policy are not good judging from data, but it can walk in terrain.
-python legged_gym/scripts/train.py --task=elspider_air_rough_student --num_envs=4096 --headless
-
-# Evaluate the student policy
-python legged_gym/scripts/play.py --task=elspider_air_rough_student --num_envs=48 --checkpoint=-1
-```
-
-
-### ElSpiderAir Rough RayCast
-
-```bash
-python legged_gym/scripts/train.py --task=elspider_air_rough_raycast --num_envs=6144 --resume --headless
-python legged_gym/scripts/play.py --task=elspider_air_rough_raycast --num_envs=8 --checkpoint=-1
+python legged_gym/scripts/train.py --task=el4090_spider --num_envs=4096 --headless --resume
+python legged_gym/scripts/play.py --task=el4090_spider --num_envs=48 --checkpoint=-1  --load_run=Dec02_20-16-21_ --resume
+python legged_gym/scripts/train.py --task=el4090_mammal --num_envs=4096 --headless --resume
+python legged_gym/scripts/play.py --task=el4090_mammal --num_envs=48 --checkpoint=-1  --load_run=Dec02_20-16-21_ --resume
 ```
 
 ## Other Tasks

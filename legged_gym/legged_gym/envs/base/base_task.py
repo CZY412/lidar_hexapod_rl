@@ -99,7 +99,12 @@ class BaseTask():
         #     self.gym.subscribe_viewer_keyboard_event(
         #         self.viewer, gymapi.KEY_V, "toggle_viewer_sync")
             
-        #     self.vis = GymVisualizer(self.gym, self.sim, self.viewer, self.envs)
+            self.vis = GymVisualizer(self.gym, self.sim, self.viewer, self.envs)
+        
+        l_color = gymapi.Vec3(0.5, 0.5, 0.5)  # 提高亮度
+        l_ambient = gymapi.Vec3(0.1, 0.1, 0.1)  # 提高亮度
+        l_direction = gymapi.Vec3(0., 0., 1.)
+        self.gym.set_light_parameters(self.sim, 0, l_color, l_ambient, l_direction)
             
 
     def get_observations(self):
