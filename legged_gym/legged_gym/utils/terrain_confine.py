@@ -298,7 +298,7 @@ def timber_piles_terrain(terrain_ground, terrain_ceiling, timber_spacing=1.0, ti
         hanging_obstacles: whether to add hanging ceiling obstacles
         position_noise: random offset for tile positions [meters]
     """
-def timber_piles_terrain(terrain_ground, terrain_ceiling, timber_spacing=1.0, timber_size=0.3, pile_height=1.2, hanging_obstacles=False, position_noise=0.2, height_noise=0.1, spawn_platform_height=None):
+
 def timber_piles_terrain(terrain_ground, terrain_ceiling, timber_spacing=1.0, timber_size=0.3, pile_height=1.2, hanging_obstacles=False, position_noise=0.2, height_noise=0.1, spawn_platform_height=None):
     # Convert to discrete units
     timber_spacing_px = int(timber_spacing / terrain_ground.horizontal_scale)
@@ -1387,15 +1387,6 @@ class TerrainConfined:
                 obstacle_height=corridor_obstacle_height,
                 num_turns=corridor_num_turns,
                 uniform_width=corridor_uniform_width
-            # Corridor with obstacles (PRIMARY terrain for goal navigation)
-            terrain_ground, terrain_ceiling = corridor_with_obstacles_terrain(
-                terrain_ground, terrain_ceiling,
-                corridor_width=corridor_width,
-                obstacle_density=corridor_obstacle_density,
-                obstacle_size=corridor_obstacle_size,
-                obstacle_height=corridor_obstacle_height,
-                num_turns=corridor_num_turns,
-                uniform_width=corridor_uniform_width
             )
         elif choice < self.proportions[1]:
             # Timber piles terrain (open area with obstacles)
@@ -1408,7 +1399,6 @@ class TerrainConfined:
                 position_noise=position_noise,
                 height_noise=height_noise,
             )
-        elif choice < self.proportions[2]:
         elif choice < self.proportions[2]:
             # Column obstacles terrain
             terrain_ground, terrain_ceiling = column_obstacles_terrain(
@@ -1439,31 +1429,9 @@ class TerrainConfined:
                 gap_width=gap_width,
                 platform_size=platform_size
             )
-        elif choice < self.proportions[3]:
-            # Complex Maze Terrain
-            terrain_ground, terrain_ceiling = complex_maze_terrain(
-                terrain_ground, terrain_ceiling,
-                complexity=difficulty
-            )
-        elif choice < self.proportions[4]:
-            # Tunnel terrain  
-            terrain_ground, terrain_ceiling = barrier_terrain(
-                terrain_ground, terrain_ceiling,
-                barrier_height=barrier_height,
-                gap_height=gap_height
-            )
-        elif choice < self.proportions[5]:
-            # Confined gap terrain
-            terrain_ground, terrain_ceiling = confined_gap_terrain(
-                terrain_ground, terrain_ceiling,
-                gap_width=gap_width,
-                platform_size=platform_size
-            )
         else:
             # Corridor with obstacles (straight, same-width fallback)
             terrain_ground, terrain_ceiling = corridor_with_obstacles_terrain(
-            # Corridor with obstacles (straight, same-width fallback)
-            terrain_ground, terrain_ceiling = corridor_with_obstacles_terrain(
                 terrain_ground, terrain_ceiling,
                 corridor_width=corridor_width,
                 obstacle_density=corridor_obstacle_density * 0.7,
@@ -1472,14 +1440,6 @@ class TerrainConfined:
                 num_turns=0,
                 uniform_width=corridor_uniform_width
             )
-                corridor_width=corridor_width,
-                obstacle_density=corridor_obstacle_density * 0.7,
-                obstacle_size=corridor_obstacle_size,
-                obstacle_height=corridor_obstacle_height,
-                num_turns=0,
-                uniform_width=corridor_uniform_width
-            )
-
         return terrain_ground, terrain_ceiling
 
     def add_terrain_to_map(self, terrain_ground, terrain_ceiling, row, col):
