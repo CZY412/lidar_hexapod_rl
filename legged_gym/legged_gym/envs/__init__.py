@@ -71,12 +71,14 @@ from .cassie.cassie_traj_grad_sampling import CassieTrajGradSampling
 from .cassie.cassie_traj_grad_sampling_config import CassieTrajGradSamplingCfg, CassieTrajGradSamplingCfgPPO
 from .a1.a1_config import A1RoughCfg, A1RoughCfgPPO
 
-from .elspider_air.elspider import ElSpider, PoseElSpider, FootTrackElSpider
+from .elspider_air.elspider import ElSpider, ElSpiderStudent
+from .elspider_air.elspider_tasks import PoseElSpider, FootTrackElSpider
 from .elspider_air.mixed_terrains.elspider_air_rough_config import ElSpiderAirRoughCfg, ElSpiderAirRoughCfgPPO
 from .elspider_air.mixed_terrains.elspider_air_rough_train_config import ElSpiderAirRoughTrainCfg, ElSpiderAirRoughTrainCfgPPO
 from .elspider_air.mixed_terrains.elspider_air_rough_train2_config import ElSpiderAirRoughTrain2Cfg, ElSpiderAirRoughTrain2CfgPPO
 from .elspider_air.mixed_terrains.elspider_air_rough_raycast_config import ElSpiderAirRoughRaycastCfg, ElSpiderAirRoughRaycastCfgPPO
-from .elspider_air.flat.elspider_air_flat_config import ElSpiderAirFlatCfg, ElSpiderAirFlatCfgPPO
+from .elspider_air.mixed_terrains.elspider_air_rough_student_config import ElSpiderAirRoughStudentCfg, ElSpiderAirRoughStudentCfgPPO
+from .elspider_air.flat.elspider_air_flat_config import ElSpiderAirFlatCfg, ElSpiderAirSlightRoughCfg, ElSpiderAirFlatCfgPPO
 from .elspider_air.flat.pose_elspider_air_flat_config import PoseElSpiderAirFlatCfg, PoseElSpiderAirFlatCfgPPO
 from .elspider_air.flat.foot_track_elspider_air_flat_config import FootTrackElSpiderAirFlatCfg, FootTrackElSpiderAirFlatCfgPPO
 from .elspider_air.flat.foot_track_elspider_air_hang_config import FootTrackElSpiderAirHangCfg, FootTrackElSpiderAirHangCfgPPO
@@ -98,6 +100,24 @@ from .elspider_air.batch_rollout.elspider_air_nav_config import ElSpiderAirNavCf
 from .elspider_air.nav_tasks.elair_nav_barrier_cfg import ElAirNavBarrierCfg, ElAirNavBarrierCfgPPO
 from .elspider_air.nav_tasks.elair_nav_timberpile_cfg import ElAirNavTimberPileCfg, ElAirNavTimberPileCfgPPO
 from .elspider_air.nav_tasks.elair_nav_gap_cfg import ElAirNavGapCfg, ElAirNavGapCfgPPO
+
+# LiDAR-based confined space navigation
+from .elspider_air.elspider_lidar import ElSpiderLidar
+from .elspider_air.elspider_lidar_confined_config import (
+    ElSpiderLidarConfinedCfg, ElSpiderLidarConfinedCfgPPO,
+    ElSpiderLidarConfinedSimpleCfg, ElSpiderLidarConfinedSimpleCfgPPO,
+    ElSpiderLidarTimberPileCfg, ElSpiderLidarTimberPileCfgPPO,
+    ElSpiderLidarTunnelCfg, ElSpiderLidarTunnelCfgPPO,
+    ElSpiderLidarCaveCfg, ElSpiderLidarCaveCfgPPO,
+    ElSpiderLidarPoseAdaptSameDimCfg, ElSpiderLidarPoseAdaptSameDimCfgPPO,
+    ElSpiderLidarFlatSkillSameDimCfg, ElSpiderLidarFlatSkillSameDimCfgPPO,
+    ElSpiderLidarMixedTerrainSameDimCfg, ElSpiderLidarMixedTerrainSameDimCfgPPO,
+    ElSpiderLidarNavBarrierSameDimCfg, ElSpiderLidarNavBarrierSameDimCfgPPO,
+    ElSpiderLidarFlatPretrainCfg, ElSpiderLidarFlatPretrainCfgPPO,
+    ElSpiderLidarConfinedEasySameDimCfg, ElSpiderLidarConfinedEasySameDimCfgPPO,
+    ElSpiderLidarWalkFlatSameDimCfg, ElSpiderLidarWalkFlatSameDimCfgPPO,
+    ElSpiderLidarNavFlatSameDimCfg, ElSpiderLidarNavFlatSameDimCfgPPO
+)
 
 from .cyberdog2.c2_standdance_config import CyberStandDanceConfig, CyberStandDanceCfgPPO, CyberStandDanceCfgPPOAug, CyberStandDanceCfgPPOEMLP
 from .cyberdog2.c2_standdance_env import CyberStandDanceEnv
@@ -164,6 +184,7 @@ task_registry.register("elspider_air_rough", ElSpider, ElSpiderAirRoughTrain2Cfg
 task_registry.register("elspider_air_rough_raycast", ElSpiderRayCast,
                        ElSpiderAirRoughRaycastCfg(), ElSpiderAirRoughRaycastCfgPPO())
 task_registry.register("elspider_air_flat", ElSpider, ElSpiderAirFlatCfg(), ElSpiderAirFlatCfgPPO())
+task_registry.register("elspider_air_slight_rough", ElSpider, ElSpiderAirSlightRoughCfg(), ElSpiderAirFlatCfgPPO())
 task_registry.register("pose_elspider_air_flat", PoseElSpider, PoseElSpiderAirFlatCfg(), PoseElSpiderAirFlatCfgPPO())
 task_registry.register("foot_track_elspider_air_flat", FootTrackElSpider,
                        FootTrackElSpiderAirFlatCfg(), FootTrackElSpiderAirFlatCfgPPO())
@@ -204,6 +225,7 @@ task_registry.register("cyber2_walk", CyberWalkEnv, CyberWalkConfig(), CyberWalk
 # Register teacher-student tasks
 task_registry.register("anymal_c_rough_teacher", Anymal, AnymalCRoughTeacherCfg(), AnymalCRoughTeacherCfgPPO())
 task_registry.register("anymal_c_rough_student", AnymalStudent, AnymalCRoughStudentCfg(), AnymalCRoughStudentCfgPPO())
+task_registry.register("elspider_air_rough_student", ElSpiderStudent, ElSpiderAirRoughStudentCfg(), ElSpiderAirRoughStudentCfgPPO())
 
 # Register franka environments
 task_registry.register("franka", Franka, FrankaCfg(), FrankaCfgPPO())
@@ -213,3 +235,30 @@ task_registry.register("franka_batch_rollout", FrankaBatchRollout, FrankaBatchRo
 
 task_registry.register("el4090_spider_normal", EL_4090, El4090SpiderCfg(), El4090SpiderCfgPPO())
 task_registry.register("el_4090_safe", EL_4090_Safe, El4090SafeCfg(), El4090SafeCfgPPO())
+# Register ElSpider LiDAR confined space tasks (基于激光雷达的六足机器人受限空间避障)
+task_registry.register("elspider_lidar_confined", ElSpiderLidar,
+                       ElSpiderLidarConfinedCfg(), ElSpiderLidarConfinedCfgPPO())
+task_registry.register("elspider_lidar_confined_simple", ElSpiderLidar,
+                       ElSpiderLidarConfinedSimpleCfg(), ElSpiderLidarConfinedSimpleCfgPPO())
+task_registry.register("elspider_lidar_timber_pile", ElSpiderLidar,
+                       ElSpiderLidarTimberPileCfg(), ElSpiderLidarTimberPileCfgPPO())
+task_registry.register("elspider_lidar_tunnel", ElSpiderLidar,
+                       ElSpiderLidarTunnelCfg(), ElSpiderLidarTunnelCfgPPO())
+task_registry.register("elspider_lidar_cave", ElSpiderLidar,
+                       ElSpiderLidarCaveCfg(), ElSpiderLidarCaveCfgPPO())
+task_registry.register("elspider_lidar_pose_adapt_same_dim", ElSpiderLidar,
+                       ElSpiderLidarPoseAdaptSameDimCfg(), ElSpiderLidarPoseAdaptSameDimCfgPPO())
+task_registry.register("elspider_lidar_flat_same_dim", ElSpiderLidar,
+                       ElSpiderLidarFlatSkillSameDimCfg(), ElSpiderLidarFlatSkillSameDimCfgPPO())
+task_registry.register("elspider_lidar_mixed_terrains_same_dim", ElSpiderLidar,
+                       ElSpiderLidarMixedTerrainSameDimCfg(), ElSpiderLidarMixedTerrainSameDimCfgPPO())
+task_registry.register("elspider_lidar_nav_barrier_same_dim", ElSpiderLidar,
+                       ElSpiderLidarNavBarrierSameDimCfg(), ElSpiderLidarNavBarrierSameDimCfgPPO())
+task_registry.register("elspider_lidar_flat_pretrain", ElSpiderLidar,
+                       ElSpiderLidarFlatPretrainCfg(), ElSpiderLidarFlatPretrainCfgPPO())
+task_registry.register("elspider_lidar_walk_flat_same_dim", ElSpiderLidar,
+                       ElSpiderLidarWalkFlatSameDimCfg(), ElSpiderLidarWalkFlatSameDimCfgPPO())
+task_registry.register("elspider_lidar_nav_flat_same_dim", ElSpiderLidar,
+                       ElSpiderLidarNavFlatSameDimCfg(), ElSpiderLidarNavFlatSameDimCfgPPO())
+task_registry.register("elspider_lidar_confined_easy_same_dim", ElSpiderLidar,
+                       ElSpiderLidarConfinedEasySameDimCfg(), ElSpiderLidarConfinedEasySameDimCfgPPO())

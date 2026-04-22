@@ -10,7 +10,7 @@ class LeggedRobotRewMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.speed_min = 0.1  # Minimum speed for some rewards
+        self.speed_min = 0.2  # Minimum speed for some rewards
 
     def _get_reward_scales(self, stage=0):
         self.reward_scales_dict = class_to_dict(self.cfg.rewards.scales)
@@ -185,12 +185,9 @@ class LeggedRobotRewMixin:
         async_rr_fr = self._async_reward_func(3, 1)
         async_reward = (async_fl_fr + async_fl_rl + async_rr_rl + async_rr_fr) / 4
         re = sync_reward + async_reward
-        if self.cfg.commands.heading_command:
-            re = re * torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
-                                    torch.abs(self.commands[:, 3]) >= self.speed_min/ 2)
-        else:
-            re = re * torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
-                                    torch.abs(self.commands[:, 2]) >= self.speed_min/ 2)
+
+        re = re * torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
+                                torch.abs(self.commands[:, 2]) >= self.speed_min/ 2)
         return re
     
     def _sync_reward_func(self, foot_0: int, foot_1: int, max_err=2) -> torch.Tensor:

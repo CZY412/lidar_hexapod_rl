@@ -150,13 +150,29 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
         self.last_root_vel[:] = self.root_states[:, 7:13]
 
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
+            print("Debug visualization enabled, drawing debug visuals")
             self._draw_debug_vis()
             self.draw_foot_hip_positions()
 
     def check_termination(self):
         """ Check if environments need to be reset
         """
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        # Get protection steps (grace period during early training)
+        if hasattr(self.cfg.rewards, 'allow_initial_contact_steps'):
+            min_steps = self.cfg.rewards.allow_initial_contact_steps
+        else:
+            min_steps = 5  # Default: 5 steps grace period
+        
+        # Check contact termination condition
+        contact_termination = torch.any(
+            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1
+        )
+        
+        # Only terminate due to contact after grace period to avoid early termination
+        # This helps with initialization issues and gives the robot time to stabilize
+        self.reset_buf = contact_termination & (self.episode_length_buf > min_steps)
+        
+        # Timeout termination (no grace period needed)
         self.time_out_buf = self.episode_length_buf > self.max_episode_length  # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
 
@@ -671,8 +687,14 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
             self.reward_functions.append(getattr(self, name))
 
         # reward episode sums
-        self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-                             for name in self.reward_scales.keys()}
+        if self.init_done:
+            # This means we are adjusting reward scales & functions during training
+            for name in self.reward_scales.keys():
+                if name not in self.episode_sums:
+                    self.episode_sums[name] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        else:
+            self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+                                for name in self.reward_scales.keys()}
 
     def _create_ground_plane(self):
         """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
