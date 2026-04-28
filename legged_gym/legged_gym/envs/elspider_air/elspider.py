@@ -359,10 +359,6 @@ class ElSpider(LeggedRobot):
         
         self.create_viewer()
 
-        
-        self.create_viewer()
-
-
     def _draw_debug_vis(self):
         # draw base vel
         self.gym.clear_lines(self.viewer)
