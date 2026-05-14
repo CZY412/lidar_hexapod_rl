@@ -1,34 +1,71 @@
-# Extended Isaac Gym Environments for Legged Robots
+# Lidar Spider #
+---
+**Maintainer**: TaoLiangjie  
+**Affiliation**: HIT  
+**Contact**: 3190312883@qq.com  
 
-<div align="center">
-  <img src="doc/teaser1.png" alt="Terrain Navigation" width="42%" style="margin-right: 0%"/>
-  <img src="doc/teaser2.png" alt="Multi-Robot Environment" width="45%"/>
-</div>
+---
+# 一.注意
+1.
+2.
+3.
 
-> [!WARNING]
-> This repository is still under development. Documentation is incomplete and the code may contain bugs.
 
-This repository extends the original [legged_gym](https://github.com/leggedrobotics/legged_gym).
-And is used as an submodule in [PegasusFlow](https://github.com/MasterYip/PegasusFlow)
+# 二.待办
+- [x] 示例 
+- [ ] 示例
+- [ ] 键鼠控制机器人运动
 
-## Newly Added Features
 
-- **`rsl_rl` 3.3.0 support**: Update support from rsl_rl 1.0.2 to 3.3.0.
-- **Nvidia Warp SDF & Raycasting**: Integration of Nvidia Warp SDF, raycasting and depth camera for enhanced environment interaction.
-- **Main-Rollout Environment Architecture**: Implementation of a main-rollout architecture for sampling-based methods.
+# 三.git使用指南  
+## 1.链接远程仓库并同步分支状态
+```bash
+git remote add origin git@github.com:CZY412/OmniPerception.git
+git remote -v # 检查状态
+git fetch origin # 同步远程分支信息
+```
+## 2.拉取远程分支
+(还没本地分支）
+```bash
+git switch -c <新分支名1> origin/<新分支名2> # <新分支名1>为本地名称，origin/<新分支名2>为远程名称，-c是新建再拉取的意思
+```
+例如：git switch -c TLJ origin/TLJ
 
-<div class="columns is-centered has-text-centered is-vcentered">
-    <div class="column is-fullwidth is-centered">
-        <video id="method_video" autoplay controls muted loop playsinline width="70%">
-            <source src="doc/anymal_rollout.mp4" type="video/mp4">
-        </video>
-    </div>
-</div>
+## 3.修改提交信息
+```bash
+git log --oneline -n 5 # 查看提交历史
+git reset --soft HEAD~1 # 软撤回，已经修改的部分保留为已暂存状态
+git reset --mixed HEAD~1 # 或者取消暂存，改为未暂存状态
 
-https://github.com/user-attachments/assets/f9a9bcac-ec0e-4ffe-bc07-01bdd7ab75f7
+git add . 
+git commit -m ""
+git push --force-with-lease origin 分支名 # 强制推送，用本地历史替换远端
+```
 
-- **Confined Terrain Generation & OBJ Terrain Support**: Added confined terrain generation and support for OBJ terrains. To generate OBJ terrains, you can refer to [leggedrobotics/terrain-generator](https://github.com/leggedrobotics/terrain-generator), [MasterYip/blender_robotic_utils](https://github.com/MasterYip/blender_robotic_utils).
-- **Miscellaneous Enhancements**:
-  - gym_visualizer integration
-  - benchmarking tools
-  - etc.
+## 4.基于当前分支新建分支
+```bash
+git checkout -b temp
+git push -u origin temp
+```
+
+## 5.重命名分支
+```bash
+git branch -m temp
+```
+
+## 6.删除分支
+```bash
+git branch -d temp
+```
+
+## 7.合并分支
+```bash
+git merge --no-ff temp # 把temp合并到当前分支
+```
+
+## 8.回退与恢复
+```bash
+git checkout <哈希值>
+
+git checkout main
+```

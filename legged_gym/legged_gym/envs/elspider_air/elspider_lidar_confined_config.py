@@ -10,6 +10,7 @@ Configuration for ElSpider LiDAR Confined Space Navigation Task
 """
 
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
+from dataclasses import dataclass, field
 
 SAME_DIM_POLICY_HIDDEN_DIMS = [128, 64, 32]
 SAME_DIM_INIT_NOISE_STD = 0.35
@@ -28,7 +29,7 @@ class ElSpiderLidarConfinedCfg(LeggedRobotCfg):
         # Goal observations: 2 (direction_angle, normalized_distance)
         num_lidar_obs = 96  # num_theta_bins × num_phi_bins
         num_goal_obs = 2    # goal direction angle + normalized distance
-        num_observations = 66 + 187 + 96 + 2  # 351 total
+        num_observations = 66 + 96 + 2  # 351 total
         
         episode_length_s = 24  # Longer episode to reach goal
 
@@ -60,8 +61,8 @@ class ElSpiderLidarConfinedCfg(LeggedRobotCfg):
         num_phi_bins = 8     # Elevation bins for observation
         
         # Sensor mounting position (relative to robot base frame)
-        sensor_offset = [0.0, 0.0, 0.15]  # [x, y, z] in meters
-        sensor_rotation_deg = [0.0, 0.0, 0.0]  # [roll, pitch, yaw] in degrees
+        sensor_offset = [0.3, 0.0, 0.35]  # [x, y, z] in meters
+        sensor_rotation_deg = [3.14, 0.0, 0.0]  # [roll, pitch, yaw] in degrees
 
     class terrain(LeggedRobotCfg.terrain):
         """Terrain configuration for confined spaces."""
@@ -77,7 +78,7 @@ class ElSpiderLidarConfinedCfg(LeggedRobotCfg):
         restitution = 0.
         
         # Height measurement settings
-        measure_heights = True
+        measure_heights = False
         measured_points_x = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1,
                            0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
         measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5]
@@ -364,7 +365,7 @@ class ElSpiderLidarFlatPretrainCfg(ElSpiderLidarConfinedCfg):
     class terrain(ElSpiderLidarConfinedCfg.terrain):
         mesh_type = 'plane'
         curriculum = False
-        measure_heights = True
+        measure_heights = False
         goal_navigation = False
         goal_offset_y = 2.0
 
@@ -414,7 +415,7 @@ class ElSpiderLidarPoseAdaptSameDimCfg(ElSpiderLidarConfinedCfg):
     class terrain(ElSpiderLidarConfinedCfg.terrain):
         mesh_type = 'plane'
         curriculum = False
-        measure_heights = True
+        measure_heights = False
         goal_navigation = False
 
     class commands(ElSpiderLidarConfinedCfg.commands):
@@ -480,7 +481,7 @@ class ElSpiderLidarFlatSkillSameDimCfg(ElSpiderLidarConfinedCfg):
     class terrain(ElSpiderLidarConfinedCfg.terrain):
         mesh_type = 'plane'
         curriculum = False
-        measure_heights = True
+        measure_heights = False
         goal_navigation = False
 
     class commands(ElSpiderLidarConfinedCfg.commands):
@@ -503,14 +504,14 @@ class ElSpiderLidarFlatSkillSameDimCfg(ElSpiderLidarConfinedCfg):
         reward_max_stage = 1
 
         class scales(ElSpiderLidarConfinedCfg.rewards.scales):
-            tracking_lin_vel = 1.0
-            tracking_ang_vel = 0.5
+            tracking_lin_vel = 3.5
+            tracking_ang_vel = 2.0
             lin_vel_z = -2.0
             ang_vel_xy = -0.05
             orientation = -5.0
             torques = -0.00001
             dof_acc = -5e-8
-            base_height = -8.0
+            base_height = -12.0
             feet_slip = [-0.0, -0.4]
             feet_air_time = 0.8
             gait_2_step = -5.0
@@ -524,6 +525,7 @@ class ElSpiderLidarFlatSkillSameDimCfg(ElSpiderLidarConfinedCfg):
             goal_progress = 0.0
             goal_bonus = 0.0
             goal_heading = 0.0
+            async_gait_scheduler = [-0.4, -0.4, -0.4]
 
 
 class ElSpiderLidarFlatSkillSameDimCfgPPO(ElSpiderLidarConfinedCfgPPO):
@@ -551,7 +553,7 @@ class ElSpiderLidarMixedTerrainSameDimCfg(ElSpiderLidarConfinedCfg):
     class terrain(ElSpiderLidarConfinedCfg.terrain):
         mesh_type = 'trimesh'
         curriculum = True
-        measure_heights = True
+        measure_heights = False
         goal_navigation = False
         max_init_terrain_level = 0
         terrain_length = 4.0
@@ -736,7 +738,7 @@ class ElSpiderLidarWalkFlatSameDimCfg(ElSpiderLidarConfinedCfg):
     class terrain(ElSpiderLidarConfinedCfg.terrain):
         mesh_type = 'plane'
         curriculum = False
-        measure_heights = True
+        measure_heights = False
         goal_navigation = False
         goal_offset_y = 2.0
 

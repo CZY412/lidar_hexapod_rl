@@ -24,6 +24,7 @@ import warp as wp
 import trimesh
 
 from legged_gym.envs.elspider_air.elspider import ElSpider
+from legged_gym.envs.elspider_air.elspider_lidar_confined_config import ElSpiderLidarConfinedCfg
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.utils import GaitScheduler, GaitSchedulerCfg, AsyncGaitSchedulerCfg, AsyncGaitScheduler
 from legged_gym.utils.helpers import class_to_dict
@@ -125,6 +126,45 @@ def downsample_spherical_points_vectorized(sphere_points: torch.Tensor,
     downsampled[:, :, 2] = phi_centers_flat.unsqueeze(0)
     return downsampled
 
+def farthest_point_sampling(point_cloud, sample_size):
+    """
+    Sample points using the farthest point sampling algorithm
+    Args:
+        point_cloud: Tensor of shape (num_envs, 1, num_points,1, 3)
+        sample_size: Number of points to sample
+    Returns:
+        Downsampled point cloud of shape (num_envs, 1, sample_size, 3)
+    """
+    num_envs, _, num_points, _ = point_cloud.shape
+    device = point_cloud.device
+    result = []
+    
+    for env_idx in range(num_envs):
+        points = point_cloud[env_idx, 0]  # (num_points, 3)
+        
+        # Initialize with a random point
+        sampled_indices = torch.zeros(sample_size, dtype=torch.long, device=device)
+        sampled_indices[0] = torch.randint(0, num_points, (1,), device=device)
+        
+        # Calculate distances
+        distances = torch.norm(points - points[sampled_indices[0]], dim=1)
+        
+        # Iteratively select farthest points
+        for i in range(1, sample_size):
+            # Select the farthest point
+            sampled_indices[i] = torch.argmax(distances)
+            
+            # Update distances
+            if i < sample_size - 1:
+                new_distances = torch.norm(points - points[sampled_indices[i]], dim=1)
+                distances = torch.min(distances, new_distances)
+        
+        # Get the sampled points
+        sampled_points = points[sampled_indices]
+        result.append(sampled_points.unsqueeze(0))  # Add sensor dimension back
+    
+    return torch.stack(result)
+
 
 class ElSpiderLidar(ElSpider):
     """ElSpider robot with LiDAR sensor for confined space navigation.
@@ -134,7 +174,7 @@ class ElSpiderLidar(ElSpider):
     - LiDAR-based observations for obstacle avoidance
     - Rewards for collision avoidance in confined spaces
     """
-
+    cfg: ElSpiderLidarConfinedCfg # 类型注解
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
         # Initialize LiDAR configuration before calling parent __init__
         self._init_lidar_cfg(cfg)
@@ -444,24 +484,6 @@ class ElSpiderLidar(ElSpider):
 
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
             self._draw_debug_vis()
-
-    # def post_physics_step(self):
-    #     """Update after physics step, including LiDAR sensor and goal tracking."""
-    #     # Update sensor pose before parent's post_physics_step
-    #     self._update_sensor_pose()
-        
-    #     # Update LiDAR sensor
-    #     self.lidar_update_time += self.dt
-    #     if self.lidar_update_time >= self.lidar_update_interval:
-    #         self._update_lidar()
-    #         self.lidar_update_time = 0.0
-        
-    #     # Update goal distance tracking (before rewards are computed)
-    #     if self.goal_navigation:
-    #         self._update_goal_tracking()
-        
-    #     # Call parent's post_physics_step
-    #     super().post_physics_step()
 
     def _update_lidar(self):
         """Update LiDAR sensor and process observations."""
@@ -1110,43 +1132,3 @@ class ElSpiderLidar(ElSpider):
                 self.viewer, gymapi.KEY_V, "toggle_viewer_sync") # 焦点在仿真与显示之间切换
             
             self.vis = GymVisualizer(self.gym, self.sim, self.viewer, self.envs)
-
-def farthest_point_sampling(point_cloud, sample_size):
-    """
-    Sample points using the farthest point sampling algorithm
-    Args:
-        point_cloud: Tensor of shape (num_envs, 1, num_points,1, 3)
-        sample_size: Number of points to sample
-    Returns:
-        Downsampled point cloud of shape (num_envs, 1, sample_size, 3)
-    """
-    num_envs, _, num_points, _ = point_cloud.shape
-    device = point_cloud.device
-    result = []
-    
-    for env_idx in range(num_envs):
-        points = point_cloud[env_idx, 0]  # (num_points, 3)
-        
-        # Initialize with a random point
-        sampled_indices = torch.zeros(sample_size, dtype=torch.long, device=device)
-        sampled_indices[0] = torch.randint(0, num_points, (1,), device=device)
-        
-        # Calculate distances
-        distances = torch.norm(points - points[sampled_indices[0]], dim=1)
-        
-        # Iteratively select farthest points
-        for i in range(1, sample_size):
-            # Select the farthest point
-            sampled_indices[i] = torch.argmax(distances)
-            
-            # Update distances
-            if i < sample_size - 1:
-                new_distances = torch.norm(points - points[sampled_indices[i]], dim=1)
-                distances = torch.min(distances, new_distances)
-        
-        # Get the sampled points
-        sampled_points = points[sampled_indices]
-        result.append(sampled_points.unsqueeze(0))  # Add sensor dimension back
-    
-    return torch.stack(result)
-
