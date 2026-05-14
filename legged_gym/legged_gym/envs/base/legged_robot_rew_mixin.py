@@ -10,7 +10,7 @@ class LeggedRobotRewMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.speed_min = 0.1  # Minimum speed for some rewards
+        self.speed_min = 0.2  # Minimum speed for some rewards
 
     def _get_reward_scales(self, stage=0):
         self.reward_scales_dict = class_to_dict(self.cfg.rewards.scales)
@@ -53,6 +53,7 @@ class LeggedRobotRewMixin:
     def _reward_base_height(self):
         # Penalize base height away from target
         base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
+        # print(base_height)
         return torch.square(base_height - self.cfg.rewards.base_height_target)
 
     def _reward_base_foot_height(self):
@@ -83,6 +84,7 @@ class LeggedRobotRewMixin:
     # ------------ joint penalty ------------
     def _reward_torques(self):
         # Penalize torques
+        # print("torques:", self.torques[0])
         return torch.sum(torch.square(self.torques), dim=1)
 
     def _reward_dof_vel(self):
@@ -91,6 +93,9 @@ class LeggedRobotRewMixin:
 
     def _reward_dof_acc(self):
         # Penalize dof accelerations
+        # if self.common_step_counter % 50 == 0:
+        #     print("mean dof acc:", torch.mean(torch.sum(torch.square((self.last_dof_vel - self.dof_vel) / self.dt), dim=1)).item())
+        #     print("mean dof_vel:", torch.mean(torch.sum(torch.square(self.dof_vel), dim=1)).item())
         return torch.sum(torch.square((self.last_dof_vel - self.dof_vel) / self.dt), dim=1)
 
     def _reward_action_rate(self):
@@ -156,14 +161,16 @@ class LeggedRobotRewMixin:
         first_contact = (self.feet_air_time > 0.) * contact_filt
         self.feet_air_time += self.dt
         self.feet_contact_time += self.dt
-        rew_airTime = torch.sum((self.feet_air_time - 0.5) * first_contact, dim=1)  # reward only on first contact with the ground
-        rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > 0.1  # no reward for zero command
+        rew_airTime = torch.sum((self.feet_air_time - 0.2) * first_contact, dim=1)  # reward only on first contact with the ground
+        rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > self.speed_min  # no reward for zero command
         self.feet_air_time *= ~contact_filt
         self.feet_contact_time *= contact_filt
         return rew_airTime
 
     def _reward_feet_contact_forces(self):
-        # penalize high contact forces
+        # # penalize high contact forces
+        # print(torch.norm(self.contact_forces[0, self.feet_indices, :], dim=-1))
+        # print(torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) - self.cfg.rewards.max_contact_force).clip(min=0.), dim=1))
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) - self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
 
     # ------------ 2 step gait penalty ------------
@@ -178,12 +185,9 @@ class LeggedRobotRewMixin:
         async_rr_fr = self._async_reward_func(3, 1)
         async_reward = (async_fl_fr + async_fl_rl + async_rr_rl + async_rr_fr) / 4
         re = sync_reward + async_reward
-        if self.cfg.commands.heading_command:
-            re = re * torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
-                                    torch.abs(self.commands[:, 3]) >= self.speed_min/ 2)
-        else:
-            re = re * torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
-                                    torch.abs(self.commands[:, 2]) >= self.speed_min/ 2)
+
+        re = re * torch.logical_or(torch.norm(self.commands[:, :2], dim=1) > self.speed_min, 
+                                torch.abs(self.commands[:, 2]) >= self.speed_min/ 2)
         return re
     
     def _sync_reward_func(self, foot_0: int, foot_1: int, max_err=2) -> torch.Tensor:
@@ -218,8 +222,52 @@ class LeggedRobotRewMixin:
 
     def _reward_stand_still(self):
         # Penalize motion at zero commands
-        return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (torch.norm(self.commands[:, :2], dim=1) < self.speed_min)
+        rew = torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (torch.norm(self.commands[:, :2], dim=1) < self.speed_min)
+        # print(rew)
+        return rew
 
+
+    def _reward_stand_still2(self):
+        # Parameters
+        contact_count_weight = 0.1
+        force_normalization_scale = 50.0
+        contact_time_decay_scale = 0.5
+        
+        # Combination weights
+        joint_position_weight = 0.5
+        contact_count_penalty_weight = 0.3
+        contact_stability_weight = 0.4
+        contact_time_weight = 0.0
+        
+        # Small Cmd Mask
+        small_command_mask = (torch.norm(self.commands[:, :2], dim=1) < self.speed_min) & \
+                           (torch.abs(self.commands[:, 2]) < self.speed_min)
+        
+        # 1.Penalize deviation from default joint positions
+        joint_position_penalty = torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1)
+        
+        # 2.Penalize unstable foot contacts
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
+        num_feet_in_contact = torch.sum(contact.float(), dim=1)
+        # Penalty for fewer feet in contact
+        contact_count_penalty = (len(self.feet_indices) - num_feet_in_contact) * contact_count_weight
+        
+        # 3.Penalty for unstable contact forces (high std across feet)
+        contact_forces_z = self.contact_forces[:, self.feet_indices, 2]
+        contact_stability_penalty = torch.std(contact_forces_z, dim=1) / force_normalization_scale  # Normalize by reasonable force scale
+        
+        # 4.Penalty for short contact times (encourage longer contact)
+        avg_contact_time = torch.mean(self.feet_contact_time, dim=1)
+        contact_time_penalty = torch.exp(-avg_contact_time / contact_time_decay_scale)  # Penalty decreases with longer contact
+        
+        # Combine all penalties with weights
+        total_penalty = (joint_position_penalty * joint_position_weight + 
+                        contact_count_penalty * contact_count_penalty_weight + 
+                        contact_stability_penalty * contact_stability_weight + 
+                        contact_time_penalty * contact_time_weight)
+        
+        # Apply penalty only when commands are small
+        return total_penalty * small_command_mask.float()
 
     # ------------ base reward ------------
 

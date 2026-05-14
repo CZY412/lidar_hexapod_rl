@@ -152,6 +152,7 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
             print("Debug visualization enabled, drawing debug visuals")
             self._draw_debug_vis()
+            self.draw_foot_hip_positions()
 
     def check_termination(self):
         """ Check if environments need to be reset
@@ -436,7 +437,7 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
                 self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
 
         # set small commands to zero
-        self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
+        # self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > self.speed_min).unsqueeze(1)
 
     def _compute_torques(self, actions):
         """ Compute torques from actions.
@@ -686,8 +687,14 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
             self.reward_functions.append(getattr(self, name))
 
         # reward episode sums
-        self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-                             for name in self.reward_scales.keys()}
+        if self.init_done:
+            # This means we are adjusting reward scales & functions during training
+            for name in self.reward_scales.keys():
+                if name not in self.episode_sums:
+                    self.episode_sums[name] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        else:
+            self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+                                for name in self.reward_scales.keys()}
 
     def _create_ground_plane(self):
         """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
@@ -896,6 +903,20 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
                 z = heights[j]
                 sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
                 gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
+
+    def draw_foot_hip_positions(self):
+        hip_pos=self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, [3,7,11,15,19,23], 0:3]
+        self.gym.clear_lines(self.viewer)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        sphere_geom = gymutil.WireframeSphereGeometry(0.02, 4, 4, None, color=(1, 1, 0))
+        for i in range(self.num_envs):
+            for j in range(hip_pos.shape[1]):
+                x = hip_pos[i,j,0].cpu().numpy()
+                y = hip_pos[i,j,1].cpu().numpy()
+                z = hip_pos[i,j,2].cpu().numpy()
+                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
+
 
     def _init_height_points(self):
         """ Returns points at which the height measurments are sampled (in base frame)

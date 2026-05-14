@@ -420,7 +420,21 @@ class ElSpiderLidar(ElSpider):
             self.goal_distance = torch.zeros(self.num_envs, device=self.device)
             self.prev_goal_distance = torch.zeros(self.num_envs, device=self.device)
             self.goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            self.goal_offset_x = getattr(self.cfg.terrain, 'goal_offset_x', 0.0)
             self.goal_offset_y = getattr(self.cfg.terrain, 'goal_offset_y', 4.0)
+            waypoint_offsets = getattr(self.cfg.terrain, 'goal_waypoints', None)
+            if waypoint_offsets is not None and len(waypoint_offsets) > 0:
+                self.goal_waypoints = torch.tensor(waypoint_offsets, dtype=torch.float, device=self.device)
+                self.num_goal_waypoints = self.goal_waypoints.shape[0]
+            else:
+                self.goal_waypoints = None
+                self.num_goal_waypoints = 0
+            self.current_goal_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self.waypoint_reach_threshold = getattr(
+                self.cfg.rewards,
+                'waypoint_reach_threshold',
+                getattr(self.cfg.rewards, 'goal_reach_threshold', 1.0),
+            )
 
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
@@ -602,15 +616,22 @@ class ElSpiderLidar(ElSpider):
         noise_vec[12:30] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
         noise_vec[30:48] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
         noise_vec[48:66] = 0.  # previous actions
+
+        proprio_obs_dim = 66
+        height_obs_dim = 0
         
         # Height measurements noise
         if self.cfg.terrain.measure_heights:
-            noise_vec[66:253] = noise_scales.height_measurements * noise_level * self.obs_scales.height_measurements
+            height_obs_dim = len(self.cfg.terrain.measured_points_x) * len(self.cfg.terrain.measured_points_y)
+            height_end = proprio_obs_dim + height_obs_dim
+            noise_vec[proprio_obs_dim:height_end] = (
+                noise_scales.height_measurements * noise_level * self.obs_scales.height_measurements
+            )
         
         # LiDAR observation noise
-        num_lidar_obs = self.num_theta_bins * self.num_phi_bins
+        num_lidar_obs = getattr(self.cfg.env, 'num_lidar_obs', self.num_theta_bins * self.num_phi_bins)
         lidar_noise = getattr(noise_scales, 'lidar', 0.05) * noise_level
-        lidar_start = 253
+        lidar_start = proprio_obs_dim + height_obs_dim
         lidar_end = lidar_start + num_lidar_obs
         noise_vec[lidar_start:lidar_end] = lidar_noise
         
@@ -676,8 +697,18 @@ class ElSpiderLidar(ElSpider):
         """Set goal positions for given environments.
         Goal is placed at +Y offset from env_origin (far end of corridor).
         """
-        # Goal position: same X as origin, offset Y forward, same Z as origin
-        self.goal_positions[env_ids, 0] = self.env_origins[env_ids, 0]  # Same X
+        if self.goal_waypoints is not None and self.num_goal_waypoints > 0:
+            self.current_goal_idx[env_ids] = 0
+            self._set_current_goal_positions(env_ids)
+            self.goal_distance[env_ids] = torch.norm(
+                self.root_states[env_ids, :2] - self.goal_positions[env_ids, :2], dim=1
+            )
+            self.prev_goal_distance[env_ids] = self.goal_distance[env_ids].clone()
+            self.goal_reached[env_ids] = False
+            return
+
+        # Goal position: offset X/Y from origin, same Z as origin
+        self.goal_positions[env_ids, 0] = self.env_origins[env_ids, 0] + self.goal_offset_x
         self.goal_positions[env_ids, 1] = self.env_origins[env_ids, 1] + self.goal_offset_y  # Forward Y
         self.goal_positions[env_ids, 2] = self.env_origins[env_ids, 2]  # Same Z
         
@@ -693,20 +724,48 @@ class ElSpiderLidar(ElSpider):
         )
         self.prev_goal_distance[env_ids] = self.goal_distance[env_ids].clone()
         self.goal_reached[env_ids] = False
+
+    def _set_current_goal_positions(self, env_ids):
+        """Set the active waypoint target for the selected environments."""
+        if self.goal_waypoints is None or self.num_goal_waypoints == 0 or len(env_ids) == 0:
+            return
+
+        waypoint_offsets = self.goal_waypoints[self.current_goal_idx[env_ids]]
+        self.goal_positions[env_ids, 0] = self.env_origins[env_ids, 0] + waypoint_offsets[:, 0]
+        self.goal_positions[env_ids, 1] = self.env_origins[env_ids, 1] + waypoint_offsets[:, 1]
+        self.goal_positions[env_ids, 2] = self.env_origins[env_ids, 2]
     
     def _update_goal_tracking(self):
         """Update goal distance and goal observations each step."""
         # Save previous distance
         self.prev_goal_distance[:] = self.goal_distance.clone()
-        
-        # Compute current distance to goal (XY plane)
+
+        # Compute current distance to active goal / waypoint (XY plane)
         self.goal_distance[:] = torch.norm(
             self.root_states[:, :2] - self.goal_positions[:, :2], dim=1
         )
-        
-        # Check if goal reached
-        goal_threshold = getattr(self.cfg.rewards, 'goal_reach_threshold', 1.0)
-        self.goal_reached[:] = self.goal_distance < goal_threshold
+
+        if self.goal_waypoints is not None and self.num_goal_waypoints > 0:
+            reached_waypoint = self.goal_distance < self.waypoint_reach_threshold
+            final_waypoint = self.current_goal_idx >= (self.num_goal_waypoints - 1)
+            advance_waypoint = reached_waypoint & (~final_waypoint)
+
+            if torch.any(advance_waypoint):
+                advance_env_ids = advance_waypoint.nonzero(as_tuple=False).flatten()
+                self.current_goal_idx[advance_env_ids] += 1
+                self._set_current_goal_positions(advance_env_ids)
+                self.goal_distance[advance_env_ids] = torch.norm(
+                    self.root_states[advance_env_ids, :2] - self.goal_positions[advance_env_ids, :2],
+                    dim=1,
+                )
+                self.prev_goal_distance[advance_env_ids] = self.goal_distance[advance_env_ids].clone()
+                reached_waypoint[advance_env_ids] = False
+
+            self.goal_reached[:] = reached_waypoint & final_waypoint
+        else:
+            # Check if goal reached
+            goal_threshold = getattr(self.cfg.rewards, 'goal_reach_threshold', 1.0)
+            self.goal_reached[:] = self.goal_distance < goal_threshold
         
         # Compute goal observation: [direction_angle, normalized_distance]
         # Direction to goal in robot's local frame
