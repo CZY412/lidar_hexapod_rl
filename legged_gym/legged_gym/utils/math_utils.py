@@ -34,6 +34,125 @@ from torch import Tensor
 import numpy as np
 from typing import Tuple
 
+
+@torch.jit.script
+def quat_from_euler_xyz_tensor(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+    """Convert euler angles to quaternion (tensor version)"""
+    cy = torch.cos(yaw * 0.5)
+    sy = torch.sin(yaw * 0.5)
+    cr = torch.cos(roll * 0.5)
+    sr = torch.sin(roll * 0.5)
+    cp = torch.cos(pitch * 0.5)
+    sp = torch.sin(pitch * 0.5)
+    qw = cy * cr * cp + sy * sr * sp
+    qx = cy * sr * cp - sy * cr * sp
+    qy = cy * cr * sp + sy * sr * cp
+    qz = sy * cr * cp - cy * sr * sp
+    return torch.stack([qx, qy, qz, qw], dim=-1)
+
+
+@torch.jit.script
+def cart2sphere(cart: torch.Tensor) -> torch.Tensor:
+    """Convert cartesian coordinates to spherical (r, theta, phi)"""
+    epsilon = 1e-9
+    x = cart[:, 0]
+    y = cart[:, 1]
+    z = cart[:, 2]
+    r = torch.norm(cart, dim=1)
+    theta = torch.atan2(y, x)
+    phi = torch.asin(z / (r + epsilon))
+    return torch.stack((r, theta, phi), dim=-1)
+
+
+def downsample_spherical_points_vectorized(sphere_points: torch.Tensor, 
+                                           num_theta_bins: int = 10, 
+                                           num_phi_bins: int = 10,
+                                           default_range: float = 5.0) -> torch.Tensor:
+    """Downsample spherical points using minimum distance per bin.
+
+    Using min instead of average helps preserve narrow obstacles such as thin
+    columns that may otherwise be smoothed out by averaging.
+    """
+    num_envs = sphere_points.shape[0]
+    device = sphere_points.device
+    num_bins = num_theta_bins * num_phi_bins
+    
+    theta_min, theta_max = -3.14, 3.14
+    phi_min, phi_max = -0.5, 0.5  # Adjusted for typical LiDAR FOV
+    
+    r = sphere_points[:, :, 0]
+    theta = sphere_points[:, :, 1]
+    phi = sphere_points[:, :, 2]
+    
+    theta_bin = ((theta - theta_min) / (theta_max - theta_min) * num_theta_bins).long()
+    phi_bin = ((phi - phi_min) / (phi_max - phi_min) * num_phi_bins).long()
+    theta_bin = torch.clamp(theta_bin, 0, num_theta_bins - 1)
+    phi_bin = torch.clamp(phi_bin, 0, num_phi_bins - 1)
+    bin_indices = theta_bin * num_phi_bins + phi_bin
+    
+    # Preserve the nearest obstacle in each bin. Empty bins stay at max range.
+    min_r = torch.full((num_envs, num_bins), default_range, device=device)
+    min_r.scatter_reduce_(1, bin_indices, r, reduce="amin", include_self=True)
+    
+    theta_centers = torch.linspace(
+        theta_min + (theta_max - theta_min) / (2 * num_theta_bins),
+        theta_max - (theta_max - theta_min) / (2 * num_theta_bins),
+        num_theta_bins, device=device
+    )
+    phi_centers = torch.linspace(
+        phi_min + (phi_max - phi_min) / (2 * num_phi_bins),
+        phi_max - (phi_max - phi_min) / (2 * num_phi_bins),
+        num_phi_bins, device=device
+    )
+    theta_grid, phi_grid = torch.meshgrid(theta_centers, phi_centers, indexing='ij')
+    theta_centers_flat = theta_grid.reshape(-1)
+    phi_centers_flat = phi_grid.reshape(-1)
+    
+    downsampled = torch.zeros(num_envs, num_bins, 3, device=device)
+    downsampled[:, :, 0] = min_r
+    downsampled[:, :, 1] = theta_centers_flat.unsqueeze(0)
+    downsampled[:, :, 2] = phi_centers_flat.unsqueeze(0)
+    return downsampled
+
+def farthest_point_sampling(point_cloud, sample_size):
+    """
+    Sample points using the farthest point sampling algorithm
+    Args:
+        point_cloud: Tensor of shape (num_envs, 1, num_points,1, 3)
+        sample_size: Number of points to sample
+    Returns:
+        Downsampled point cloud of shape (num_envs, 1, sample_size, 3)
+    """
+    num_envs, _, num_points, _ = point_cloud.shape
+    device = point_cloud.device
+    result = []
+    
+    for env_idx in range(num_envs):
+        points = point_cloud[env_idx, 0]  # (num_points, 3)
+        
+        # Initialize with a random point
+        sampled_indices = torch.zeros(sample_size, dtype=torch.long, device=device)
+        sampled_indices[0] = torch.randint(0, num_points, (1,), device=device)
+        
+        # Calculate distances
+        distances = torch.norm(points - points[sampled_indices[0]], dim=1)
+        
+        # Iteratively select farthest points
+        for i in range(1, sample_size):
+            # Select the farthest point
+            sampled_indices[i] = torch.argmax(distances)
+            
+            # Update distances
+            if i < sample_size - 1:
+                new_distances = torch.norm(points - points[sampled_indices[i]], dim=1)
+                distances = torch.min(distances, new_distances)
+        
+        # Get the sampled points
+        sampled_points = points[sampled_indices]
+        result.append(sampled_points.unsqueeze(0))  # Add sensor dimension back
+    
+    return torch.stack(result)
+
 # @ torch.jit.script
 
 def quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

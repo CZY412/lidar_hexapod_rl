@@ -150,7 +150,7 @@ class LeggedRobot(BaseTask, LeggedRobotRewMixin):
         self.last_root_vel[:] = self.root_states[:, 7:13]
 
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
-            print("Debug visualization enabled, drawing debug visuals")
+            # print("Debug visualization enabled, drawing debug visuals")
             self._draw_debug_vis()
             self.draw_foot_hip_positions()
 

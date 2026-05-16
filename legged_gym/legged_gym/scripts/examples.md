@@ -14,6 +14,14 @@ python3 ./legged_gym/legged_gym/scripts/train.py --task=elspider_lidar_confined 
 python3 ./legged_gym/legged_gym/scripts/train.py --task=elspider_lidar_tunnel --num_envs=500 --max_iterations=300 --headless
 
 python3 ./legged_gym/legged_gym/scripts/train.py --task=elspider_lidar_flat_same_dim --num_envs=500 --max_iterations=300 --headless
+
+
+python3 ./legged_gym/legged_gym/scripts/train.py --task=el4090_spider_normal --num_envs=4 --max_iterations=100
+
+python3 ./legged_gym/legged_gym/scripts/train.py --task=el4090_lidar --num_envs=4 --max_iterations=100
+
+
+
 ```
 
 # 3.测试
@@ -22,6 +30,12 @@ python3 ./legged_gym/legged_gym/scripts/play.py \
         --task elspider_lidar_flat_same_dim \
         --num_envs 1 \
         --load_run v1 \
+        --checkpoint -1
+
+python3 ./legged_gym/legged_gym/scripts/play.py \
+        --task el4090_lidar \
+        --num_envs 1 \
+        --load_run v2 \
         --checkpoint -1
 ```
 
@@ -64,5 +78,7 @@ python3 /home/hithcat/Code/DaChuang/final/OmniPerception/legged_gym/legged_gym/s
 
 # Tensorboard
 ```bash
-tensorboard --logdir /home/hithcat/Code/DaChuang/LidarSpider/legged_gym/logs/elspider_air_rough_lidar/v1
+tensorboard --logdir ./legged_gym/logs/elspider_lidar_flat_same_dim/v1
+
+tensorboard --logdir ./legged_gym/logs/el4090_spider_normal/v1
 ```

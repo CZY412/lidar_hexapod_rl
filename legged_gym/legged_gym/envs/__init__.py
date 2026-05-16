@@ -142,6 +142,9 @@ from .el_4090.spider_nomal.el4090_spider_config import El4090SpiderCfg, El4090Sp
 from .el_4090.safe.el_4090_safe import EL_4090_Safe
 from .el_4090.safe.el_4090_safe_config import El4090SafeCfg, El4090SafeCfgPPO
 
+from .el_4090.spider_lidar.el_4090_lidar import El4090Lidar
+from .el_4090.spider_lidar.el_4090_lidar_config import El4090LidarCfg, El4090LidarCfgPPO
+
 
 task_registry.register("anymal_c_rough", Anymal, AnymalCRoughCfg(), AnymalCRoughCfgPPO())
 task_registry.register("anymal_c_flat", Anymal, AnymalCFlatCfg(), AnymalCFlatCfgPPO())
@@ -235,6 +238,11 @@ task_registry.register("franka_batch_rollout", FrankaBatchRollout, FrankaBatchRo
 
 task_registry.register("el4090_spider_normal", EL_4090, El4090SpiderCfg(), El4090SpiderCfgPPO())
 task_registry.register("el_4090_safe", EL_4090_Safe, El4090SafeCfg(), El4090SafeCfgPPO())
+
+# 激光雷达六足机器人大创新任务注册
+task_registry.register("el4090_lidar", El4090Lidar, El4090LidarCfg(), El4090LidarCfgPPO())
+
+
 # Register ElSpider LiDAR confined space tasks (基于激光雷达的六足机器人受限空间避障)
 task_registry.register("elspider_lidar_confined", ElSpiderLidar,
                        ElSpiderLidarConfinedCfg(), ElSpiderLidarConfinedCfgPPO())

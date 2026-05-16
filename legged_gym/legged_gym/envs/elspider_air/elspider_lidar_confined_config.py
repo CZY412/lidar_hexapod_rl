@@ -10,7 +10,6 @@ Configuration for ElSpider LiDAR Confined Space Navigation Task
 """
 
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
-from dataclasses import dataclass, field
 
 SAME_DIM_POLICY_HIDDEN_DIMS = [128, 64, 32]
 SAME_DIM_INIT_NOISE_STD = 0.35
@@ -61,8 +60,8 @@ class ElSpiderLidarConfinedCfg(LeggedRobotCfg):
         num_phi_bins = 8     # Elevation bins for observation
         
         # Sensor mounting position (relative to robot base frame)
-        sensor_offset = [0.3, 0.0, 0.35]  # [x, y, z] in meters
-        sensor_rotation_deg = [3.14, 0.0, 0.0]  # [roll, pitch, yaw] in degrees
+        sensor_offset = [0.0, 0.0, 0.15]  # [x, y, z] in meters
+        sensor_rotation_deg = [0.0, 0.0, 0.0]  # [roll, pitch, yaw] in degrees
 
     class terrain(LeggedRobotCfg.terrain):
         """Terrain configuration for confined spaces."""
@@ -696,7 +695,6 @@ class ElSpiderLidarFlatSkillSameDimCfg(ElSpiderLidarConfinedCfg):
             goal_progress = 0.0
             goal_bonus = 0.0
             goal_heading = 0.0
-            async_gait_scheduler = [-0.4, -0.4, -0.4]
 
 
 class ElSpiderLidarFlatSkillSameDimCfgPPO(ElSpiderLidarConfinedCfgPPO):
