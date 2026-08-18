@@ -1,0 +1,235 @@
+"""Frozen public contracts for ``envelope_adaptive_2``.
+
+All implementation agents MUST keep their modules compatible with the
+dataclasses, constants and function signatures documented in this file.
+No implementation agent may edit this file; it is owned by the integration
+owner (v4-pro) only.
+
+The actual implementations live in their own modules:
+    - ``utils/LidarSensor/lidar_sensor.py``  -> ``apply_noise`` (shared util patch)
+    - ``airy_mount.py``                      -> mapping table + mount self-test
+    - ``envelope_geometry.py``               -> hexagon / offset / grid collision
+    - ``map_generator.py``                   -> primitives -> occupancy -> warp mesh
+    - ``path_planner.py``                    -> A* / smoothing / noise / heading
+    - ``range_image.py``                     -> 5760 rays -> 450 range image
+    - ``el_4090_ea2_env.py``                 -> BaseTask integration
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Sequence, Tuple
+
+import numpy as np
+import torch
+
+# ---------------------------------------------------------------------------
+# Paths / constants (single source of truth)
+# ---------------------------------------------------------------------------
+EA2_DIR = Path(__file__).resolve().parent
+EA2_MAPPING_TABLE_FILE = EA2_DIR / "airy_mapping.pt"
+
+EA2_MAP_SIZE_M = 12.0
+EA2_RESOLUTION_M = 0.1
+EA2_GRID_SHAPE = (120, 120)  # (rows=iy, cols=ix)
+EA2_WORLD_MIN_XY = -6.0
+EA2_WORLD_MAX_XY = 6.0
+EA2_GROUND_MARGIN_M = 2.0
+
+# Airy (matches LidarSensor.generate_AIRY defaults)
+EA2_AIRY_N_AZIMUTH = 60
+EA2_AIRY_N_ELEVATION = 96
+EA2_AIRY_HORIZONTAL_RES_DEG = 6.0
+EA2_AIRY_VERTICAL_FOV_DEG = (0.0, 90.0)
+EA2_N_RAYS = EA2_AIRY_N_AZIMUTH * EA2_AIRY_N_ELEVATION  # 5760
+EA2_RAY_INDEX = "i = az * 96 + el"  # LidarSensor C-order flatten
+
+# v2 bucketing: physical azimuth channels 18..42, elevation lines 6..95
+EA2_SELECTED_AZ = tuple(range(18, 43))   # 25 physical channels, theta 108..252 deg
+EA2_SELECTED_EL = tuple(range(6, 96))    # 90 lines, 5 per row -> 18 rows
+EA2_N_COLS = len(EA2_SELECTED_AZ)        # 25
+EA2_N_ROWS = len(EA2_SELECTED_EL) // 5   # 18
+EA2_RANGE_DIM = EA2_N_COLS * EA2_N_ROWS  # 450
+
+EA2_RANGE_MAX_M = 5.0   # effective aggregation range (normalization divisor)
+EA2_RANGE_MIN_M = 0.2   # applied in aggregation, NOT by the warp kernel
+EA2_LIDAR_FAR_PLANE_M = 60.0
+
+# Sensor mount (body frame)
+EA2_SENSOR_OFFSET_POS = (0.62, 0.0, 0.0)
+EA2_SENSOR_OFFSET_RPY = (0.0, math.pi / 2.0 + 0.35, 0.0)
+
+# Envelope (must stay identical to spider_envelop config; do not duplicate)
+ENVELOPE_SPEC_CONFIG_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "envs" / "el_4090" / "spider_envelop" / "el4090_spider_config.py"
+)
+
+# ---------------------------------------------------------------------------
+# Dataclasses shared between modules
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RectPrimitive:
+    """Wall / U-shape segment footprint. (x, y) world center, size=full extents."""
+
+    center: Tuple[float, float]
+    size: Tuple[float, float]  # (length_x, length_y)
+    yaw: float = 0.0
+    height: float = 1.5
+
+
+@dataclass(frozen=True)
+class PillarPrimitive:
+    """Square/circular pillar footprint. ``radius`` is half-side or radius."""
+
+    center: Tuple[float, float]
+    radius: float
+    height: float
+    square: bool = False
+    segments: int = 16
+
+
+@dataclass
+class MapData:
+    """Output of ``map_generator.generate_map``.
+
+    Arrays use world coordinates x/y in [-6, 6]; grid indexing follows
+    ``ix = floor((x + 6) / 0.1)``.  ``inflated`` is the 0.35 m (4-cell)
+    safety grid for A*/path checks and is computed once per fixed map.
+    """
+
+    occupancy: np.ndarray           # (120, 120) uint8, 1 = occupied
+    inflated: np.ndarray            # (120, 120) uint8, 1 = blocked
+    vertices: np.ndarray            # (V, 3) float32, watertight ground+obstacles
+    triangles: np.ndarray           # (T, 3) int32, CCW/outward-consistent winding
+    rects: Tuple[RectPrimitive, ...] = ()
+    pillars: Tuple[PillarPrimitive, ...] = ()
+    acceptance: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class PathData:
+    """Output of ``path_planner.plan_path`` (one env, one episode)."""
+
+    points: np.ndarray              # (P, 2) world x/y
+    yaws: np.ndarray                # (P,) tangent yaw, radians
+    arc: np.ndarray                 # (P,) cumulative arc length, starts at 0
+
+
+@dataclass(frozen=True)
+class MapGenCfg:
+    size_m: float = EA2_MAP_SIZE_M
+    resolution_m: float = EA2_RESOLUTION_M
+    grid_shape: Tuple[int, int] = EA2_GRID_SHAPE
+    boundary_occupied: bool = True
+    ground_margin_m: float = EA2_GROUND_MARGIN_M
+    inflation_m: float = 0.35
+    inflation_cells: int = 4
+    max_gen_attempts: int = 20
+    n_validation_paths: int = 12
+    min_solved_ratio: float = 0.8
+    path_near_obstacle_ratio: float = 0.3
+    near_obstacle_range: Tuple[float, float] = (0.7, 1.5)
+    require_constraint_primitive: bool = True
+
+
+@dataclass(frozen=True)
+class PathCfg:
+    speed_range: Tuple[float, float] = (0.5, 1.5)
+    resample_time_s: float = 4.0
+    delta_target_deg_range: Tuple[float, float] = (-20.0, 20.0)
+    omega_max: float = 1.5
+    k_p: float = 5.0
+    min_turn_radius: float = 1.0
+    resample_dist: float = 0.2
+    goal_min_obstacle_dist: float = 0.5
+    min_path_len: float = 3.0
+    noise_amp_range: Tuple[float, float] = (0.15, 0.25)
+    noise_fc_hz: float = 1.0
+    noise_retries: int = 8
+
+
+@dataclass(frozen=True)
+class SwayCfg:
+    pos_amp_range: Tuple[float, float] = (0.02, 0.05)
+    heading_amp_range: Tuple[float, float] = (0.05, 0.1)
+    fc_hz: float = 1.0
+
+
+@dataclass(frozen=True)
+class HeightCfg:
+    min_m: float = 0.53
+    max_m: float = 0.64
+    resample_time_s: float = 4.0
+    tau_s: float = 0.8
+    wobble_amp_range: Tuple[float, float] = (0.01, 0.02)
+    wobble_fc_hz: float = 1.0
+
+
+@dataclass(frozen=True)
+class LidarNoiseCfg:
+    enable: bool = True
+    pixel_std_dev_multiplier: float = 0.02
+    pixel_dropout_prob: float = 0.02
+    random_distance_noise: float = 0.0
+    random_angle_noise: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Function contracts (implementation modules MUST provide these signatures)
+# ---------------------------------------------------------------------------
+#
+# utils/LidarSensor/lidar_sensor.py
+#   def apply_noise(self, pixels: torch.Tensor, dists: torch.Tensor) \
+#           -> Tuple[torch.Tensor, torch.Tensor]
+#       - pixels (E,1,N,1,3), dists (E,1,N,1); gated by cfg.enable_sensor_noise
+#       - multiplicative Gaussian on range, dropout -> far_plane, all rays
+#       - reference implementation in README section 2.2.8
+#
+# airy_mount.py
+#   def build_airy_mapping_table() -> torch.Tensor          # (5760,) int64, -1
+#   def body_frame_ray_directions() -> torch.Tensor         # (5760, 3)
+#   def self_check_mapping_table(table) -> Dict[str, object]
+#       - asserts body-x>0, azimuth in [-80,80] deg,
+#         elevation in [-25,70] deg for all selected rays
+#
+# envelope_geometry.py
+#   def compute_hex_vertices(front_width, middle_width, back_width,
+#                            forward_limit, backward_limit) -> torch.Tensor
+#       # (..., 6, 2), vertex order B,D,F,E,C,A (legacy-compatible)
+#   def offset_hexagon(vertices, margin) -> torch.Tensor    # half-plane exact offset
+#   def point_in_hex(pts_xy, vertices) -> torch.Tensor      # bool mask (..., N)
+#   def collision_cell_ratio(hex_vertices_world_xy, occupancy,
+#                            world_to_grid_fn) -> torch.Tensor
+#       # covered occupied cells / covered cells, eps-protected
+#   def envelope_params_to_condition(params5: torch.Tensor,
+#                                    spec) -> torch.Tensor # (..., 8)
+#       # must reuse apply_env_morphology_priors (do not re-implement priors)
+#
+# map_generator.py
+#   def generate_map(cfg: MapGenCfg, seed: int) -> MapData
+#
+# path_planner.py
+#   def plan_path(occupancy: np.ndarray, inflated: np.ndarray,
+#                 start_xy, goal_xy, cfg: PathCfg,
+#                 rng: np.random.Generator) -> PathData
+#   def heading_update(heading, tangent, tangent_rate, delta_target,
+#                      v, dt, k_p, omega_max) -> Tuple[heading, omega, delta_actual]
+#   def ego_motion(v, heading, tangent, omega) -> Tuple[vx, vy, omega]
+#
+# range_image.py
+#   def aggregate_range_image(points: torch.Tensor, dists: torch.Tensor,
+#                             mapping: torch.Tensor,
+#                             max_range: float, r_min: float) -> torch.Tensor
+#       # (E,5760,3)/(E,5760) -> (E,450), min per bucket, empty = max_range
+#   def range_image_observation(range_image, max_range) -> torch.Tensor
+#
+# el_4090_ea2_env.py
+#   class EL_4090_EA2(BaseTask)
+#       - old legged_gym interface: step returns 5-tuple
+#       - defines self.dt, self.max_episode_length, time_outs in infos
+#       - all envs share world origin (env_origins=0), warp mesh authoritative

@@ -1,0 +1,184 @@
+"""Configuration for ``el4090_ea2`` (envelope_adaptive_2, M1).
+
+Environment cfg: simplified BaseTask, no robot actor, one global fixed map.
+PPO cfg: rsl_rl ``ActorCriticRecurrent`` (single GRU + MLP heads).
+
+All numeric values follow README v2.  Implementation agents must NOT edit this
+file; integration owner updates it only when the README contract changes.
+"""
+
+import math
+
+from legged_gym.envs.base.legged_robot_config import (
+    LeggedRobotCfg,
+    LeggedRobotCfgPPO,
+)
+
+
+class El4090EA2Cfg(LeggedRobotCfg):
+    """M1 envelope-perception environment config (BaseTask, no robot)."""
+
+    class env(LeggedRobotCfg.env):
+        num_envs = 1024  # start small; benchmark A*/raycast before scaling
+        num_observations = 453          # 450 range + 3 ego-motion
+        num_privileged_obs = None       # no asymmetric critic
+        num_actions = 5                 # raw envelope params (sigmoid-affine in env)
+        env_spacing = 0.                # all envs share the single global map origin
+        episode_length_s = 20.
+        send_timeouts = True
+
+    class sim(LeggedRobotCfg.sim):
+        dt = 0.02                       # 50 Hz policy step
+        substeps = 1
+        gravity = [0.0, 0.0, -9.81]
+        up_axis = 1
+
+        class physx(LeggedRobotCfg.sim.physx):
+            num_threads = 10
+            solver_type = 1
+            num_position_iterations = 4
+            num_velocity_iterations = 0
+            contact_offset = 0.01
+            rest_offset = 0.0
+            bounce_threshold_velocity = 0.5
+            max_depenetration_velocity = 1.0
+            max_gpu_contact_pairs = 2 ** 23
+            default_buffer_size_multiplier = 5
+            contact_collection = 2
+
+    class map:
+        size_m = 12.0
+        resolution_m = 0.1
+        grid_shape = [120, 120]
+        world_min_xy = -6.0
+        world_max_xy = 6.0
+        boundary_occupied = True
+        ground_margin_m = 2.0            # warp ground plane extends past map edges
+        inflation_m = 0.35               # A* lateral safety (3.5 cells -> 4)
+        inflation_cells = 4
+        max_gen_attempts = 20
+        n_validation_paths = 12          # 8~16 validation A* runs at map acceptance
+        min_solved_ratio = 0.8
+        path_near_obstacle_ratio = 0.3
+        near_obstacle_range = [0.7, 1.5]
+        require_constraint_primitive = True
+
+    class obstacles:
+        height_range = [1.5, 2.0]
+        wall_length_range = [2.0, 5.0]
+        wall_thickness_range = [0.2, 0.5]
+        pillar_half_range = [0.2, 0.4]   # half-side / radius (diameter 0.4~0.8)
+        pillar_polygon_segments = 16
+        corridor_width_range = [1.0, 2.0]
+        side_wall_count_range = [2, 5]
+        u_shape_opening_range = [1.0, 1.5]
+
+    class path:
+        speed_range = [0.5, 1.5]
+        resample_time_s = 4.0
+        delta_target_deg_range = [-20.0, 20.0]
+        omega_max = 1.5
+        k_p = 5.0
+        min_turn_radius = 1.0
+        resample_dist = 0.2
+        goal_min_obstacle_dist = 0.5
+        min_path_len = 3.0
+        noise_amp_range = [0.15, 0.25]
+        noise_fc_hz = 1.0
+        noise_retries = 8
+
+    class sway:
+        pos_amp_range = [0.02, 0.05]
+        heading_amp_range = [0.05, 0.1]
+        fc_hz = 1.0
+
+    class height:
+        min_m = 0.53                     # spider_envelop spider target
+        max_m = 0.64                     # spider_envelop mammal target
+        resample_time_s = 4.0
+        tau_s = 0.8
+        wobble_amp_range = [0.01, 0.02]
+        wobble_fc_hz = 1.0
+
+    class lidar:
+        enable = True
+        airy_n_azimuth = 60
+        airy_n_elevation = 96
+        airy_horizontal_res_deg = 6.0
+        airy_vertical_fov_deg = [0.0, 90.0]
+        far_plane = 60.0                 # LidarConfig.max_range
+        min_range = 0.2                  # aggregation-side only (kernel ignores it)
+        update_frequency_hz = 10.0
+        effective_max_range = 5.0        # 450-bucket valid range + normalization
+        offset_pos = [0.62, 0.0, 0.0]
+        sensor_offset_rpy = [0.0, math.pi / 2.0 + 0.35, 0.0]
+        pointcloud_in_world_frame = False
+        randomize_placement = False
+
+        # LidarConfig noise fields; applied to ALL rays (camera-original semantics)
+        enable_sensor_noise = True
+        pixel_std_dev_multiplier = 0.02
+        pixel_dropout_prob = 0.02
+        random_distance_noise = 0.0
+        random_angle_noise = 0.0
+
+    class envelope:
+        margin = 0.05                    # exact half-plane offset for collision
+        # 5 params + 3 priors are loaded from spider_envelop config at runtime:
+        # legged_gym.utils.envelop.network.haa_swing_range.load_envelope_condition_spec
+        spec_config_path = (
+            "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"
+            "spider_envelop/el4090_spider_config.py"
+        )
+
+    class rewards:
+        # BaseTask does not auto-scale reward terms; env multiplies directly.
+        class scales:
+            potential = 1.0
+            collision = -2.0
+            action_rate = -0.01
+
+        collision_eps = 1e-6
+
+    class normalization:
+        clip_observations = 100.
+        clip_actions = 100.
+
+
+class El4090EA2CfgPPO(LeggedRobotCfgPPO):
+    seed = 1
+    runner_class_name = "OnPolicyRunner"
+
+    class policy(LeggedRobotCfgPPO.policy):
+        init_noise_std = 0.3
+        actor_hidden_dims = [256, 128]
+        critic_hidden_dims = [256, 128]
+        activation = "elu"
+        # recurrent fields (num_actor_obs/num_critic_obs come from runner env,
+        # never declare them here -- duplicate keyword -> TypeError)
+        rnn_type = "gru"
+        rnn_hidden_dim = 187
+        rnn_num_layers = 1
+
+    class algorithm(LeggedRobotCfgPPO.algorithm):
+        class symmetry_cfg:
+            # M1 default: symmetry off.  Optional T8 symmetry module can enable:
+            # data_augmentation_func =
+            #   "legged_gym.envs.el_4090.envelope_adaptive_2.symmetry:get_ea2_xsym_obs_act"
+            use_data_augmentation = False
+            use_mirror_loss = False
+            mirror_loss_coeff = 0.0
+            data_augmentation_func = None
+
+    class runner(LeggedRobotCfgPPO.runner):
+        policy_class_name = "ActorCriticRecurrent"
+        algorithm_class_name = "PPO"
+        num_steps_per_env = 50          # 1 s ~= 10 LiDAR frames per segment
+        max_iterations = 3000
+        save_interval = 50
+        experiment_name = "el4090_ea2"
+        run_name = ""
+        resume = False
+        load_run = -1
+        checkpoint = -1
+        resume_path = None
