@@ -1,6 +1,7 @@
 import torch
 import math
 import warp as wp
+from typing import Tuple
 
 from .sensor_kernels.lidar_kernels_warp import LidarWarpKernels
 from .base_sensor import BaseSensor
@@ -507,6 +508,40 @@ class LidarSensor(BaseSensor):
             return
 
         raise TypeError(f"Unsupported env_ids type: {type(env_ids)}")
+
+    @torch.no_grad()
+    def apply_noise(self, pixels: torch.Tensor, dists: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply LiDAR sensor noise to all rays in the range domain.
+
+        Args:
+            pixels: Ray endpoints as ``(E, 1, N, 1, 3)``. Hit and no-hit points
+                are both represented as ``distance * direction``.
+            dists: Per-ray range values as ``(E, 1, N, 1)``.
+
+        Returns:
+            The same ``pixels`` and ``dists`` tensors, updated in-place with
+            multiplicative Gaussian range noise and Bernoulli dropout (dropout
+            resets the range to ``self.far_plane``).
+        """
+        if not getattr(self.sensor_cfg, "enable_sensor_noise", False):
+            return pixels, dists
+
+        norm = torch.norm(pixels, dim=-1, keepdim=True).clamp_min(1e-6)
+        direction = pixels / norm                      # hit 与 no-hit 都是 d·dir，方向可安全复原
+
+        std = float(self.sensor_cfg.pixel_std_dev_multiplier) * dists
+        noisy_dists = torch.normal(mean=dists, std=std).clamp_min(0.0)
+
+        p = float(self.sensor_cfg.pixel_dropout_prob)
+        if p > 0.0:
+            drop = torch.bernoulli(torch.full_like(dists, p)).bool()
+            noisy_dists[drop] = self.far_plane          # LiDAR 无效约定，不用相机的 near 哨兵
+
+        noisy_pixels = direction * noisy_dists.unsqueeze(-1)
+        pixels.copy_(noisy_pixels)                      # 若为零拷贝视图，同时写回 warp buffer
+        dists.copy_(noisy_dists)
+        return pixels, dists
+
     def update(self):
         """Update sensor and return point cloud data"""
         self.sensor_t += self.env_dt
@@ -563,5 +598,7 @@ class LidarSensor(BaseSensor):
 
         self.lidar_pixels_tensor = wp.to_torch(self.lidar_warp_tensor)
         self.lidar_dist_tensor = wp.to_torch(self.local_dist)
-
+        self.lidar_pixels_tensor, self.lidar_dist_tensor = self.apply_noise(
+            self.lidar_pixels_tensor, self.lidar_dist_tensor
+        )
         return self.lidar_pixels_tensor, self.lidar_dist_tensor

@@ -149,6 +149,8 @@ from .el_4090.pd_gru_lidar.el_4090_lidar_tripod2_low_avoid_config import El4090L
 
 from .el_4090.envelope_adaptive.el_4090_ea import EL_4090_EA
 from .el_4090.envelope_adaptive.el_4090_ea_config import El4090EACfg, El4090EACfgPPO
+from .el_4090.envelope_adaptive_2.el_4090_ea2_env import EL_4090_EA2
+from .el_4090.envelope_adaptive_2.el_4090_ea2_config import El4090EA2Cfg, El4090EA2CfgPPO
 
 
 task_registry.register("anymal_c_rough", Anymal, AnymalCRoughCfg(), AnymalCRoughCfgPPO())
@@ -266,6 +268,7 @@ task_registry.register("el4090_lidar_tripod2_low", EL_4090_Lidar, El4090LidarTri
 task_registry.register("el4090_lidar_tripod2_low_avoid", EL_4090_Lidar, El4090LidarTripod2LowAvoidCfg(), El4090LidarTripod2LowAvoidCfgPPO())
 
 task_registry.register("el4090_ea", EL_4090_EA, El4090EACfg(), El4090EACfgPPO())
+task_registry.register("el4090_ea2", EL_4090_EA2, El4090EA2Cfg(), El4090EA2CfgPPO())
 
 # Data-collection environments
 from .elspider_air.elspider_data_collect import ElSpiderDataCollect
