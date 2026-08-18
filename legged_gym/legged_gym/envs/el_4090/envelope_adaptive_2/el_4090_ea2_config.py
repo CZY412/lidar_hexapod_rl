@@ -115,6 +115,10 @@ class El4090EA2Cfg(LeggedRobotCfg):
         pointcloud_in_world_frame = False
         randomize_placement = False
 
+        # Debug point-cloud visualization (README 2.7 red/green spheres)
+        debug_env_ids = [0]
+        debug_point_stride = 1
+
         # LidarConfig noise fields; applied to ALL rays (camera-original semantics)
         enable_sensor_noise = True
         pixel_std_dev_multiplier = 0.02

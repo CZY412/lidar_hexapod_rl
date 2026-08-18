@@ -257,6 +257,40 @@ def refresh_range_image_from_scan(
     return range_image
 
 
+def point_cloud_debug_masks(
+    dists: torch.Tensor,
+    mapping: torch.Tensor,
+    far_plane: float,
+    max_range: float,
+    r_min: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Classify rays for README 2.7 red/green visualization.
+
+    Args:
+        dists: Noisy ray distances, shape ``(..., N)``.
+        mapping: Flat Airy mapping table, shape ``(N,)``.
+        far_plane: ``LidarConfig.max_range`` (60 m); ``d >= far_plane`` is a
+            no-hit ray.
+        max_range/r_min: Effective 450-bucket range ``[r_min, max_range]``.
+
+    Returns:
+        ``(red, green)`` boolean masks with the same shape as ``dists``.
+        Red = real hit whose channel is in the mapping table and whose noisy
+        distance participates in the 450-dim aggregation.  Green = other real
+        hits.  No-hit and dropout rays are excluded from both masks.
+    """
+    far = float(far_plane)
+    max_r = float(max_range)
+    min_r = float(r_min)
+    hit = dists < (far - 1e-3)
+    mapped = mapping.to(device=dists.device) >= 0
+    in_agg_range = (dists >= min_r) & (dists <= max_r)
+    red = hit & mapped & in_agg_range
+    green = hit & ~red
+    return red, green
+
+
+
 def sway_position_acceptable(
     prev_xy: Sequence[float],
     cand_xy: Sequence[float],
@@ -543,6 +577,19 @@ class EL_4090_EA2(BaseTask):
             n, 3, dtype=torch.float32, device=device
         )
 
+        # Debug point-cloud visualization state (populated only when a viewer
+        # exists; stored only for cfg.lidar.debug_env_ids).
+        self._debug_env_ids = [
+            int(i) for i in getattr(self.cfg.lidar, "debug_env_ids", [0])
+        ]
+        self._debug_point_stride = int(
+            getattr(self.cfg.lidar, "debug_point_stride", 1)
+        )
+        self._debug_points = None
+        self._debug_dists = None
+        self._debug_base_pos = None
+        self._debug_base_quat = None
+
         # Episode reward sums (scaled, matching LeggedRobot logging)
         self.episode_sums = {
             name: torch.zeros(n, dtype=torch.float32, device=device)
@@ -680,6 +727,119 @@ class EL_4090_EA2(BaseTask):
             fresh,
             self.range_image_stale,
         )
+
+        # Keep the latest noisy point cloud for debug-env visualization only.
+        # Cloning all 5760 rays for every env would waste ~100 MB at 1024 envs.
+        if self.viewer is not None and self._debug_env_ids:
+            ids = torch.tensor(
+                self._debug_env_ids, dtype=torch.long, device=self.device
+            )
+            self._debug_points = points[ids].clone()
+            self._debug_dists = dists[ids].clone()
+            self._debug_base_pos = self.base_pos[ids].clone()
+            self._debug_base_quat = self.base_quat[ids].clone()
+
+    # ------------------------------------------------------------------
+    # Debug visualization (README 2.7 red/green point cloud)
+    # ------------------------------------------------------------------
+
+    def _draw_debug_vis(self) -> None:
+        """Draw red/green LiDAR points and the current envelope footprint.
+
+        Only ``cfg.lidar.debug_env_ids`` are drawn, and only when a viewer
+        exists.  The point cloud is the latest *noisy* 10 Hz frame cached by
+        :meth:`_update_lidar`; drawing happens after a LiDAR update, so the
+        lines appear on the next viewer frame.
+        """
+        if self.viewer is None or self._debug_points is None:
+            return
+        from isaacgym import gymapi, gymutil
+        from isaacgym.torch_utils import quat_apply
+
+        self.gym.clear_lines(self.viewer)
+
+        far_plane = float(self.cfg.lidar.far_plane)
+        max_r = float(self.cfg.lidar.effective_max_range)
+        r_min = float(self.cfg.lidar.min_range)
+        stride = max(1, self._debug_point_stride)
+
+        red_geom = gymutil.WireframeSphereGeometry(
+            0.04, 4, 4, None, color=(1.0, 0.0, 0.0)
+        )
+        green_geom = gymutil.WireframeSphereGeometry(
+            0.03, 4, 4, None, color=(0.0, 1.0, 0.0)
+        )
+
+        for k, eid in enumerate(self._debug_env_ids):
+            if eid >= self.num_envs:
+                continue
+            dists = self._debug_dists[k]
+            red, green = point_cloud_debug_masks(
+                dists,
+                self.airy_mapping,
+                far_plane=far_plane,
+                max_range=max_r,
+                r_min=r_min,
+            )
+
+            pts_sensor = self._debug_points[k][::stride]
+            red = red[::stride]
+            green = green[::stride]
+            n = pts_sensor.shape[0]
+
+            # sensor frame -> body frame -> world frame
+            offset_q = self._sensor_offset_quat[eid : eid + 1].expand(n, 4)
+            pts_body = (
+                quat_apply(offset_q, pts_sensor)
+                + self._sensor_translation[eid : eid + 1]
+            )
+            base_q = self._debug_base_quat[k : k + 1].expand(n, 4)
+            pts_world = self._debug_base_pos[k] + quat_apply(base_q, pts_body)
+            pts_world = pts_world.detach().cpu().numpy()
+
+            red_pts = pts_world[red.cpu().numpy()]
+            green_pts = pts_world[green.cpu().numpy()]
+            for pt in red_pts:
+                pose = gymapi.Transform(
+                    gymapi.Vec3(float(pt[0]), float(pt[1]), float(pt[2]))
+                )
+                gymutil.draw_lines(
+                    red_geom, self.gym, self.viewer, self.envs[eid], pose
+                )
+            for pt in green_pts:
+                pose = gymapi.Transform(
+                    gymapi.Vec3(float(pt[0]), float(pt[1]), float(pt[2]))
+                )
+                gymutil.draw_lines(
+                    green_geom, self.gym, self.viewer, self.envs[eid], pose
+                )
+
+            # Current policy envelope footprint (cyan) at z=0.02 m.
+            hex_xy = self._compute_hex_world()[eid].numpy()  # (6, 2)
+            z = 0.02
+            line_verts = []
+            line_colors = []
+            for i in range(6):
+                j = (i + 1) % 6
+                line_verts.extend(
+                    [
+                        float(hex_xy[i, 0]),
+                        float(hex_xy[i, 1]),
+                        z,
+                        float(hex_xy[j, 0]),
+                        float(hex_xy[j, 1]),
+                        z,
+                    ]
+                )
+                line_colors.extend([0.0, 0.85, 1.0, 0.0, 0.85, 1.0])
+            if line_verts:
+                self.gym.add_lines(
+                    self.viewer,
+                    self.envs[eid],
+                    6,
+                    np.asarray(line_verts, dtype=np.float32),
+                    np.asarray(line_colors, dtype=np.float32),
+                )
 
     # ------------------------------------------------------------------
     # Path / reset
@@ -1104,6 +1264,8 @@ class EL_4090_EA2(BaseTask):
             self.privileged_obs_buf = torch.clip(
                 self.privileged_obs_buf, -clip_obs, clip_obs
             )
+
+        self._draw_debug_vis()
 
         if self.cfg.env.send_timeouts:
             self.extras["time_outs"] = self.time_out_buf

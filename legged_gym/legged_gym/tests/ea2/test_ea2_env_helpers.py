@@ -25,6 +25,7 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_env import (
     map_actions_to_params,
     potential_reward,
     refresh_range_image_from_scan,
+    point_cloud_debug_masks,
     sway_position_acceptable,
     sway_update,
     wrap_to_pi,
@@ -47,6 +48,33 @@ def _straight_path(length: float = 8.0, step: float = 0.2) -> PathData:
     arc = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
     yaws = np.zeros_like(xs)
     return PathData(points=points, yaws=yaws, arc=arc)
+
+
+def test_point_cloud_debug_masks_match_readme_27() -> None:
+    """Red/green classification follows README 2.7."""
+    mapping = torch.full((8,), -1, dtype=torch.int64)
+    mapping[1] = 0
+    mapping[3] = 1
+    dists = torch.tensor(
+        [
+            [0.1, 2.0, 4.9, 5.1, 60.0, 0.5, 5.0, 60.0],
+            [0.1, 2.0, 4.9, 5.1, 60.0, 0.5, 5.0, 60.0],
+        ],
+        dtype=torch.float32,
+    )
+    red, green = point_cloud_debug_masks(
+        dists,
+        mapping,
+        far_plane=60.0,
+        max_range=5.0,
+        r_min=0.2,
+    )
+    # red: mapped channels inside [0.2, 5.0] and real hits
+    assert red[0].tolist() == [False, True, False, False, False, False, False, False]
+    # green: every real hit that is not red (below/above agg range included)
+    assert green[0].tolist() == [True, False, True, True, False, True, True, False]
+    # no-hit 60 m is neither red nor green
+    assert not red[:, 4].any() and not green[:, 4].any()
 
 
 def test_height_step_converges_to_target_and_stays_in_bounds() -> None:
