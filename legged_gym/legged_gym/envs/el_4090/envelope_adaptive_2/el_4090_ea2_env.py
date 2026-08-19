@@ -415,6 +415,11 @@ class EL_4090_EA2(BaseTask):
             ground_margin_m=float(self.cfg.map.ground_margin_m),
             inflation_m=float(self.cfg.map.inflation_m),
             inflation_cells=int(self.cfg.map.inflation_cells),
+            n_tiles=int(self.cfg.map.n_tiles),
+            tile_padding_m=float(self.cfg.map.tile_padding_m),
+            min_free_component_ratio=float(
+                self.cfg.map.min_free_component_ratio
+            ),
             max_gen_attempts=int(self.cfg.map.max_gen_attempts),
             n_validation_paths=int(self.cfg.map.n_validation_paths),
             min_solved_ratio=float(self.cfg.map.min_solved_ratio),
@@ -428,6 +433,20 @@ class EL_4090_EA2(BaseTask):
         self.map_data = generate_map(map_cfg, seed=map_seed)
         self.occupancy = self.map_data.occupancy
         self.inflated = self.map_data.inflated
+
+        # Start/goal sampling must live in the largest 8-connected component
+        # of the inflated free space; otherwise A* can fail for map seeds that
+        # leave small isolated pockets (corridor/U interiors).
+        from scipy.ndimage import label as _label
+        from scipy.ndimage import sum as _nd_sum
+
+        free = self.inflated == 0
+        labels, n_components = _label(free)
+        if n_components == 0:
+            raise RuntimeError("map has no inflated-free cells")
+        sizes = _nd_sum(free, labels, index=range(1, n_components + 1))
+        largest_label = int(np.argmax(sizes)) + 1
+        self._free_cells = np.argwhere(labels == largest_label)
 
         # Physics ground for Isaac (visual/ground only; Warp mesh is the
         # authoritative raycast geometry).
@@ -846,9 +865,8 @@ class EL_4090_EA2(BaseTask):
     # ------------------------------------------------------------------
 
     def _sample_free_start_goal(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Sample a start/goal pair that can plausibly yield a long path."""
-        inflated = self.inflated
-        free = np.argwhere(inflated == 0)
+        """Sample a start/goal pair from the largest safe connected component."""
+        free = self._free_cells
         if free.shape[0] == 0:
             raise RuntimeError("map has no free cells")
         start_idx = free[self._rng.integers(0, free.shape[0])]

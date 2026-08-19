@@ -122,21 +122,60 @@ def test_shapes_and_dtypes():
     assert any(not p.square for p in map_data.pillars)
 
     for key in (
-        "boundary_occupied",
+        "occupancy_border_free",
+        "planning_border_blocked",
+        "physical_boundary_walls",
+        "all_rects_axis_aligned",
         "has_constraint_primitive",
         "near_obstacle_ratio_estimate",
         "near_obstacle_ratio",
+        "largest_free_component_ratio",
     ):
         assert key in map_data.acceptance
         assert 0.0 <= map_data.acceptance[key] <= 1.0
+    assert map_data.acceptance["n_tiles"] == 25.0
 
 
-def test_boundary_cells_occupied():
-    occ = generate_map(_default_cfg(), seed=11).occupancy
-    assert np.all(occ[0, :] == 1)
-    assert np.all(occ[-1, :] == 1)
-    assert np.all(occ[:, 0] == 1)
-    assert np.all(occ[:, -1] == 1)
+def test_no_physical_boundary_walls_planning_border_blocked():
+    map_data = generate_map(_default_cfg(), seed=11)
+    occ = map_data.occupancy
+    # No enclosing wall primitives: the occupancy border must be free...
+    assert np.all(occ[0, :] == 0)
+    assert np.all(occ[-1, :] == 0)
+    assert np.all(occ[:, 0] == 0)
+    assert np.all(occ[:, -1] == 0)
+    # ...while the planning (inflated) border stays blocked for A*.
+    inf = map_data.inflated
+    assert np.all(inf[0, :] == 1)
+    assert np.all(inf[-1, :] == 1)
+    assert np.all(inf[:, 0] == 1)
+    assert np.all(inf[:, -1] == 1)
+    # No primitive is a full-map boundary wall.
+    assert map_data.acceptance["physical_boundary_walls"] == 0.0
+
+
+def test_all_rects_axis_aligned():
+    map_data = generate_map(_default_cfg(), seed=7)
+    assert len(map_data.rects) > 0
+    for rect in map_data.rects:
+        yaw = float(rect.yaw) % (np.pi / 2.0)
+        assert min(abs(yaw), abs(np.pi / 2.0 - yaw)) < 1e-6
+
+
+def test_tile_layout_is_5x5_one_type_per_tile():
+    map_data = generate_map(_default_cfg(), seed=7)
+    assert map_data.tile_types is not None
+    assert map_data.tile_types.shape == (5, 5)
+    assert set(np.unique(map_data.tile_types).tolist()) <= set(c.EA2_TILE_TYPE_CODES)
+    for code in c.EA2_TILE_TYPE_CODES:
+        assert int(np.sum(map_data.tile_types == code)) > 0
+    assert map_data.acceptance["n_tiles"] == 25.0
+
+
+def test_inflated_free_space_largest_component_dominates():
+    for seed in range(20):
+        map_data = generate_map(_default_cfg(), seed=seed)
+        assert map_data.acceptance["largest_free_component_ratio"] >= 0.95
 
 
 def test_inflation_monotonic_and_nontrivial():
@@ -237,8 +276,9 @@ def test_occupied_cell_centers_covered_by_primitives():
 
 def test_acceptance_requires_constraint_primitive():
     map_data = generate_map(_default_cfg(), seed=3)
-    assert map_data.acceptance["boundary_occupied"] == 1.0
+    assert map_data.acceptance["planning_border_blocked"] == 1.0
+    assert map_data.acceptance["occupancy_border_free"] == 1.0
     assert map_data.acceptance["has_constraint_primitive"] == 1.0
-    assert map_data.acceptance["corridor_walls"] >= 2.0
-    assert map_data.acceptance["side_wall_segments"] >= 2.0
-    assert map_data.acceptance["u_walls"] == 3.0
+    assert map_data.acceptance["corridor_tiles"] >= 1.0
+    assert map_data.acceptance["side_walls_tiles"] >= 1.0
+    assert map_data.acceptance["u_shape_tiles"] >= 1.0

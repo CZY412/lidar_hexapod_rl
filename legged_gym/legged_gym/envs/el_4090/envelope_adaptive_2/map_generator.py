@@ -1,39 +1,55 @@
 """Deterministic seeded map generator for envelope_adaptive_2 (M1).
 
-This module implements the README v2 ``map_generator.py`` contract:
-primitive obstacles -> occupancy grid -> inflated safety grid -> Warp mesh.
-The occupancy grid is the authoritative geometry; the Warp mesh is built from
-the same primitives (boxes and n-gon cylinders) so rasterization and mesh stay
-consistent.
+Layout contract (user-confirmed revision):
+  * one global fixed 12m x 12m map split into a ``n_tiles x n_tiles`` grid
+    (default 5 x 5, 2.4m tiles);
+  * each tile contains exactly ONE terrain type (empty / wall / pillar /
+    corridor / side-walls / U-shape), so primitives never mix or spill into
+    neighbouring tiles;
+  * all rect primitives are axis-aligned (yaw 0 or pi/2) -- no slanted walls;
+  * there are NO physical boundary walls.  The planning (inflated) grid border
+    is still marked blocked so A* keeps the robot inside the map, but nothing
+    is rasterized or meshed at the border.
+
+The occupancy grid remains the authoritative geometry; the Warp mesh is built
+from the same axis-aligned box / n-gon prism primitives.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
 import numpy as np
 
 from ._contracts import (
+    EA2_TILE_CORRIDOR,
+    EA2_TILE_EMPTY,
+    EA2_TILE_PILLAR,
+    EA2_TILE_SIDE_WALLS,
+    EA2_TILE_U_SHAPE,
+    EA2_TILE_WALL,
     MapData,
     MapGenCfg,
     PillarPrimitive,
     RectPrimitive,
 )
 
-# Default obstacle ranges mirror the frozen ``El4090EA2Cfg.obstacles`` block.
 _HEIGHT_RANGE = (1.5, 2.0)
-_WALL_LENGTH_RANGE = (2.0, 5.0)
-_WALL_THICKNESS_RANGE = (0.2, 0.5)
-_PILLAR_HALF_RANGE = (0.2, 0.4)
 _PILLAR_SEGMENTS = 16
-_CORRIDOR_WIDTH_RANGE = (1.0, 2.0)
-_SIDE_WALL_COUNT_RANGE = (2, 5)
-_U_OPENING_RANGE = (1.0, 1.5)
-
 _GROUND_THICKNESS_M = 0.02
-_BOUNDARY_WALL_THICKNESS_M = 0.2
 _NEAR_OBSTACLE_SAMPLE_CAP = 2000
+
+# Tile type frequencies for the 5x5 layout (sums to 25).
+_TILE_COUNTS = {
+    EA2_TILE_EMPTY: 6,
+    EA2_TILE_WALL: 5,
+    EA2_TILE_PILLAR: 4,
+    EA2_TILE_CORRIDOR: 4,
+    EA2_TILE_SIDE_WALLS: 3,
+    EA2_TILE_U_SHAPE: 3,
+}
 
 
 @dataclass(frozen=True)
@@ -45,11 +61,7 @@ class _Mesh:
 
 
 def _world_to_grid(x: float, y: float, cfg: MapGenCfg) -> Tuple[int, int]:
-    """Convert a world coordinate to grid indices using the contract formula.
-
-    ``ix = floor((x + size/2) / resolution)``, ``iy`` likewise.  The caller is
-    responsible for bounds checking.
-    """
+    """Convert a world coordinate to grid indices using the contract formula."""
     half = cfg.size_m / 2.0
     ix = int(np.floor((x + half) / cfg.resolution_m))
     iy = int(np.floor((y + half) / cfg.resolution_m))
@@ -57,12 +69,7 @@ def _world_to_grid(x: float, y: float, cfg: MapGenCfg) -> Tuple[int, int]:
 
 
 def _grid_centers(cfg: MapGenCfg) -> Tuple[np.ndarray, np.ndarray]:
-    """Return world coordinates of every grid-cell center.
-
-    Returns ``(xs, ys)`` with shapes ``(grid_shape[1],)`` and
-    ``(grid_shape[0],)``.  The grid rows correspond to ``iy`` and columns to
-    ``ix``.
-    """
+    """Return world coordinates of every grid-cell center."""
     world_min = -cfg.size_m / 2.0
     xs = world_min + (np.arange(cfg.grid_shape[1]) + 0.5) * cfg.resolution_m
     ys = world_min + (np.arange(cfg.grid_shape[0]) + 0.5) * cfg.resolution_m
@@ -70,177 +77,81 @@ def _grid_centers(cfg: MapGenCfg) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _circle_polygon(radius: float, segments: int) -> np.ndarray:
-    """Return the CCW inscribed n-gon used for circular pillar footprints.
-
-    The same vertex set is used by both the occupancy rasterizer and the
-    n-gon prism mesh so the authoritative grid and the raycast mesh describe
-    exactly the same 2D footprint.
-    """
+    """Return the CCW inscribed n-gon used for circular pillar footprints."""
     n = max(3, int(segments))
     angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
     return np.stack([np.cos(angles), np.sin(angles)], axis=-1) * radius
 
 
-def _sample_center(rng: np.random.Generator, limit: float) -> Tuple[float, float]:
-    """Sample a 2D center uniformly inside ``[-limit, limit]^2``."""
-    x = float(rng.uniform(-limit, limit))
-    y = float(rng.uniform(-limit, limit))
+# ---------------------------------------------------------------------------
+# 5x5 tile layout helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_tile_layout(rng: np.random.Generator) -> np.ndarray:
+    """Build a shuffled ``(n_tiles, n_tiles)`` tile-type grid."""
+    tiles: List[int] = []
+    for code, count in _TILE_COUNTS.items():
+        tiles.extend([int(code)] * int(count))
+    rng.shuffle(tiles)
+    n = int(round(math.sqrt(len(tiles))))
+    if n * n != len(tiles):
+        raise ValueError(f"tile counts must form a square grid, got {len(tiles)}")
+    return np.asarray(tiles, dtype=np.uint8).reshape(n, n)
+
+
+def _tile_center(cfg: MapGenCfg, row: int, col: int) -> Tuple[float, float]:
+    """World center of tile ``(row, col)``; row 0 is the most negative y."""
+    tile = cfg.size_m / float(cfg.n_tiles)
+    x = -cfg.size_m / 2.0 + (float(col) + 0.5) * tile
+    y = -cfg.size_m / 2.0 + (float(row) + 0.5) * tile
     return x, y
 
 
-def _generate_boundary_rects(cfg: MapGenCfg, height: float) -> List[RectPrimitive]:
-    """Build four thin boundary walls so the map border is explicitly occupied.
+def _axis_dirs(yaw: float) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Return ``(direction, normal)`` for an axis-aligned yaw (0 or pi/2)."""
+    direction = (math.cos(yaw), math.sin(yaw))
+    normal = (-math.sin(yaw), math.cos(yaw))
+    return direction, normal
 
-    These rects are first-class primitives: they appear in ``MapData.rects``,
-    are rasterized into occupancy, and are meshed as normal wall boxes.
-    """
-    half = cfg.size_m / 2.0
-    t = _BOUNDARY_WALL_THICKNESS_M
+
+# ---------------------------------------------------------------------------
+# One primitive set per tile type (all axis-aligned)
+# ---------------------------------------------------------------------------
+
+
+def _tile_wall(
+    rng: np.random.Generator, center: Tuple[float, float], height: float
+) -> List[RectPrimitive]:
+    length = float(rng.uniform(1.2, 1.8))
+    thickness = float(rng.uniform(0.2, 0.4))
+    yaw = 0.0 if rng.integers(0, 2) == 0 else math.pi / 2.0
     return [
-        RectPrimitive(center=(0.0, -half + t / 2.0), size=(cfg.size_m, t), yaw=0.0, height=height),
-        RectPrimitive(center=(0.0, half - t / 2.0), size=(cfg.size_m, t), yaw=0.0, height=height),
-        RectPrimitive(center=(-half + t / 2.0, 0.0), size=(t, cfg.size_m), yaw=0.0, height=height),
-        RectPrimitive(center=(half - t / 2.0, 0.0), size=(t, cfg.size_m), yaw=0.0, height=height),
+        RectPrimitive(
+            center=center, size=(length, thickness), yaw=yaw, height=height
+        )
     ]
 
 
-def _generate_corridor(rng: np.random.Generator, height: float) -> List[RectPrimitive]:
-    """Generate one narrow corridor: two parallel wall segments with a gap.
-
-    The gap is sampled from the README's 1.0-2.0 m range and is guaranteed by
-    construction: wall centers are offset by ``gap/2 + thickness/2`` on each
-    side of the corridor centerline.
-    """
-    length = float(rng.uniform(3.0, 5.0))
-    thickness = float(rng.uniform(*_WALL_THICKNESS_RANGE))
-    gap = float(rng.uniform(*_CORRIDOR_WIDTH_RANGE))
-    yaw = float(rng.uniform(0.0, 2.0 * np.pi))
-    cx, cy = _sample_center(rng, 2.0)
-    normal_x = -np.sin(yaw)
-    normal_y = np.cos(yaw)
-    offset = gap / 2.0 + thickness / 2.0
-    return [
-        RectPrimitive(
-            center=(cx + normal_x * offset, cy + normal_y * offset),
-            size=(length, thickness),
-            yaw=yaw,
-            height=height,
-        ),
-        RectPrimitive(
-            center=(cx - normal_x * offset, cy - normal_y * offset),
-            size=(length, thickness),
-            yaw=yaw,
-            height=height,
-        ),
+def _tile_pillars(
+    rng: np.random.Generator,
+    center: Tuple[float, float],
+    height: float,
+    square: bool,
+) -> List[PillarPrimitive]:
+    n = int(rng.integers(1, 3))  # 1 or 2 pillars
+    horizontal = bool(rng.integers(0, 2) == 0)
+    offsets = [(-0.25, 0.0), (0.25, 0.0)] if horizontal else [
+        (0.0, -0.25), (0.0, 0.25)
     ]
-
-
-def _generate_side_wall_group(rng: np.random.Generator, height: float) -> List[RectPrimitive]:
-    """Generate one side-wall group: 2-5 wall segments on one side of a line."""
-    n_segments = int(rng.integers(*_SIDE_WALL_COUNT_RANGE))
-    yaw = float(rng.uniform(0.0, 2.0 * np.pi))
-    base_x, base_y = _sample_center(rng, 2.0)
-    dir_x, dir_y = np.cos(yaw), np.sin(yaw)
-    normal_x, normal_y = -dir_y, dir_x
-    lateral = float(rng.uniform(0.8, 1.5))
-    along = rng.uniform(-2.0, 2.0, size=n_segments)
-
-    rects: List[RectPrimitive] = []
-    for s in along:
-        seg_len = float(rng.uniform(1.5, 3.0))
-        seg_thick = float(rng.uniform(*_WALL_THICKNESS_RANGE))
-        center = (
-            base_x + dir_x * float(s) + normal_x * lateral,
-            base_y + dir_y * float(s) + normal_y * lateral,
-        )
-        rects.append(
-            RectPrimitive(
-                center=center,
-                size=(seg_len, seg_thick),
-                yaw=yaw,
-                height=height,
-            )
-        )
-    return rects
-
-
-def _generate_u_shape(rng: np.random.Generator, height: float) -> List[RectPrimitive]:
-    """Generate one U-shape: a back wall plus two parallel side walls.
-
-    The opening width is sampled from 1.0-1.5 m and faces the local +x
-    direction of the sampled yaw.
-    """
-    depth = float(rng.uniform(2.0, 3.0))
-    opening = float(rng.uniform(*_U_OPENING_RANGE))
-    thickness = float(rng.uniform(*_WALL_THICKNESS_RANGE))
-    yaw = float(rng.uniform(0.0, 2.0 * np.pi))
-    base_x, base_y = _sample_center(rng, 2.0)
-    dir_x, dir_y = np.cos(yaw), np.sin(yaw)
-    normal_x, normal_y = -dir_y, dir_x
-
-    back_center = (base_x + dir_x * (-depth / 2.0), base_y + dir_y * (-depth / 2.0))
-    back = RectPrimitive(
-        center=back_center,
-        size=(opening + 2.0 * thickness, thickness),
-        yaw=yaw,
-        height=height,
-    )
-
-    side_offset = opening / 2.0 + thickness / 2.0
-    side1 = RectPrimitive(
-        center=(base_x + normal_x * side_offset, base_y + normal_y * side_offset),
-        size=(depth, thickness),
-        yaw=yaw,
-        height=height,
-    )
-    side2 = RectPrimitive(
-        center=(base_x - normal_x * side_offset, base_y - normal_y * side_offset),
-        size=(depth, thickness),
-        yaw=yaw,
-        height=height,
-    )
-    return [back, side1, side2]
-
-
-def _generate_random_walls(rng: np.random.Generator, height: float) -> List[RectPrimitive]:
-    """Generate a handful of independent wall primitives."""
-    n = int(rng.integers(1, 4))
-    rects: List[RectPrimitive] = []
-    for _ in range(n):
-        length = float(rng.uniform(2.0, 4.0))
-        thickness = float(rng.uniform(*_WALL_THICKNESS_RANGE))
-        yaw = float(rng.uniform(0.0, 2.0 * np.pi))
-        cx, cy = _sample_center(rng, 3.0)
-        rects.append(
-            RectPrimitive(
-                center=(cx, cy),
-                size=(length, thickness),
-                yaw=yaw,
-                height=height,
-            )
-        )
-    return rects
-
-
-def _generate_pillars(rng: np.random.Generator, height: float) -> List[PillarPrimitive]:
-    """Generate 4-8 square/circular pillar primitives.
-
-    At least one square and one circular pillar are always produced so a map
-    exercises both mesh code paths.
-    """
-    n = int(rng.integers(4, 9))
-    square_flags = [True, False] + [bool(rng.random() < 0.5) for _ in range(n - 2)]
-    rng.shuffle(square_flags)
     pillars: List[PillarPrimitive] = []
-    for square in square_flags:
-        radius = float(rng.uniform(*_PILLAR_HALF_RANGE))
-        pillar_height = float(rng.uniform(*_HEIGHT_RANGE))
-        cx, cy = _sample_center(rng, 4.5)
+    for i in range(n):
+        radius = float(rng.uniform(0.15, 0.30))
         pillars.append(
             PillarPrimitive(
-                center=(cx, cy),
+                center=(center[0] + offsets[i][0], center[1] + offsets[i][1]),
                 radius=radius,
-                height=pillar_height,
+                height=height,
                 square=square,
                 segments=_PILLAR_SEGMENTS,
             )
@@ -248,35 +159,147 @@ def _generate_pillars(rng: np.random.Generator, height: float) -> List[PillarPri
     return pillars
 
 
-def _generate_primitive_set(
-    cfg: MapGenCfg, rng: np.random.Generator
+def _tile_corridor(
+    rng: np.random.Generator, center: Tuple[float, float], height: float
+) -> List[RectPrimitive]:
+    """Two parallel axis-aligned walls forming a narrow channel."""
+    gap = float(rng.uniform(1.0, 1.4))
+    thickness = float(rng.uniform(0.2, 0.3))
+    length = 1.8
+    yaw = 0.0 if rng.integers(0, 2) == 0 else math.pi / 2.0
+    _, normal = _axis_dirs(yaw)
+    offset = gap / 2.0 + thickness / 2.0
+    return [
+        RectPrimitive(
+            center=(
+                center[0] + normal[0] * offset,
+                center[1] + normal[1] * offset,
+            ),
+            size=(length, thickness),
+            yaw=yaw,
+            height=height,
+        ),
+        RectPrimitive(
+            center=(
+                center[0] - normal[0] * offset,
+                center[1] - normal[1] * offset,
+            ),
+            size=(length, thickness),
+            yaw=yaw,
+            height=height,
+        ),
+    ]
+
+
+def _tile_side_walls(
+    rng: np.random.Generator, center: Tuple[float, float], height: float
+) -> List[RectPrimitive]:
+    """2-3 short axis-aligned wall segments on one side of the tile."""
+    n = int(rng.integers(2, 4))
+    yaw = 0.0 if rng.integers(0, 2) == 0 else math.pi / 2.0
+    direction, normal = _axis_dirs(yaw)
+    offsets = (-0.4, 0.4) if n == 2 else (-0.5, 0.0, 0.5)
+    lateral = 0.6
+    seg_len = 0.8
+    rects: List[RectPrimitive] = []
+    for off in offsets[:n]:
+        thickness = float(rng.uniform(0.2, 0.25))
+        rects.append(
+            RectPrimitive(
+                center=(
+                    center[0] + direction[0] * off + normal[0] * lateral,
+                    center[1] + direction[1] * off + normal[1] * lateral,
+                ),
+                size=(seg_len, thickness),
+                yaw=yaw,
+                height=height,
+            )
+        )
+    return rects
+
+
+def _tile_u_shape(
+    rng: np.random.Generator, center: Tuple[float, float], height: float
+) -> List[RectPrimitive]:
+    """Axis-aligned U: back wall plus two parallel side walls."""
+    opening = float(rng.uniform(0.8, 1.0))
+    depth = 1.2
+    thickness = float(rng.uniform(0.2, 0.25))
+    yaw = 0.0 if rng.integers(0, 2) == 0 else math.pi / 2.0
+    direction, normal = _axis_dirs(yaw)
+
+    back = RectPrimitive(
+        center=(
+            center[0] - direction[0] * depth / 2.0,
+            center[1] - direction[1] * depth / 2.0,
+        ),
+        size=(opening + 2.0 * thickness, thickness),
+        yaw=yaw,
+        height=height,
+    )
+    side_offset = opening / 2.0 + thickness / 2.0
+    side1 = RectPrimitive(
+        center=(
+            center[0] + normal[0] * side_offset,
+            center[1] + normal[1] * side_offset,
+        ),
+        size=(depth, thickness),
+        yaw=yaw,
+        height=height,
+    )
+    side2 = RectPrimitive(
+        center=(
+            center[0] - normal[0] * side_offset,
+            center[1] - normal[1] * side_offset,
+        ),
+        size=(depth, thickness),
+        yaw=yaw,
+        height=height,
+    )
+    return [back, side1, side2]
+
+
+def _generate_tile_primitive_set(
+    cfg: MapGenCfg,
+    rng: np.random.Generator,
+    tile_types: np.ndarray,
+    height: float,
 ) -> Tuple[List[RectPrimitive], List[PillarPrimitive], dict]:
-    """Generate the complete primitive set for one map.
+    """Generate axis-aligned primitives, one terrain type per tile."""
+    rects: List[RectPrimitive] = []
+    pillars: List[PillarPrimitive] = []
+    counts = {code: 0 for code in _TILE_COUNTS}
+    pillar_tile_index = 0
 
-    Returns ``(rects, pillars, counts)`` where ``counts`` records how many
-    corridor / side-wall / U-shape wall primitives were produced.
-    """
-    height = float(rng.uniform(*_HEIGHT_RANGE))
-    rects: List[RectPrimitive] = _generate_boundary_rects(cfg, height)
-    corridor_rects = _generate_corridor(rng, height)
-    side_rects = _generate_side_wall_group(rng, height)
-    u_rects = _generate_u_shape(rng, height)
-    random_rects = _generate_random_walls(rng, height)
-    pillars = _generate_pillars(rng, height)
-
-    rects.extend(corridor_rects)
-    rects.extend(side_rects)
-    rects.extend(u_rects)
-    rects.extend(random_rects)
-
-    counts = {
-        "corridor_walls": len(corridor_rects),
-        "side_wall_segments": len(side_rects),
-        "u_walls": len(u_rects),
-        "random_walls": len(random_rects),
-        "pillars": len(pillars),
-    }
+    for row in range(tile_types.shape[0]):
+        for col in range(tile_types.shape[1]):
+            code = int(tile_types[row, col])
+            center = _tile_center(cfg, row, col)
+            counts[code] += 1
+            if code == EA2_TILE_EMPTY:
+                continue
+            if code == EA2_TILE_WALL:
+                rects.extend(_tile_wall(rng, center, height))
+            elif code == EA2_TILE_PILLAR:
+                # Alternate square/circular pillar tiles so both mesh code
+                # paths are always exercised.
+                square = bool(pillar_tile_index % 2 == 0)
+                pillars.extend(_tile_pillars(rng, center, height, square))
+                pillar_tile_index += 1
+            elif code == EA2_TILE_CORRIDOR:
+                rects.extend(_tile_corridor(rng, center, height))
+            elif code == EA2_TILE_SIDE_WALLS:
+                rects.extend(_tile_side_walls(rng, center, height))
+            elif code == EA2_TILE_U_SHAPE:
+                rects.extend(_tile_u_shape(rng, center, height))
+            else:  # pragma: no cover - layout builder only emits known codes
+                raise ValueError(f"unknown tile type code {code}")
     return rects, pillars, counts
+
+
+# ---------------------------------------------------------------------------
+# Rasterization / inflation (cell-center-in-footprint semantics)
+# ---------------------------------------------------------------------------
 
 
 def _rasterize_rect(rect: RectPrimitive, cfg: MapGenCfg) -> np.ndarray:
@@ -295,13 +318,7 @@ def _rasterize_rect(rect: RectPrimitive, cfg: MapGenCfg) -> np.ndarray:
 
 
 def _rasterize_pillar(pillar: PillarPrimitive, cfg: MapGenCfg) -> np.ndarray:
-    """Return a boolean grid marking cell centers covered by ``pillar``.
-
-    Circular pillars use the same inscribed n-gon footprint as
-    ``_build_cylinder``: the mesh polygon is authoritative for both occupancy
-    and rasterization, so no cell is marked occupied that lies outside the
-    generated raycast mesh footprint.
-    """
+    """Return a boolean grid marking cell centers covered by ``pillar``."""
     xs, ys = _grid_centers(cfg)
     gx, gy = np.meshgrid(xs, ys)
     dx = gx - pillar.center[0]
@@ -326,41 +343,42 @@ def _rasterize_occupancy(
     pillars: Sequence[PillarPrimitive],
     cfg: MapGenCfg,
 ) -> np.ndarray:
-    """Rasterize all primitives into the authoritative occupancy grid."""
+    """Rasterize primitives only; no implicit border occupancy."""
     occupancy = np.zeros(cfg.grid_shape, dtype=np.uint8)
     for rect in rects:
         occupancy |= _rasterize_rect(rect, cfg).astype(np.uint8)
     for pillar in pillars:
         occupancy |= _rasterize_pillar(pillar, cfg).astype(np.uint8)
-    # Belt-and-braces: boundary is always occupied regardless of rasterization.
-    occupancy[0, :] = 1
-    occupancy[-1, :] = 1
-    occupancy[:, 0] = 1
-    occupancy[:, -1] = 1
     return occupancy
 
 
 def _inflate_occupancy(occupancy: np.ndarray, cfg: MapGenCfg) -> np.ndarray:
-    """Inflate the occupancy grid by ``cfg.inflation_cells`` cells.
+    """Inflate occupancy by ``cfg.inflation_cells`` cells.
 
-    A square structuring element implements the 8-neighbour 4-cell safety
-    dilation used by A* and path-noise rejection.
+    ``cfg.boundary_occupied`` now means "keep the planning border blocked in
+    the *inflated* grid" -- there is no physical boundary wall in the mesh.
     """
     from scipy.ndimage import binary_dilation
 
     if cfg.inflation_cells <= 0:
-        return occupancy.copy()
-    radius = int(cfg.inflation_cells)
-    structure = np.ones((2 * radius + 1, 2 * radius + 1), dtype=bool)
-    inflated = binary_dilation(
-        occupancy.astype(bool), structure=structure, border_value=1
-    ).astype(np.uint8)
-    # Boundary stays blocked after dilation.
-    inflated[0, :] = 1
-    inflated[-1, :] = 1
-    inflated[:, 0] = 1
-    inflated[:, -1] = 1
+        inflated = occupancy.copy()
+    else:
+        radius = int(cfg.inflation_cells)
+        structure = np.ones((2 * radius + 1, 2 * radius + 1), dtype=bool)
+        inflated = binary_dilation(
+            occupancy.astype(bool), structure=structure, border_value=1
+        ).astype(np.uint8)
+    if cfg.boundary_occupied:
+        inflated[0, :] = 1
+        inflated[-1, :] = 1
+        inflated[:, 0] = 1
+        inflated[:, -1] = 1
     return inflated
+
+
+# ---------------------------------------------------------------------------
+# Mesh builders (unchanged geometry contracts)
+# ---------------------------------------------------------------------------
 
 
 def _build_box(
@@ -370,11 +388,7 @@ def _build_box(
     height: float,
     z_min: float = 0.0,
 ) -> _Mesh:
-    """Build a closed, outward-wound box mesh.
-
-    ``size`` is ``(length_x, length_y)`` in the box's local frame.  The box
-    spans ``z_min .. z_min + height`` and is rotated by ``yaw`` around z.
-    """
+    """Build a closed, outward-wound box mesh."""
     sx, sy = size
     local = np.array(
         [
@@ -397,9 +411,6 @@ def _build_box(
     vertices[:, :2] = xy + np.asarray(center[:2], dtype=np.float32)
     vertices[:, 2] = local[:, 2] + center[2] + z_min
 
-    # Outward-facing quad vertex orders (verified in tests by edge/watertight
-    # and winding conventions).  The bottom quad is CW from +z so both of its
-    # triangles have normal -z (outward through the bottom of the slab/box).
     faces = [
         (0, 2, 3, 1),  # bottom, normal -z
         (4, 5, 7, 6),  # top, normal +z
@@ -421,11 +432,7 @@ def _build_cylinder(
     height: float,
     segments: int,
 ) -> _Mesh:
-    """Build a closed n-gon prism (circular pillar approximation).
-
-    The polygon is oriented CCW when viewed from +z.  Top, bottom and side
-    faces all use outward winding.
-    """
+    """Build a closed n-gon prism (circular pillar approximation)."""
     xy = _circle_polygon(radius, segments)
     n = xy.shape[0]
     top = np.concatenate([xy, np.full((n, 1), height)], axis=-1)
@@ -438,18 +445,14 @@ def _build_cylinder(
     tris: List[Tuple[int, int, int]] = []
     for i in range(n):
         j = (i + 1) % n
-        # Top cap, normal +z.
         tris.append((2 * n, i, j))
-        # Bottom cap, normal -z.
         tris.append((2 * n + 1, n + j, n + i))
-        # Side quad, outward normal.
         tris.append((i, n + j, j))
         tris.append((i, n + i, n + j))
     return _Mesh(vertices=vertices, triangles=np.asarray(tris, dtype=np.int32))
 
 
 def _build_rect_mesh(rect: RectPrimitive) -> _Mesh:
-    """Build a closed box mesh for a ``RectPrimitive`` wall."""
     return _build_box(
         center=(rect.center[0], rect.center[1], 0.0),
         size=rect.size,
@@ -460,7 +463,6 @@ def _build_rect_mesh(rect: RectPrimitive) -> _Mesh:
 
 
 def _build_pillar_mesh(pillar: PillarPrimitive) -> _Mesh:
-    """Build a box or n-gon prism mesh for a ``PillarPrimitive``."""
     if pillar.square:
         return _build_box(
             center=(pillar.center[0], pillar.center[1], 0.0),
@@ -478,11 +480,6 @@ def _build_pillar_mesh(pillar: PillarPrimitive) -> _Mesh:
 
 
 def _build_ground_mesh(cfg: MapGenCfg) -> _Mesh:
-    """Build the ground as a thin closed box whose top surface is z=0.
-
-    The ground covers the map plus ``cfg.ground_margin_m`` on every side.  A
-    thin closed slab is used so the combined triangle soup is watertight.
-    """
     extent = cfg.size_m / 2.0 + cfg.ground_margin_m
     return _build_box(
         center=(0.0, 0.0, 0.0),
@@ -498,7 +495,6 @@ def _build_mesh(
     pillars: Sequence[PillarPrimitive],
     cfg: MapGenCfg,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Assemble the combined ground + obstacle mesh arrays."""
     meshes: List[_Mesh] = [_build_ground_mesh(cfg)]
     for rect in rects:
         meshes.append(_build_rect_mesh(rect))
@@ -517,19 +513,18 @@ def _build_mesh(
     return vertices, triangles
 
 
+# ---------------------------------------------------------------------------
+# Acceptance statistics
+# ---------------------------------------------------------------------------
+
+
 def _estimate_near_obstacle_ratio(
     occupancy: np.ndarray,
     inflated: np.ndarray,
     cfg: MapGenCfg,
     rng: np.random.Generator,
 ) -> float:
-    """Estimate the near-obstacle path statistic without running A*.
-
-    The A* validation in the environment samples actual paths.  This static
-    proxy samples safe (inflated-free) cells and computes their distance to
-    the nearest occupied cell using an EDT, then reports the fraction whose
-    distance falls inside ``cfg.near_obstacle_range``.
-    """
+    """Static proxy for the near-obstacle path statistic."""
     from scipy.ndimage import distance_transform_edt
 
     free_mask = occupancy == 0
@@ -547,60 +542,128 @@ def _estimate_near_obstacle_ratio(
     return float(np.mean((sample_dist >= lo) & (sample_dist <= hi)))
 
 
+def _border_mask(shape: Tuple[int, ...]) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    mask[0, :] = True
+    mask[-1, :] = True
+    mask[:, 0] = True
+    mask[:, -1] = True
+    return mask
+
+
 def _build_acceptance(
     occupancy: np.ndarray,
     inflated: np.ndarray,
     counts: dict,
+    tile_types: np.ndarray,
+    rects: Sequence[RectPrimitive],
     cfg: MapGenCfg,
     rng: np.random.Generator,
 ) -> dict:
-    """Build the static acceptance statistics stored in ``MapData.acceptance``."""
-    border = np.ones(occupancy.shape, dtype=bool)
-    border[1:-1, 1:-1] = False
-    boundary_ok = float(np.all(occupancy[border] == 1))
-    has_constraint = float((counts["corridor_walls"] > 0) or (counts["side_wall_segments"] > 0))
-    near_obstacle_ratio = _estimate_near_obstacle_ratio(occupancy, inflated, cfg, rng)
+    border = _border_mask(occupancy.shape)
+    occupancy_border_free = float(not bool(np.any(occupancy[border] == 1)))
+    planning_border_blocked = float(
+        bool(np.all(inflated[border] == 1)) if cfg.boundary_occupied else 1.0
+    )
+    all_axis_aligned = float(
+        all(
+            min(abs(rect.yaw % (math.pi / 2.0)),
+                abs(math.pi / 2.0 - (rect.yaw % (math.pi / 2.0))))
+            < 1e-6
+            for rect in rects
+        )
+    )
+    has_constraint = float(
+        counts[EA2_TILE_CORRIDOR] > 0 or counts[EA2_TILE_SIDE_WALLS] > 0
+    )
+    n_rects = len(rects)
+    n_pillars = counts[EA2_TILE_PILLAR]  # tile count, not primitive count
+    near_obstacle_ratio = _estimate_near_obstacle_ratio(
+        occupancy, inflated, cfg, rng
+    )
+
+    # Inflated free-space connectivity: paths are sampled inside the largest
+    # 8-connected component, so a map is only acceptable when that component
+    # contains nearly all safe cells.
+    from scipy.ndimage import label as _label
+    from scipy.ndimage import sum as _nd_sum
+
+    free = inflated == 0
+    labels, n_components = _label(free)
+    if n_components == 0:
+        largest_free_component_ratio = 0.0
+    else:
+        sizes = _nd_sum(free, labels, index=range(1, n_components + 1))
+        largest_free_component_ratio = float(sizes.max() / max(1, int(free.sum())))
 
     acceptance: dict = {
-        "boundary_occupied": boundary_ok,
-        "has_corridor_or_side_wall": has_constraint,
+        "occupancy_border_free": occupancy_border_free,
+        "planning_border_blocked": planning_border_blocked,
+        "physical_boundary_walls": float(
+            sum(
+                1
+                for r in rects
+                if max(r.size) >= cfg.size_m - 0.1
+            )
+        ),
+        "all_rects_axis_aligned": all_axis_aligned,
+        "n_tiles": float(tile_types.size),
+        "tile_types": float(tile_types.astype(np.float32).mean()),
+        "empty_tiles": float(counts.get(EA2_TILE_EMPTY, 0)),
+        "wall_tiles": float(counts.get(EA2_TILE_WALL, 0)),
+        "pillar_tiles": float(counts.get(EA2_TILE_PILLAR, 0)),
+        "corridor_tiles": float(counts.get(EA2_TILE_CORRIDOR, 0)),
+        "side_walls_tiles": float(counts.get(EA2_TILE_SIDE_WALLS, 0)),
+        "u_shape_tiles": float(counts.get(EA2_TILE_U_SHAPE, 0)),
         "has_constraint_primitive": has_constraint,
-        "n_rects": float(counts.get("n_rects", 0.0)),
-        "n_pillars": float(counts.get("pillars", 0.0)),
-        "corridor_walls": float(counts.get("corridor_walls", 0.0)),
-        "side_wall_segments": float(counts.get("side_wall_segments", 0.0)),
-        "u_walls": float(counts.get("u_walls", 0.0)),
+        "n_rects": float(n_rects),
+        "n_pillars": float(n_pillars),
         "near_obstacle_ratio_estimate": near_obstacle_ratio,
         "near_obstacle_ratio": near_obstacle_ratio,
         "path_near_obstacle_ratio": near_obstacle_ratio,
+        "largest_free_component_ratio": largest_free_component_ratio,
     }
     return acceptance
 
 
-def _static_acceptance(occupancy: np.ndarray, acceptance: dict, cfg: MapGenCfg) -> bool:
-    """Return True when static map acceptance criteria are satisfied."""
-    if acceptance["boundary_occupied"] != 1.0:
+def _static_acceptance(
+    occupancy: np.ndarray, acceptance: dict, cfg: MapGenCfg
+) -> bool:
+    if acceptance["occupancy_border_free"] != 1.0:
         return False
-    if cfg.require_constraint_primitive and acceptance["has_corridor_or_side_wall"] != 1.0:
+    if acceptance["planning_border_blocked"] != 1.0:
+        return False
+    if acceptance["physical_boundary_walls"] != 0.0:
+        return False
+    if acceptance["all_rects_axis_aligned"] != 1.0:
+        return False
+    if acceptance["largest_free_component_ratio"] < cfg.min_free_component_ratio:
+        return False
+    if cfg.require_constraint_primitive and acceptance["has_constraint_primitive"] != 1.0:
         return False
     return True
 
 
-def generate_map(cfg: MapGenCfg, seed: int) -> MapData:
-    """Generate a deterministic fixed map from ``cfg`` and ``seed``.
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-    The returned ``MapData`` contains the occupancy grid, the 4-cell inflated
-    safety grid, a watertight ground+obstacle mesh, the primitive lists, and
-    static acceptance statistics.
-    """
+
+def generate_map(cfg: MapGenCfg, seed: int) -> MapData:
+    """Generate a deterministic fixed 5x5-tile map from ``cfg`` and ``seed``."""
     rng = np.random.default_rng(seed)
 
     for _ in range(max(1, cfg.max_gen_attempts)):
-        rects, pillars, counts = _generate_primitive_set(cfg, rng)
-        counts["n_rects"] = len(rects)
+        tile_types = _make_tile_layout(rng)
+        height = float(rng.uniform(*_HEIGHT_RANGE))
+        rects, pillars, counts = _generate_tile_primitive_set(
+            cfg, rng, tile_types, height
+        )
         occupancy = _rasterize_occupancy(rects, pillars, cfg)
         inflated = _inflate_occupancy(occupancy, cfg)
-        acceptance = _build_acceptance(occupancy, inflated, counts, cfg, rng)
+        acceptance = _build_acceptance(
+            occupancy, inflated, counts, tile_types, rects, cfg, rng
+        )
         if _static_acceptance(occupancy, acceptance, cfg):
             break
     else:
@@ -615,6 +678,7 @@ def generate_map(cfg: MapGenCfg, seed: int) -> MapData:
         inflated=inflated,
         vertices=vertices,
         triangles=triangles,
+        tile_types=tile_types,
         rects=tuple(rects),
         pillars=tuple(pillars),
         acceptance=acceptance,

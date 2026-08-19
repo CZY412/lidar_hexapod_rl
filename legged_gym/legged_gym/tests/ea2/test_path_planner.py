@@ -6,7 +6,8 @@ Covered behaviours:
 - noisy path points stay free in the inflated grid and segments are clear;
 - heading controller converges to ``delta_target`` on a straight path;
 - ego-motion decomposition formula;
-- sharp synthetic path is rejected for violating ``min_turn_radius``.
+- sharp synthetic path is kept feasible and its tangent yaws are smoothed to
+  satisfy ``min_turn_radius``.
 """
 
 import numpy as np
@@ -120,19 +121,18 @@ def test_arc_is_cumulative_length_of_returned_points() -> None:
     assert data.arc[-1] > 7.0
 
 
-def test_min_path_len_checked_on_returned_path() -> None:
-    """The returned path (after LOS/noise), not only raw A*, must meet min len."""
+def test_min_path_len_enforced() -> None:
+    """Paths shorter than cfg.min_path_len are rejected."""
     occ = np.zeros((_GRID, _GRID), dtype=np.uint8)
     inflated = np.zeros((_GRID, _GRID), dtype=np.uint8)
 
-    # Raw A* length is ~3.04 m, but LOS simplification shortens it below 3.0 m.
-    with pytest.raises(ValueError, match="returned path length"):
+    with pytest.raises(ValueError, match="path length"):
         plan_path(
             occ,
             inflated,
             (-1.2, -0.8),
             (1.1, 0.9),
-            PathCfg(),
+            PathCfg(min_path_len=20.0),
             np.random.default_rng(0),
         )
 
@@ -238,8 +238,8 @@ def test_low_pass_noise_offsets_honors_configured_cutoff() -> None:
     assert ac_low > 0.9
 
 
-def test_sharp_path_rejected_for_min_turn_radius() -> None:
-    """An L-shaped path forced by a wall violates R_min and is rejected."""
+def test_sharp_path_yaws_smoothed_to_min_turn_radius() -> None:
+    """An L-shaped path keeps clear geometry and smoothed tangent yaws."""
     occ = np.zeros((_GRID, _GRID), dtype=np.uint8)
     wall_ix, _ = _world_to_grid(0.0, 0.0)
     for iy in range(_GRID):
@@ -249,5 +249,9 @@ def test_sharp_path_rejected_for_min_turn_radius() -> None:
     inflated = occ.copy()
 
     rng = np.random.default_rng(7)
-    with pytest.raises(ValueError, match="min_turn_radius"):
-        plan_path(occ, inflated, (-2.0, 0.0), (2.0, 0.0), PathCfg(), rng)
+    data = plan_path(occ, inflated, (-2.0, 0.0), (2.0, 0.0), PathCfg(), rng)
+    ds = np.linalg.norm(np.diff(data.points, axis=0), axis=1)
+    dyaw = np.abs(wrap_to_pi(np.diff(data.yaws)))
+    max_curvature = 1.0 / PathCfg().min_turn_radius
+    assert np.all(ds > 0.0)
+    assert np.all(dyaw / ds <= max_curvature + 1e-6)

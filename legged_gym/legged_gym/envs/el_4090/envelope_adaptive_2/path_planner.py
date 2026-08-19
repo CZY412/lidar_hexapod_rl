@@ -394,7 +394,15 @@ def _low_pass_noise_offsets(
         raw = rng.uniform(-1.0, 1.0)
         state += alpha * (raw - state)
         u[i] = float(np.clip(state, -1.0, 1.0))
-    return amp * u
+    # Taper the first/last 20% of the sequence to zero so the noisy path
+    # departs from and returns to the original reference smoothly; otherwise a
+    # large offset at the endpoints dominates the finite-difference tangent.
+    n_taper = max(2, int(n * 0.2))
+    taper = np.ones(n, dtype=np.float64)
+    ramp = np.sin(np.linspace(0.0, np.pi / 2.0, n_taper))
+    taper[:n_taper] = ramp
+    taper[-n_taper:] = ramp[::-1]
+    return amp * u * taper
 
 
 def _smooth_offsets_once(offsets: np.ndarray) -> np.ndarray:
@@ -591,13 +599,84 @@ def _curvature_violation(points: np.ndarray, yaws: np.ndarray, cfg: PathCfg) -> 
     return False
 
 
+def _deduplicate_close_points(points: np.ndarray, min_spacing: float) -> np.ndarray:
+    """Drop consecutive points closer than ``min_spacing``.
+
+    Noise fallback can leave nearly coincident points; they add zero-length
+    segments and artificial curvature spikes.  Removing consecutive duplicates
+    can never make a previously clear polyline blocked.
+    """
+    if points.shape[0] < 2:
+        return points
+    keep = [0]
+    for i in range(1, points.shape[0]):
+        if float(np.linalg.norm(points[i] - points[keep[-1]])) >= min_spacing:
+            keep.append(i)
+    return points[np.asarray(keep, dtype=int)]
+
+
+def _smooth_yaws_to_min_radius(
+    points: np.ndarray, yaws: np.ndarray, cfg: PathCfg, max_iterations: int = 500
+) -> np.ndarray:
+    """Smooth tangent yaws until the discrete curvature bound is satisfied.
+
+    A* on an 8-neighbour grid produces right-angle polyline corners whose
+    exact tangent curvature is infinite.  M1 is a kinematic surrogate: the
+    position stays on the collision-checked reference polyline, while the
+    heading/tangent reference is a smoothed version of the finite-difference
+    yaw.  Endpoint yaws are pinned to their segment directions; interior yaws
+    are smoothed with a 1:2:1 circular mean.  The heading controller still
+    clips ``omega`` to ``cfg.omega_max``.
+    """
+    y = np.asarray(yaws, dtype=np.float64).copy()
+    ds = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    max_curvature = 1.0 / max(float(cfg.min_turn_radius), 1e-6)
+
+    def _violates(cur_yaws: np.ndarray) -> bool:
+        dy = np.abs(wrap_to_pi(np.diff(cur_yaws)))
+        for k in range(len(ds)):
+            if ds[k] > 1e-9 and dy[k] / ds[k] > max_curvature + 1e-9:
+                return True
+        return False
+
+    if y.shape[0] == 1:
+        return y
+    # Pin endpoints to their segment directions: path-noise jitter otherwise
+    # leaves large finite-difference yaws at the first/last point that no
+    # interior-only smoothing can remove.
+    y[0] = np.arctan2(points[1, 1] - points[0, 1], points[1, 0] - points[0, 0])
+    y[-1] = np.arctan2(
+        points[-1, 1] - points[-2, 1], points[-1, 0] - points[-2, 0]
+    )
+    if y.shape[0] == 2:
+        return y
+
+    for _ in range(max_iterations):
+        if not _violates(y):
+            return y
+        z = np.exp(1j * y)
+        z_new = z.copy()
+        z_new[1:-1] = 0.25 * z[:-2] + 0.5 * z[1:-1] + 0.25 * z[2:]
+        z_new[0] = z[0]
+        z_new[-1] = z[-1]
+        y = np.angle(z_new)
+    return y
+
+
 def _build_path_data(
     points: np.ndarray,
     cfg: PathCfg,
     inflated: np.ndarray,
     rng: np.random.Generator,
 ) -> PathData:
-    """Resample, noise, validate curvature and package a :class:`PathData`."""
+    """Resample, noise, smooth tangent yaws and package a :class:`PathData`.
+
+    The geometry (points) is validated against the inflated grid; the tangent
+    yaws are the finite-difference tangents smoothed until the discrete
+    ``R_min`` curvature bound holds.  Grid right-angle corners are therefore
+    tolerated in the reference polyline instead of rejecting every tile-map
+    path.
+    """
     # A* output may contain many collinear grid waypoints; simplify first.
     simple = _simplify_path(points, inflated)
     resampled, _ = _resample_polyline(simple, cfg.resample_dist)
@@ -605,28 +684,29 @@ def _build_path_data(
     if len(resampled) < 2:
         raise ValueError("path contains fewer than two points after resampling")
 
-    # First try the configured 1 Hz noise; if R_min rejects it, re-smooth the
-    # noise sequence (README 2.2.4: "重新平滑/重采样路径噪声") before rejecting.
     smoothing_passes = (0, 1, 2, 4, 8, 16)
     for passes in smoothing_passes:
-        for attempt in range(_MAX_NOISE_ATTEMPTS):
-            noisy = _apply_path_noise(resampled, inflated, cfg, rng, smoothing_passes=passes)
-            yaws = _tangent_yaws(noisy)
-            if _curvature_violation(noisy, yaws, cfg):
+        for _ in range(_MAX_NOISE_ATTEMPTS):
+            noisy = _apply_path_noise(
+                resampled, inflated, cfg, rng, smoothing_passes=passes
+            )
+            min_spacing = max(1e-3, float(cfg.resample_dist) * 0.1)
+            noisy = _deduplicate_close_points(noisy, min_spacing)
+            if noisy.shape[0] < 2:
                 continue
-            # The arc belongs to the returned noisy polyline, not to the
-            # pre-noise resampled path.  Re-validate safety after the noise
-            # fallback so no blocked segment can escape plan_path.
-            noisy_arc = _cumulative_arc_lengths(noisy)
             if not _path_clear(noisy, inflated):
                 raise ValueError(
                     "path noise produced a blocked point or segment after fallback"
                 )
+            yaws = _smooth_yaws_to_min_radius(
+                noisy, _tangent_yaws(noisy), cfg
+            )
+            noisy_arc = _cumulative_arc_lengths(noisy)
             return PathData(points=noisy, yaws=yaws, arc=noisy_arc)
 
     raise ValueError(
-        "path violates min_turn_radius after resampling/noise retries; "
-        "reject and resample a new path"
+        "path noise could not produce a feasible realization; reject and "
+        "resample a new path"
     )
 
 
@@ -642,8 +722,8 @@ def plan_path(
 
     Pipeline (README 2.2.4-2.2.6):
     A* on the inflated grid -> line-of-sight simplification -> fixed-distance
-    resampling -> bounded lateral noise with rejection sampling -> tangent yaw
-    and min-turn-radius validation.
+    resampling -> bounded lateral noise with rejection sampling -> tangent-yaw
+    smoothing to the configured ``min_turn_radius`` bound.
 
     Args:
         occupancy: Raw occupancy grid ``(120, 120)`` uint8 (kept for API
@@ -660,8 +740,8 @@ def plan_path(
 
     Raises:
         ValueError: If start/goal are blocked, A* has no solution, the path is
-            shorter than ``cfg.min_path_len``, or no noise realization can meet
-            the minimum turn radius.
+            shorter than ``cfg.min_path_len``, or path-noise rejection sampling
+            cannot produce a clear polyline.
     """
     if occupancy is None:
         raise ValueError("occupancy grid must be provided")

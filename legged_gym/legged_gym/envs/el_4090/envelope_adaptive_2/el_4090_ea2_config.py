@@ -52,10 +52,15 @@ class El4090EA2Cfg(LeggedRobotCfg):
         grid_shape = [120, 120]
         world_min_xy = -6.0
         world_max_xy = 6.0
+        # No physical boundary walls.  When True, only the *inflated planning*
+        # grid border is blocked so A* keeps the robot inside the map.
         boundary_occupied = True
         ground_margin_m = 2.0            # warp ground plane extends past map edges
         inflation_m = 0.35               # A* lateral safety (3.5 cells -> 4)
         inflation_cells = 4
+        n_tiles = 5                      # 5 x 5 terrain plots, one type per tile
+        tile_padding_m = 0.15            # primitives stay inside their tile
+        min_free_component_ratio = 0.95  # inflated free space must be mostly connected
         max_gen_attempts = 20
         n_validation_paths = 12          # 8~16 validation A* runs at map acceptance
         min_solved_ratio = 0.8

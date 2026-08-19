@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -56,6 +56,23 @@ EA2_RANGE_DIM = EA2_N_COLS * EA2_N_ROWS  # 450
 EA2_RANGE_MAX_M = 5.0   # effective aggregation range (normalization divisor)
 EA2_RANGE_MIN_M = 0.2   # applied in aggregation, NOT by the warp kernel
 EA2_LIDAR_FAR_PLANE_M = 60.0
+
+# 5x5 tile terrain layout (one terrain type per tile, axis-aligned obstacles)
+EA2_N_TILES = 5
+EA2_TILE_EMPTY = 0
+EA2_TILE_WALL = 1
+EA2_TILE_PILLAR = 2
+EA2_TILE_CORRIDOR = 3
+EA2_TILE_SIDE_WALLS = 4
+EA2_TILE_U_SHAPE = 5
+EA2_TILE_TYPE_CODES = (
+    EA2_TILE_EMPTY,
+    EA2_TILE_WALL,
+    EA2_TILE_PILLAR,
+    EA2_TILE_CORRIDOR,
+    EA2_TILE_SIDE_WALLS,
+    EA2_TILE_U_SHAPE,
+)
 
 # Sensor mount (body frame)
 EA2_SENSOR_OFFSET_POS = (0.62, 0.0, 0.0)
@@ -103,9 +120,10 @@ class MapData:
     """
 
     occupancy: np.ndarray           # (120, 120) uint8, 1 = occupied
-    inflated: np.ndarray            # (120, 120) uint8, 1 = blocked
+    inflated: np.ndarray            # (120, 120) uint8, 1 = blocked (planning)
     vertices: np.ndarray            # (V, 3) float32, watertight ground+obstacles
     triangles: np.ndarray           # (T, 3) int32, CCW/outward-consistent winding
+    tile_types: Optional[np.ndarray] = None  # (5, 5) uint8 tile type codes
     rects: Tuple[RectPrimitive, ...] = ()
     pillars: Tuple[PillarPrimitive, ...] = ()
     acceptance: Dict[str, float] = field(default_factory=dict)
@@ -125,10 +143,13 @@ class MapGenCfg:
     size_m: float = EA2_MAP_SIZE_M
     resolution_m: float = EA2_RESOLUTION_M
     grid_shape: Tuple[int, int] = EA2_GRID_SHAPE
-    boundary_occupied: bool = True
+    boundary_occupied: bool = True   # planning border in *inflated* grid only
     ground_margin_m: float = EA2_GROUND_MARGIN_M
     inflation_m: float = 0.35
     inflation_cells: int = 4
+    n_tiles: int = EA2_N_TILES       # n_tiles x n_tiles terrain plots
+    tile_padding_m: float = 0.15     # keep primitives inside each plot
+    min_free_component_ratio: float = 0.95  # inflated free-space connectivity
     max_gen_attempts: int = 20
     n_validation_paths: int = 12
     min_solved_ratio: float = 0.8
