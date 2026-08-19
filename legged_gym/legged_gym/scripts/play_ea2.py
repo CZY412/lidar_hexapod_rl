@@ -43,7 +43,7 @@ def play(args) -> None:
     env_cfg.lidar.debug_point_stride = 1
 
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
-    _set_camera(env, [0.0, -8.0, 6.0], [0.0, 0.0, 0.6])
+    _set_camera(env, [0.0, -35.0, 22.0], [0.0, 0.0, 0.6])
 
     # Load the latest (or requested) checkpoint.
     train_cfg.runner.resume = True

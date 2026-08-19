@@ -187,10 +187,9 @@ def test_offset_hexagon_handles_collinear_minimum_envelope() -> None:
 def test_collision_cell_ratio_synthetic_occupancy() -> None:
     """A hex covering 4 cells with 2 occupied has collision ratio 0.5."""
     occupancy = np.zeros(c.EA2_GRID_SHAPE, dtype=np.uint8)
-    # Cell centers for ix=60,61 / iy=60,61 are (0.05,0.05),(0.15,0.05),
-    # (0.05,0.15),(0.15,0.15). Mark the two lower cells occupied.
-    occupancy[60, 60] = 1
-    occupancy[60, 61] = 1
+    # World (0.05,0.05) -> grid (300,300); (0.15,0.05) -> (300,301).
+    occupancy[300, 300] = 1
+    occupancy[300, 301] = 1
 
     # Degenerate CCW hexagon equal to the world rectangle [0, 0.2] x [0, 0.2].
     # The six vertices are collinear in pairs, matching the legacy B,D,F,E,C,A
@@ -217,10 +216,10 @@ def test_collision_cell_ratio_synthetic_occupancy() -> None:
 
     # All covered cells occupied -> ratio 1.
     full_occ = np.zeros(c.EA2_GRID_SHAPE, dtype=np.uint8)
-    full_occ[60, 60] = 1
-    full_occ[60, 61] = 1
-    full_occ[61, 60] = 1
-    full_occ[61, 61] = 1
+    full_occ[300, 300] = 1
+    full_occ[300, 301] = 1
+    full_occ[301, 300] = 1
+    full_occ[301, 301] = 1
     ratio_full = collision_cell_ratio(hex_vertices, full_occ)
     assert abs(ratio_full.item() - 1.0) < 1e-5
 

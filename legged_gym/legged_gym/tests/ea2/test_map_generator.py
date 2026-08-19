@@ -243,8 +243,10 @@ def test_mesh_winding_is_outward_consistent():
 
 def test_circular_pillar_rasterization_matches_polygon_footprint():
     map_data = generate_map(_default_cfg(), seed=0)
-    xs = np.linspace(-5.95, 5.95, map_data.occupancy.shape[1])
-    ys = np.linspace(-5.95, 5.95, map_data.occupancy.shape[0])
+    shape = map_data.occupancy.shape
+    half = c.EA2_MAP_SIZE_M / 2.0
+    xs = np.linspace(-half + 0.05, half - 0.05, shape[1])
+    ys = np.linspace(-half + 0.05, half - 0.05, shape[0])
     gx, gy = np.meshgrid(xs, ys)
 
     for pillar in map_data.pillars:

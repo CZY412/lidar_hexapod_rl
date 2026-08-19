@@ -455,9 +455,9 @@ class EL_4090_EA2(BaseTask):
         self.gym.add_ground(self.sim, plane_params)
 
         # All envs share the same world origin; bounds are deliberately large
-        # enough to cover the single 12x12 map.
-        env_lower = self.gymapi().Vec3(-20.0, -20.0, -20.0)
-        env_upper = self.gymapi().Vec3(20.0, 20.0, 20.0)
+        # enough to cover the single 60x60 map.
+        env_lower = self.gymapi().Vec3(-35.0, -35.0, -20.0)
+        env_upper = self.gymapi().Vec3(35.0, 35.0, 20.0)
         num_per_row = max(1, int(math.isqrt(self.num_envs)))
         self.envs = []
         self.env_origins = torch.zeros(

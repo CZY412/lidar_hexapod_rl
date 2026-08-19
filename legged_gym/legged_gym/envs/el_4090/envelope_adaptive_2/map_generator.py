@@ -123,8 +123,8 @@ def _axis_dirs(yaw: float) -> Tuple[Tuple[float, float], Tuple[float, float]]:
 def _tile_wall(
     rng: np.random.Generator, center: Tuple[float, float], height: float
 ) -> List[RectPrimitive]:
-    length = float(rng.uniform(1.2, 1.8))
-    thickness = float(rng.uniform(0.2, 0.4))
+    length = float(rng.uniform(4.0, 8.0))
+    thickness = float(rng.uniform(0.2, 0.5))
     yaw = 0.0 if rng.integers(0, 2) == 0 else math.pi / 2.0
     return [
         RectPrimitive(
@@ -139,14 +139,19 @@ def _tile_pillars(
     height: float,
     square: bool,
 ) -> List[PillarPrimitive]:
-    n = int(rng.integers(1, 3))  # 1 or 2 pillars
+    n = int(rng.integers(1, 4))  # 1..3 pillars
     horizontal = bool(rng.integers(0, 2) == 0)
-    offsets = [(-0.25, 0.0), (0.25, 0.0)] if horizontal else [
-        (0.0, -0.25), (0.0, 0.25)
-    ]
+    if n == 1:
+        offsets = [(0.0, 0.0)]
+    elif n == 2:
+        offsets = [(-1.0, 0.0), (1.0, 0.0)]
+    else:
+        offsets = [(-1.5, 0.0), (0.0, 0.0), (1.5, 0.0)]
+    if not horizontal:
+        offsets = [(dy, dx) for dx, dy in offsets]
     pillars: List[PillarPrimitive] = []
     for i in range(n):
-        radius = float(rng.uniform(0.15, 0.30))
+        radius = float(rng.uniform(0.2, 0.45))
         pillars.append(
             PillarPrimitive(
                 center=(center[0] + offsets[i][0], center[1] + offsets[i][1]),
@@ -163,9 +168,9 @@ def _tile_corridor(
     rng: np.random.Generator, center: Tuple[float, float], height: float
 ) -> List[RectPrimitive]:
     """Two parallel axis-aligned walls forming a narrow channel."""
-    gap = float(rng.uniform(1.0, 1.4))
-    thickness = float(rng.uniform(0.2, 0.3))
-    length = 1.8
+    gap = float(rng.uniform(1.0, 2.0))
+    thickness = float(rng.uniform(0.2, 0.4))
+    length = float(rng.uniform(8.0, 10.0))
     yaw = 0.0 if rng.integers(0, 2) == 0 else math.pi / 2.0
     _, normal = _axis_dirs(yaw)
     offset = gap / 2.0 + thickness / 2.0
@@ -194,21 +199,21 @@ def _tile_corridor(
 def _tile_side_walls(
     rng: np.random.Generator, center: Tuple[float, float], height: float
 ) -> List[RectPrimitive]:
-    """2-3 short axis-aligned wall segments on one side of the tile."""
-    n = int(rng.integers(2, 4))
+    """2-5 short axis-aligned wall segments on one side of the tile."""
+    n = int(rng.integers(2, 6))
     yaw = 0.0 if rng.integers(0, 2) == 0 else math.pi / 2.0
     direction, normal = _axis_dirs(yaw)
-    offsets = (-0.4, 0.4) if n == 2 else (-0.5, 0.0, 0.5)
-    lateral = 0.6
-    seg_len = 0.8
+    offsets = np.linspace(-3.0, 3.0, n) if n > 1 else np.zeros(1)
+    lateral = 2.0
     rects: List[RectPrimitive] = []
-    for off in offsets[:n]:
-        thickness = float(rng.uniform(0.2, 0.25))
+    for off in offsets:
+        seg_len = float(rng.uniform(1.5, 3.0))
+        thickness = float(rng.uniform(0.2, 0.35))
         rects.append(
             RectPrimitive(
                 center=(
-                    center[0] + direction[0] * off + normal[0] * lateral,
-                    center[1] + direction[1] * off + normal[1] * lateral,
+                    center[0] + direction[0] * float(off) + normal[0] * lateral,
+                    center[1] + direction[1] * float(off) + normal[1] * lateral,
                 ),
                 size=(seg_len, thickness),
                 yaw=yaw,
@@ -222,9 +227,9 @@ def _tile_u_shape(
     rng: np.random.Generator, center: Tuple[float, float], height: float
 ) -> List[RectPrimitive]:
     """Axis-aligned U: back wall plus two parallel side walls."""
-    opening = float(rng.uniform(0.8, 1.0))
-    depth = 1.2
-    thickness = float(rng.uniform(0.2, 0.25))
+    opening = float(rng.uniform(1.0, 1.5))
+    depth = float(rng.uniform(4.0, 6.0))
+    thickness = float(rng.uniform(0.2, 0.4))
     yaw = 0.0 if rng.integers(0, 2) == 0 else math.pi / 2.0
     direction, normal = _axis_dirs(yaw)
 
@@ -303,39 +308,87 @@ def _generate_tile_primitive_set(
 
 
 def _rasterize_rect(rect: RectPrimitive, cfg: MapGenCfg) -> np.ndarray:
-    """Return a boolean grid marking cell centers covered by ``rect``."""
-    xs, ys = _grid_centers(cfg)
+    """Return a boolean grid marking cell centers covered by ``rect``.
+
+    Only the rectangle's bounding box is evaluated so the 600x600 raster
+    stays fast with many primitives.
+    """
+    world_min = -cfg.size_m / 2.0
+    res = cfg.resolution_m
+    c = np.cos(rect.yaw)
+    s = np.sin(rect.yaw)
+    half_x = rect.size[0] / 2.0
+    half_y = rect.size[1] / 2.0
+    extent_x = abs(c) * half_x + abs(s) * half_y
+    extent_y = abs(s) * half_x + abs(c) * half_y
+
+    ix_min = max(0, int(np.floor((rect.center[0] - extent_x - world_min) / res)))
+    ix_max = min(
+        cfg.grid_shape[1] - 1,
+        int(np.floor((rect.center[0] + extent_x - world_min) / res)),
+    )
+    iy_min = max(0, int(np.floor((rect.center[1] - extent_y - world_min) / res)))
+    iy_max = min(
+        cfg.grid_shape[0] - 1,
+        int(np.floor((rect.center[1] + extent_y - world_min) / res)),
+    )
+    if ix_min > ix_max or iy_min > iy_max:
+        return np.zeros(cfg.grid_shape, dtype=np.uint8)
+
+    xs = world_min + (np.arange(ix_min, ix_max + 1) + 0.5) * res
+    ys = world_min + (np.arange(iy_min, iy_max + 1) + 0.5) * res
     gx, gy = np.meshgrid(xs, ys)
     dx = gx - rect.center[0]
     dy = gy - rect.center[1]
-    c = np.cos(rect.yaw)
-    s = np.sin(rect.yaw)
     local_x = c * dx + s * dy
     local_y = -s * dx + c * dy
-    half_x = rect.size[0] / 2.0
-    half_y = rect.size[1] / 2.0
-    return (np.abs(local_x) <= half_x) & (np.abs(local_y) <= half_y)
+    mask = (np.abs(local_x) <= half_x) & (np.abs(local_y) <= half_y)
+
+    out = np.zeros(cfg.grid_shape, dtype=np.uint8)
+    out[iy_min : iy_max + 1, ix_min : ix_max + 1] = mask.astype(np.uint8)
+    return out
 
 
 def _rasterize_pillar(pillar: PillarPrimitive, cfg: MapGenCfg) -> np.ndarray:
     """Return a boolean grid marking cell centers covered by ``pillar``."""
-    xs, ys = _grid_centers(cfg)
+    world_min = -cfg.size_m / 2.0
+    res = cfg.resolution_m
+    half = float(pillar.radius)
+    ix_min = max(0, int(np.floor((pillar.center[0] - half - world_min) / res)))
+    ix_max = min(
+        cfg.grid_shape[1] - 1,
+        int(np.floor((pillar.center[0] + half - world_min) / res)),
+    )
+    iy_min = max(0, int(np.floor((pillar.center[1] - half - world_min) / res)))
+    iy_max = min(
+        cfg.grid_shape[0] - 1,
+        int(np.floor((pillar.center[1] + half - world_min) / res)),
+    )
+    if ix_min > ix_max or iy_min > iy_max:
+        return np.zeros(cfg.grid_shape, dtype=np.uint8)
+
+    xs = world_min + (np.arange(ix_min, ix_max + 1) + 0.5) * res
+    ys = world_min + (np.arange(iy_min, iy_max + 1) + 0.5) * res
     gx, gy = np.meshgrid(xs, ys)
     dx = gx - pillar.center[0]
     dy = gy - pillar.center[1]
-    if pillar.square:
-        half = pillar.radius
-        return (np.abs(dx) <= half) & (np.abs(dy) <= half)
 
-    poly = _circle_polygon(pillar.radius, pillar.segments)
-    inside = np.ones(dx.shape, dtype=bool)
-    n = poly.shape[0]
-    for i in range(n):
-        x0, y0 = poly[i]
-        x1, y1 = poly[(i + 1) % n]
-        cross = (x1 - x0) * (dy - y0) - (y1 - y0) * (dx - x0)
-        inside &= cross >= 0.0
-    return inside
+    if pillar.square:
+        mask = (np.abs(dx) <= half) & (np.abs(dy) <= half)
+    else:
+        poly = _circle_polygon(pillar.radius, pillar.segments)
+        inside = np.ones(dx.shape, dtype=bool)
+        n = poly.shape[0]
+        for i in range(n):
+            x0, y0 = poly[i]
+            x1, y1 = poly[(i + 1) % n]
+            cross = (x1 - x0) * (dy - y0) - (y1 - y0) * (dx - x0)
+            inside &= cross >= 0.0
+        mask = inside
+
+    out = np.zeros(cfg.grid_shape, dtype=np.uint8)
+    out[iy_min : iy_max + 1, ix_min : ix_max + 1] = mask.astype(np.uint8)
+    return out
 
 
 def _rasterize_occupancy(

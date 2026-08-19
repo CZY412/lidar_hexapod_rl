@@ -31,11 +31,11 @@ import torch
 EA2_DIR = Path(__file__).resolve().parent
 EA2_MAPPING_TABLE_FILE = EA2_DIR / "airy_mapping.pt"
 
-EA2_MAP_SIZE_M = 12.0
+EA2_MAP_SIZE_M = 60.0    # 5 x 5 tiles of 12m x 12m each
 EA2_RESOLUTION_M = 0.1
-EA2_GRID_SHAPE = (120, 120)  # (rows=iy, cols=ix)
-EA2_WORLD_MIN_XY = -6.0
-EA2_WORLD_MAX_XY = 6.0
+EA2_GRID_SHAPE = (600, 600)  # (rows=iy, cols=ix)
+EA2_WORLD_MIN_XY = -30.0
+EA2_WORLD_MAX_XY = 30.0
 EA2_GROUND_MARGIN_M = 2.0
 
 # Airy (matches LidarSensor.generate_AIRY defaults)

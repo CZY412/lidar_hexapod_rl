@@ -28,10 +28,10 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.path_planner import (
     wrap_to_pi,
 )
 
-# Map constants duplicated here to keep the test self-contained.
-_MAP_MIN = -6.0
+# Map constants duplicated here to keep the test self-contained (60x60 map).
+_MAP_MIN = -30.0
 _RES = 0.1
-_GRID = 120
+_GRID = 600
 
 
 def _world_to_grid(x: float, y: float) -> tuple:

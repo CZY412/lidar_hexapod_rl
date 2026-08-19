@@ -3,7 +3,7 @@
 > v2 依据代码核对结果与最新讨论修订。与 v1 的主要差异：
 >
 > - 地图改为**全局一张、训练开始时生成后固定**；每 env 的差异来自起点/终点、路径噪声、速度与朝向偏置、随机晃动；
-> - 地形改为 **5×5 地块布局**：每块地一种地形（空/墙/柱/窄通道/单侧墙/U 形），**无实体围墙**，所有矩形障碍**轴对齐**（不倾斜）；
+> - 地形改为 **5×5 地块布局**：每块地 12m×12m（总地图 60m×60m），每块一种地形（空/墙/柱/窄通道/单侧墙/U 形），**无实体围墙**，所有矩形障碍**轴对齐**（不倾斜）；
 > - Airy 水平映射修正：**逻辑方位角 0° ↔ Airy 物理通道 30**，分桶选中物理通道 **18~42**（θ=108°~252°），并强制 `airy_mount.py` 自检；
 > - LiDAR 噪声改走 `LidarConfig` 的传感器噪声字段，**作用于所有点**（沿用相机传感器原加噪语义，无“仅有效点”分支）；不再使用 `pd_gru_lidar` 手写 domain-rand（注意：当前仓库 LiDAR 路径尚无 `apply_noise()`，需补上，见 §2.2.8 与 §三）；
 > - 分桶前**不再做地面过滤**，因此也不存在“干净点云/加噪点云”两份数据；
@@ -71,12 +71,12 @@
 #### 2.2.1 地图表示与尺寸
 
 ```text
-map_size      = 12m × 12m（世界坐标 x, y ∈ [-6, 6]）
+map_size      = 60m × 60m（5×5 块，每块 12m×12m；世界坐标 x, y ∈ [-30, 30]）
 resolution    = 0.1m
-grid_shape    = 120 × 120
+grid_shape    = 600 × 600
 occupied      = 1（障碍）
 free          = 0（可通行）
-world → grid  ix = floor((x + 6.0) / 0.1), iy = floor((y + 6.0) / 0.1)
+world → grid  ix = floor((x + 30.0) / 0.1), iy = floor((y + 30.0) / 0.1)
 ```
 
 该栅格同时用于：
@@ -87,7 +87,7 @@ world → grid  ix = floor((x + 6.0) / 0.1), iy = floor((y + 6.0) / 0.1)
 
 实现约定：
 
-- **5×5 地块布局**：12m×12m 均分为 5×5 块（每块 2.4m），每块地**只放置一种地形**：空（6 块）、墙（5 块）、柱（4 块）、窄通道（4 块）、单侧墙（3 块）、U 形（3 块），块内障碍与地块边保持 0.15m padding，不跨块混合；
+- **5×5 地块布局**：60m×60m 均分为 5×5 块（每块 12m×12m），每块地**只放置一种地形**：空（6 块）、墙（5 块）、柱（4 块）、窄通道（4 块）、单侧墙（3 块）、U 形（3 块），块内障碍与地块边保持 0.5m padding，不跨块混合；
 - **无实体围墙**：地图四周不再生成围墙；仅把**膨胀后（planning）栅格**的边界标为 blocked，保证 A* 不规划出图，occupancy 与 mesh 边界保持 free；
 - **所有矩形障碍轴对齐**（yaw ∈ {0°, 90°}），不接受任意倾斜墙；
 - **栅格是权威几何**：先由障碍基元 footprint 栅格化得到 occupancy，再由同一套基元参数生成 Warp mesh，两者必须一致；
@@ -578,7 +578,7 @@ task_registry.register("el4090_ea2", EL_4090_EA2, El4090EA2Cfg(), El4090EA2CfgPP
    - `tests/test_range_image.py`：ray 索引公式、映射表 450 形状、空桶填 5.0；
    - `tests/test_envelope_geometry.py`：顶点顺序、半宽语义、margin offset、栅格碰撞；
    - `tests/test_path_planner.py`：A* 连通性、0.35 膨胀、噪声拒绝采样、δ_actual 跟踪。
-4. **M1 `create_sim()` 约定**（BaseTask 无机器人）：`add_ground` 建 Isaac 地面、按基元创建静态障碍 actor（仅可视化，放 **env 0** 一份即可）；创建 `num_envs` 个 env handle，**所有 env 共用世界原点（`env_origins=0`，不要按常规网格散开）**——单张 12×12 的 warp mesh 在世界原点，散开会导致 env 射线全部出图；`sensor_pos_tensor / sensor_quat_tensor` 直接用载体世界位姿（不叠加 env_origin），`sensor_pos_tensor / sensor_quat_tensor / mesh_ids` 按 legacy `_init_lidar_sensor` 的模式创建，Warp mesh 是 raycast 权威几何。
+4. **M1 `create_sim()` 约定**（BaseTask 无机器人）：`add_ground` 建 Isaac 地面、按基元创建静态障碍 actor（仅可视化，放 **env 0** 一份即可）；创建 `num_envs` 个 env handle，**所有 env 共用世界原点（`env_origins=0`，不要按常规网格散开）**——单张 60×60 的 warp mesh 在世界原点，散开会导致 env 射线全部出图；`sensor_pos_tensor / sensor_quat_tensor` 直接用载体世界位姿（不叠加 env_origin），`sensor_pos_tensor / sensor_quat_tensor / mesh_ids` 按 legacy `_init_lidar_sensor` 的模式创建，Warp mesh 是 raycast 权威几何。
 
 - 旧的 `envelope_adaptive/` 规则式实现视为 legacy，不参与新任务。
 
@@ -588,7 +588,7 @@ task_registry.register("el4090_ea2", EL_4090_EA2, El4090EA2Cfg(), El4090EA2CfgPP
 
 ### M1：最小底座
 
-- 简化 BaseTask + **全局固定地图**（12m×12m，Warp mesh 含 z=0 地面 + 障碍）+ 每 env A* 路径 + 有界路径噪声 + 低通随机晃动；
+- 简化 BaseTask + **全局固定地图**（60m×60m = 5×5 块，每块 12m×12m；Warp mesh 含 z=0 地面 + 障碍）+ 每 env A* 路径 + 有界路径噪声 + 低通随机晃动；
 - 起点/终点每 episode 采样；路径速度 0.5~1.5m/s、δ_target ±20°、高度目标 0.53~0.64m 每 4s 重采样；**切线相对跟踪朝向控制**（ω 限幅 ±1.5 rad/s）+ **高度一阶低通过渡与保持期 ±0.01~0.02m 波动**；
 - Isaac Gym + `LidarSensor` Airy 生成点云，**物理通道 18~42 / 垂直 6~95** 聚合为 450 维 range image，含 `airy_mount.py` 覆盖自检；
 - **LidarSensor `apply_noise()` 补齐**：乘性高斯 2% + dropout 2%，作用于所有点（聚合层只收 0.2~5m 有效距离），不做地面过滤；

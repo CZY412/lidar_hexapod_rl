@@ -192,8 +192,9 @@ def test_potential_reward_max_min_and_backward_direction() -> None:
 def test_collision_ratio_synthetic_occupancy() -> None:
     """Collision ratio counts covered occupied cells / covered cells."""
     occupancy = np.zeros(ea2c.EA2_GRID_SHAPE, dtype=np.uint8)
-    occupancy[60, 60] = 1
-    occupancy[60, 61] = 1
+    # World (0.05,0.05) -> grid (300,300); (0.15,0.05) -> (300,301).
+    occupancy[300, 300] = 1
+    occupancy[300, 301] = 1
     hex_vertices = torch.tensor(
         [
             [0.20, 0.20],  # B
