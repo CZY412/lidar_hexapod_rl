@@ -14,11 +14,24 @@ def test_env_cfg_contract():
     assert cfg.env.num_privileged_obs is None
     assert cfg.env.episode_length_s == 20.0
     assert cfg.sim.dt == 0.02
-    assert cfg.height.min_m == 0.53
-    assert cfg.height.max_m == 0.64
-    assert cfg.path.speed_range == [0.5, 1.5]
-    assert cfg.path.delta_target_deg_range == [-20.0, 20.0]
+    assert cfg.height.min_m == 0.52
+    assert cfg.height.max_m == 0.52
+    assert cfg.path.speed_range == [1.0, 1.0]
+    assert cfg.path.delta_target_deg_range == [0.0, 0.0]
+    assert cfg.path.noise_amp_range == [0.0, 0.0]
+    assert cfg.sway.pos_amp_range == [0.0, 0.0]
+    assert cfg.sway.heading_amp_range == [0.0, 0.0]
+    assert cfg.height.wobble_amp_range == [0.0, 0.0]
     assert cfg.path.omega_max == 1.5
+    assert cfg.map.size_m == 74.0
+    assert cfg.map.grid_shape == [740, 740]
+    assert cfg.map.n_tiles == 4
+    assert cfg.map.tile_size_m == 16.0
+    assert cfg.obstacles.pillar_count_max == 12
+    assert cfg.obstacles.pillar_size_x_min == 0.5
+    assert cfg.obstacles.pillar_size_x_max == 4.0
+    assert cfg.obstacles.pillar_min_separation == 2.2
+    assert cfg.lidar.offset_pos == [0.0, 0.0, -0.05]
     assert cfg.lidar.far_plane == 60.0
     assert cfg.lidar.effective_max_range == 5.0
     assert cfg.lidar.update_frequency_hz == 10.0
@@ -48,8 +61,11 @@ def test_airy_bucket_constants():
     assert c.EA2_N_COLS == 25
     assert c.EA2_N_ROWS == 18
     assert c.EA2_RANGE_DIM == 450
-    assert c.EA2_SENSOR_OFFSET_POS == (0.62, 0.0, 0.0)
+    assert c.EA2_SENSOR_OFFSET_POS == (0.0, 0.0, -0.05)
     assert abs(c.EA2_SENSOR_OFFSET_RPY[1] - (3.14159265 / 2.0 + 0.35)) < 1e-6
+    assert c.EA2_MAP_SIZE_M == 74.0
+    assert c.EA2_GRID_SHAPE == (740, 740)
+    assert c.EA2_N_TILES == 4
 
 
 def test_envelope_spec_source_exists():

@@ -14,6 +14,7 @@ import math
 # ``legged_gym.envs`` package (and therefore isaacgym) before torch is used.
 from legged_gym.envs.el_4090.envelope_adaptive_2 import _contracts as ea2c
 from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_env import (
+    EL_4090_EA2,
     action_rate_term,
     assemble_observation,
     collision_ratio,
@@ -193,8 +194,8 @@ def test_collision_ratio_synthetic_occupancy() -> None:
     """Collision ratio counts covered occupied cells / covered cells."""
     occupancy = np.zeros(ea2c.EA2_GRID_SHAPE, dtype=np.uint8)
     # World (0.05,0.05) -> grid (300,300); (0.15,0.05) -> (300,301).
-    occupancy[300, 300] = 1
-    occupancy[300, 301] = 1
+    occupancy[370, 370] = 1
+    occupancy[370, 371] = 1
     hex_vertices = torch.tensor(
         [
             [0.20, 0.20],  # B
@@ -296,3 +297,35 @@ def test_wrap_to_pi() -> None:
     assert bool((wrapped >= -math.pi - 1e-6).all())
     assert bool((wrapped < math.pi - 1e-6).all())
     assert wrapped[0].item() == pytest.approx(3.5 - 2.0 * math.pi, abs=1e-6)
+
+
+def test_bold_envelope_lines_match_spider_envelop_style() -> None:
+    """Bold footprint line helper replicates spider_envelop_2 geometry."""
+    points = np.array(
+        [
+            [1.0, 1.0, 0.02],
+            [0.0, 1.0, 0.02],
+            [0.0, 0.0, 0.02],
+            [1.0, 0.0, 0.02],
+            [0.5, 0.0, 0.02],
+            [1.0, 0.0, 0.02],
+        ],
+        dtype=np.float32,
+    )
+    edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0), (1, 4)]
+    color = (0.0, 0.85, 1.0)
+    radius = 0.012
+    samples = 8
+    verts, colors = EL_4090_EA2._make_bold_envelope_lines(
+        points, edges, [color] * len(edges), radius, samples
+    )
+    n_offsets = samples + 1  # centerline + 8 tube offsets
+    assert verts.shape == (len(edges) * n_offsets * 2, 3)
+    assert colors.shape == (len(edges) * n_offsets, 3)
+    # Every edge's duplicated endpoints are radius away from the centerline
+    # (k=0 is the centerline itself with zero offset).
+    for e, (a, b) in enumerate(edges):
+        p0 = points[a]
+        for k in range(1, n_offsets):
+            offset = verts[(e * n_offsets + k) * 2] - p0
+            assert abs(float(np.linalg.norm(offset)) - radius) < 1e-5

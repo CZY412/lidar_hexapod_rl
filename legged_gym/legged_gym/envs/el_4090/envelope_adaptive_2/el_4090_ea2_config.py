@@ -47,62 +47,68 @@ class El4090EA2Cfg(LeggedRobotCfg):
             contact_collection = 2
 
     class map:
-        size_m = 60.0                   # 5 x 5 tiles, each 12m x 12m
+        size_m = 74.0                   # 4 x 4 tiles (16m) + 5m border each side
         resolution_m = 0.1
-        grid_shape = [600, 600]
-        world_min_xy = -30.0
-        world_max_xy = 30.0
+        grid_shape = [740, 740]
+        world_min_xy = -37.0
+        world_max_xy = 37.0
         # No physical boundary walls.  When True, only the *inflated planning*
         # grid border is blocked so A* keeps the robot inside the map.
         boundary_occupied = True
         ground_margin_m = 2.0            # warp ground plane extends past map edges
         inflation_m = 0.35               # A* lateral safety (3.5 cells -> 4)
         inflation_cells = 4
-        n_tiles = 5                      # 5 x 5 terrain plots, one type per tile
-        tile_padding_m = 0.5             # primitives stay inside their 12m tile
+        n_tiles = 4                      # 4 x 4 pillar-field plots
+        tile_size_m = 16.0               # pd_gru terrain_length / terrain_width
+        border_size_m = 5.0              # pd_gru border_size
         min_free_component_ratio = 0.95  # inflated free space must be mostly connected
         max_gen_attempts = 20
         n_validation_paths = 12          # 8~16 validation A* runs at map acceptance
         min_solved_ratio = 0.8
         path_near_obstacle_ratio = 0.3
         near_obstacle_range = [0.7, 1.5]
-        require_constraint_primitive = True
+        require_constraint_primitive = False  # pillar field has no corridor type
 
     class obstacles:
-        height_range = [1.5, 2.0]
-        wall_length_range = [2.0, 5.0]
-        wall_thickness_range = [0.2, 0.5]
-        pillar_half_range = [0.2, 0.4]   # half-side / radius (diameter 0.4~0.8)
-        pillar_polygon_segments = 16
-        corridor_width_range = [1.0, 2.0]
-        side_wall_count_range = [2, 5]
-        u_shape_opening_range = [1.0, 1.5]
+        # pd_gru_lidar pillar_field_terrain parameters (per 16m x 16m tile)
+        pillar_count_min = 0
+        pillar_count_max = 12
+        pillar_size_x_min = 0.5
+        pillar_size_x_max = 4.0
+        pillar_size_y_min = 0.5
+        pillar_size_y_max = 4.0
+        pillar_height_min = 1.0
+        pillar_height_max = 2.0
+        pillar_min_separation = 2.2
+        pillar_center_clear_radius = 3.0
+        pillar_spawn_radius = 7.5
+        pillar_allow_height_variation = True
 
     class path:
-        speed_range = [0.5, 1.5]
+        speed_range = [1.0, 1.0]         # stage 1: fixed forward speed
         resample_time_s = 4.0
-        delta_target_deg_range = [-20.0, 20.0]
+        delta_target_deg_range = [0.0, 0.0]  # stage 1: heading follows tangent
         omega_max = 1.5
         k_p = 5.0
         min_turn_radius = 1.0
         resample_dist = 0.2
         goal_min_obstacle_dist = 0.5
         min_path_len = 3.0
-        noise_amp_range = [0.15, 0.25]
+        noise_amp_range = [0.0, 0.0]     # stage 1: no lateral path noise
         noise_fc_hz = 1.0
         noise_retries = 8
 
     class sway:
-        pos_amp_range = [0.02, 0.05]
-        heading_amp_range = [0.05, 0.1]
+        pos_amp_range = [0.0, 0.0]       # stage 1: no lateral sway
+        heading_amp_range = [0.0, 0.0]   # stage 1: no heading sway
         fc_hz = 1.0
 
     class height:
-        min_m = 0.53                     # spider_envelop spider target
-        max_m = 0.64                     # spider_envelop mammal target
+        min_m = 0.52                     # stage 1: fixed base height
+        max_m = 0.52
         resample_time_s = 4.0
         tau_s = 0.8
-        wobble_amp_range = [0.01, 0.02]
+        wobble_amp_range = [0.0, 0.0]    # stage 1: no vertical wobble
         wobble_fc_hz = 1.0
 
     class lidar:
@@ -115,7 +121,7 @@ class El4090EA2Cfg(LeggedRobotCfg):
         min_range = 0.2                  # aggregation-side only (kernel ignores it)
         update_frequency_hz = 10.0
         effective_max_range = 5.0        # 450-bucket valid range + normalization
-        offset_pos = [0.62, 0.0, 0.0]
+        offset_pos = [0.0, 0.0, -0.05]   # legacy envelope_adaptive body placement
         sensor_offset_rpy = [0.0, math.pi / 2.0 + 0.35, 0.0]
         pointcloud_in_world_frame = False
         randomize_placement = False
@@ -139,6 +145,12 @@ class El4090EA2Cfg(LeggedRobotCfg):
             "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"
             "spider_envelop/el4090_spider_config.py"
         )
+        # spider_envelop_2-style bold footprint drawing
+        debug_env_ids = [0]
+        debug_color = (0.0, 0.85, 1.0)
+        debug_line_radius = 0.012
+        debug_line_samples = 8
+        debug_ground_z_offset = 0.02
 
     class rewards:
         # BaseTask does not auto-scale reward terms; env multiplies directly.

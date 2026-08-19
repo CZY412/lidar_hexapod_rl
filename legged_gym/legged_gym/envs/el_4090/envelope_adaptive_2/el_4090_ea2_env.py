@@ -31,7 +31,6 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
     offset_hexagon,
 )
 from legged_gym.envs.el_4090.envelope_adaptive_2.map_generator import (
-    MapGenCfg,
     generate_map,
 )
 from legged_gym.envs.el_4090.envelope_adaptive_2.path_planner import (
@@ -407,7 +406,7 @@ class EL_4090_EA2(BaseTask):
 
         # One fixed global map (README 2.2.1).  The map is generated once here
         # and never rebuilt during training.
-        map_cfg = MapGenCfg(
+        map_cfg = ea2c.MapGenCfg(
             size_m=float(self.cfg.map.size_m),
             resolution_m=float(self.cfg.map.resolution_m),
             grid_shape=tuple(self.cfg.map.grid_shape),
@@ -416,7 +415,8 @@ class EL_4090_EA2(BaseTask):
             inflation_m=float(self.cfg.map.inflation_m),
             inflation_cells=int(self.cfg.map.inflation_cells),
             n_tiles=int(self.cfg.map.n_tiles),
-            tile_padding_m=float(self.cfg.map.tile_padding_m),
+            tile_size_m=float(self.cfg.map.tile_size_m),
+            border_size_m=float(self.cfg.map.border_size_m),
             min_free_component_ratio=float(
                 self.cfg.map.min_free_component_ratio
             ),
@@ -429,8 +429,26 @@ class EL_4090_EA2(BaseTask):
                 self.cfg.map.require_constraint_primitive
             ),
         )
+        pillar_cfg = ea2c.PillarFieldCfg(
+            count_min=int(self.cfg.obstacles.pillar_count_min),
+            count_max=int(self.cfg.obstacles.pillar_count_max),
+            size_x_min=float(self.cfg.obstacles.pillar_size_x_min),
+            size_x_max=float(self.cfg.obstacles.pillar_size_x_max),
+            size_y_min=float(self.cfg.obstacles.pillar_size_y_min),
+            size_y_max=float(self.cfg.obstacles.pillar_size_y_max),
+            height_min=float(self.cfg.obstacles.pillar_height_min),
+            height_max=float(self.cfg.obstacles.pillar_height_max),
+            min_separation=float(self.cfg.obstacles.pillar_min_separation),
+            center_clear_radius=float(
+                self.cfg.obstacles.pillar_center_clear_radius
+            ),
+            spawn_radius=float(self.cfg.obstacles.pillar_spawn_radius),
+            allow_height_variation=bool(
+                self.cfg.obstacles.pillar_allow_height_variation
+            ),
+        )
         map_seed = int(getattr(self.cfg, "seed", 42))
-        self.map_data = generate_map(map_cfg, seed=map_seed)
+        self.map_data = generate_map(map_cfg, pillar_cfg, seed=map_seed)
         self.occupancy = self.map_data.occupancy
         self.inflated = self.map_data.inflated
 
@@ -455,9 +473,9 @@ class EL_4090_EA2(BaseTask):
         self.gym.add_ground(self.sim, plane_params)
 
         # All envs share the same world origin; bounds are deliberately large
-        # enough to cover the single 60x60 map.
-        env_lower = self.gymapi().Vec3(-35.0, -35.0, -20.0)
-        env_upper = self.gymapi().Vec3(35.0, 35.0, 20.0)
+        # enough to cover the single 74x74 map.
+        env_lower = self.gymapi().Vec3(-40.0, -40.0, -20.0)
+        env_upper = self.gymapi().Vec3(40.0, 40.0, 20.0)
         num_per_row = max(1, int(math.isqrt(self.num_envs)))
         self.envs = []
         self.env_origins = torch.zeros(
@@ -758,6 +776,67 @@ class EL_4090_EA2(BaseTask):
             self._debug_base_pos = self.base_pos[ids].clone()
             self._debug_base_quat = self.base_quat[ids].clone()
 
+    def _envelope_debug_points_world(self, env_id: int) -> np.ndarray:
+        """Return the 6 body-frame envelope vertices in world frame.
+
+        Mirrors ``spider_envelop._envelope_debug_points_world``: local z is
+        ``debug_ground_z_offset`` above the world ground plane and only the
+        body yaw is applied, so the footprint always sits at z=offset.
+        """
+        hex_xy = self._compute_hex_world()[env_id].detach().cpu().numpy()
+        z = float(self.cfg.envelope.debug_ground_z_offset)
+        return np.concatenate(
+            [hex_xy, np.full((6, 1), z, dtype=np.float32)], axis=1
+        )
+
+    @staticmethod
+    def _make_bold_envelope_lines(
+        points: np.ndarray,
+        edges: Sequence[Tuple[int, int]],
+        edge_colors: Sequence[Tuple[float, float, float]],
+        line_radius: float,
+        line_samples: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Replicate ``spider_envelop._make_bold_envelope_lines``.
+
+        Each edge is drawn as a tube of ``line_samples`` parallel offset lines
+        around the edge tangent, making the footprint clearly visible.
+        """
+        vertices = []
+        colors = []
+        for (a, b), color in zip(edges, edge_colors):
+            p0 = np.asarray(points[a], dtype=np.float32)
+            p1 = np.asarray(points[b], dtype=np.float32)
+            offsets = [np.zeros(3, dtype=np.float32)]
+
+            edge_vec = p1 - p0
+            edge_norm = float(np.linalg.norm(edge_vec))
+            if line_radius > 0.0 and line_samples > 1 and edge_norm > 1e-6:
+                tangent = edge_vec / edge_norm
+                ref = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                if abs(float(np.dot(tangent, ref))) > 0.9:
+                    ref = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                normal_a = np.cross(tangent, ref)
+                normal_a = normal_a / max(float(np.linalg.norm(normal_a)), 1e-6)
+                normal_b = np.cross(tangent, normal_a)
+                normal_b = normal_b / max(float(np.linalg.norm(normal_b)), 1e-6)
+
+                for sample_idx in range(line_samples):
+                    angle = 2.0 * np.pi * sample_idx / line_samples
+                    offset = line_radius * (
+                        np.cos(angle) * normal_a + np.sin(angle) * normal_b
+                    )
+                    offsets.append(offset.astype(np.float32))
+
+            for offset in offsets:
+                vertices.append([p0 + offset, p1 + offset])
+                colors.append(color)
+
+        return (
+            np.asarray(vertices, dtype=np.float32).reshape(-1, 3),
+            np.asarray(colors, dtype=np.float32),
+        )
+
     # ------------------------------------------------------------------
     # Debug visualization (README 2.7 red/green point cloud)
     # ------------------------------------------------------------------
@@ -833,31 +912,25 @@ class EL_4090_EA2(BaseTask):
                     green_geom, self.gym, self.viewer, self.envs[eid], pose
                 )
 
-            # Current policy envelope footprint (cyan) at z=0.02 m.
-            hex_xy = self._compute_hex_world()[eid].numpy()  # (6, 2)
-            z = 0.02
-            line_verts = []
-            line_colors = []
-            for i in range(6):
-                j = (i + 1) % 6
-                line_verts.extend(
-                    [
-                        float(hex_xy[i, 0]),
-                        float(hex_xy[i, 1]),
-                        z,
-                        float(hex_xy[j, 0]),
-                        float(hex_xy[j, 1]),
-                        z,
-                    ]
-                )
-                line_colors.extend([0.0, 0.85, 1.0, 0.0, 0.85, 1.0])
-            if line_verts:
+            # Bold cyan envelope footprint (spider_envelop_2 drawing style):
+            # 6 outer edges + the middle cross edge (1,4).
+            points = self._envelope_debug_points_world(eid)
+            edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0), (1, 4)]
+            color = tuple(self.cfg.envelope.debug_color)
+            line_verts, line_colors = self._make_bold_envelope_lines(
+                points,
+                edges,
+                [color] * len(edges),
+                float(self.cfg.envelope.debug_line_radius),
+                int(self.cfg.envelope.debug_line_samples),
+            )
+            if line_verts.size:
                 self.gym.add_lines(
                     self.viewer,
                     self.envs[eid],
-                    6,
-                    np.asarray(line_verts, dtype=np.float32),
-                    np.asarray(line_colors, dtype=np.float32),
+                    int(line_colors.shape[0]),
+                    line_verts,
+                    line_colors,
                 )
 
     # ------------------------------------------------------------------
@@ -957,30 +1030,24 @@ class EL_4090_EA2(BaseTask):
         self.tangent_rate[env_id] = 0.0
         self.delta_actual[env_id] = 0.0
         self.omega[env_id] = 0.0
-        self.v[env_id] = float(
-            self._rng.uniform(*self.cfg.path.speed_range)
+        # Stage 1: fixed motion parameters (ranges are degenerate by config).
+        self.v[env_id] = float(self.cfg.path.speed_range[0])
+        self.delta_target[env_id] = math.radians(
+            float(self.cfg.path.delta_target_deg_range[0])
         )
-        deg = float(
-            self._rng.uniform(*self.cfg.path.delta_target_deg_range)
-        )
-        self.delta_target[env_id] = math.radians(deg)
 
-        self.height_target[env_id] = float(
-            self._rng.uniform(self.cfg.height.min_m, self.cfg.height.max_m)
-        )
+        self.height_target[env_id] = float(self.cfg.height.min_m)
         self.height_filter[env_id] = float(self.height_target[env_id])
         self.base_pos[env_id, 2] = float(self.height_target[env_id])
         self.height_wobble_state[env_id] = 0.0
         self.pos_sway_state[env_id] = 0.0
         self.heading_sway_state[env_id] = 0.0
-        self.pos_sway_amp[env_id] = float(
-            self._rng.uniform(*self.cfg.sway.pos_amp_range)
-        )
+        self.pos_sway_amp[env_id] = float(self.cfg.sway.pos_amp_range[0])
         self.heading_sway_amp[env_id] = float(
-            self._rng.uniform(*self.cfg.sway.heading_amp_range)
+            self.cfg.sway.heading_amp_range[0]
         )
         self.height_wobble_amp[env_id] = float(
-            self._rng.uniform(*self.cfg.height.wobble_amp_range)
+            self.cfg.height.wobble_amp_range[0]
         )
 
         self.episode_length_buf[env_id] = 0
@@ -1048,11 +1115,9 @@ class EL_4090_EA2(BaseTask):
     # ------------------------------------------------------------------
 
     def _step_kinematics(self):
-        """Advance each env along its reference path with sway/height."""
+        """Advance each env along its reference path (stage 1: deterministic)."""
         n = self.num_envs
         dt = self.dt
-        rng = torch.Generator(device=self.device)
-        rng.manual_seed(int(self.common_step_counter) * 7919 + 1)
 
         for i in range(n):
             path = self.paths[i]
@@ -1085,77 +1150,15 @@ class EL_4090_EA2(BaseTask):
             self.omega[i] = omega
             self.delta_actual[i] = delta_actual
 
-            # Heading sway (applied after controller, then delta recomputed).
-            noise = torch.randn((1,), generator=rng, device=self.device)
-            self.heading_sway_state[i : i + 1], heading_offset = sway_update(
-                self.heading_sway_state[i : i + 1],
-                float(self.heading_sway_amp[i]),
-                dt,
-                float(self.cfg.sway.fc_hz),
-                noise,
-            )
-            self.heading[i] = float(
-                wrap_to_pi(self.heading[i] + heading_offset[0])
-            )
+            # Stage 1 determinism: no heading/position sway, no height
+            # dynamics, no speed/delta_target resampling.  The body follows
+            # the reference path exactly and the LiDAR keeps its fixed height.
             self.delta_actual[i] = float(
                 wrap_to_pi(self.heading[i] - self.tangent[i])
             )
-
-            # Lateral position sway with rejection to the last legal pose.
-            pos_noise = torch.randn((1,), generator=rng, device=self.device)
-            self.pos_sway_state[i : i + 1], pos_offset = sway_update(
-                self.pos_sway_state[i : i + 1],
-                float(self.pos_sway_amp[i]),
-                dt,
-                float(self.cfg.sway.fc_hz),
-                pos_noise,
-            )
-            normal = np.array(
-                [-math.sin(tangent), math.cos(tangent)], dtype=np.float64
-            )
-            cand = np.asarray(xy, dtype=np.float64) + normal * float(pos_offset[0])
-            if sway_position_acceptable(
-                (float(self.base_pos[i, 0]), float(self.base_pos[i, 1])),
-                cand,
-                self.inflated,
-            ):
-                self.base_pos[i, 0] = float(cand[0])
-                self.base_pos[i, 1] = float(cand[1])
-            # If rejected, keep the previous legal position (no write).
-
-            # Height filter/wobble.
-            h_noise = torch.randn((1,), generator=rng, device=self.device)
-            self.height_filter[i : i + 1], self.height_wobble_state[i : i + 1], h = (
-                height_step(
-                    self.height_filter[i : i + 1],
-                    self.height_target[i : i + 1],
-                    self.height_wobble_state[i : i + 1],
-                    h_noise,
-                    float(self.cfg.height.min_m),
-                    float(self.cfg.height.max_m),
-                    dt,
-                    float(self.cfg.height.tau_s),
-                    float(self.cfg.height.wobble_fc_hz),
-                    float(self.height_wobble_amp[i]),
-                )
-            )
-            self.base_pos[i, 2] = float(h[0])
-
-            # Resample speed / delta_target / height target every 4 s.
-            resample_period = float(self.cfg.path.resample_time_s)
-            if self.episode_length_buf[i] > 0 and (
-                int(self.episode_length_buf[i]) % max(1, int(resample_period / dt))
-            ) == 0:
-                self.v[i] = float(self._rng.uniform(*self.cfg.path.speed_range))
-                deg = float(
-                    self._rng.uniform(*self.cfg.path.delta_target_deg_range)
-                )
-                self.delta_target[i] = math.radians(deg)
-                self.height_target[i] = float(
-                    self._rng.uniform(
-                        self.cfg.height.min_m, self.cfg.height.max_m
-                    )
-                )
+            self.base_pos[i, 0] = float(xy[0])
+            self.base_pos[i, 1] = float(xy[1])
+            self.base_pos[i, 2] = float(self.cfg.height.min_m)
 
             # Ego motion (body frame).
             vx, vy, omega_out = ego_motion(

@@ -2,13 +2,13 @@
 
 > v2 依据代码核对结果与最新讨论修订。与 v1 的主要差异：
 >
-> - 地图改为**全局一张、训练开始时生成后固定**；每 env 的差异来自起点/终点、路径噪声、速度与朝向偏置、随机晃动；
-> - 地形改为 **5×5 地块布局**：每块地 12m×12m（总地图 60m×60m），每块一种地形（空/墙/柱/窄通道/单侧墙/U 形），**无实体围墙**，所有矩形障碍**轴对齐**（不倾斜）；
+> - 地图改为**全局一张、训练开始时生成后固定**；每 env 的差异只有随机起点/终点；
+> - 地形改为 **4×4 地块布局**：每块 16m×16m（总地图 74m×74m，含 5m 外边界），每块地按 **pd_gru_lidar 的随机长方体障碍**参数独立生成，**无实体围墙**，所有长方体轴对齐（不倾斜）；
 > - Airy 水平映射修正：**逻辑方位角 0° ↔ Airy 物理通道 30**，分桶选中物理通道 **18~42**（θ=108°~252°），并强制 `airy_mount.py` 自检；
 > - LiDAR 噪声改走 `LidarConfig` 的传感器噪声字段，**作用于所有点**（沿用相机传感器原加噪语义，无“仅有效点”分支）；不再使用 `pd_gru_lidar` 手写 domain-rand（注意：当前仓库 LiDAR 路径尚无 `apply_noise()`，需补上，见 §2.2.8 与 §三）；
 > - 分桶前**不再做地面过滤**，因此也不存在“干净点云/加噪点云”两份数据；
-> - 朝向控制改为**切线相对跟踪控制**（位置沿参考路径推进、朝向允许相对切线偏置）；
-> - 雷达载体高度改为**时变模型**：范围 `[0.53, 0.64]m`（对齐学长 spider/mammal 高度目标），每 4s 随机换目标、一阶低通平滑过渡、保持期叠加低通上下波动；
+> - 朝向控制为**切线相对跟踪控制**（位置沿参考路径推进、朝向跟随切线）；
+> - 第一阶段**移除所有运动随机量**：速度固定 `1.0 m/s`、`δ_target=0`、无路径横向噪声、无位置/航向晃动、高度固定 `0.52m`；仅保留 LiDAR 点云噪声与地图/起终点随机；
 > - 明确 **0.35m 膨胀只保证横向通过**，转弯/端墙处允许最小包络偶发碰撞，由碰撞惩罚给训练信号；
 > - 修正 rsl_rl/runner 配置字段归属、BaseTask 必填接口（`max_episode_length`、`infos["time_outs"]`）等与代码冲突的细节。
 
@@ -61,8 +61,8 @@
   - 无机器人实体；
   - **全局一张** 2D 占据栅格地图（墙体、立柱、窄通道、单侧墙等），**训练开始时生成一次并固定**，不周期重建；
   - 生成后验证地图连通性，避免 A* 无解；
-  - 每个 env 每个 episode 采样自己的起点、终点、A* 路径、路径噪声与速度参数；
-  - 雷达沿该 env 的 A* 参考路径移动，叠加随机晃动模拟机器人行走时的抖动；
+  - 每个 env 每个 episode 只采样自己的起点、终点与 A* 路径（运动参数固定）；
+  - 雷达沿该 env 的 A* 参考路径按弧长移动；
   - `step(actions)` 中只更新雷达位姿、生成 LiDAR range image、计算包络奖励。
 - 后续 M2/M3 再接已训 locomotion policy 做联合评估。
 
@@ -71,47 +71,46 @@
 #### 2.2.1 地图表示与尺寸
 
 ```text
-map_size      = 60m × 60m（5×5 块，每块 12m×12m；世界坐标 x, y ∈ [-30, 30]）
+map_size      = 74m × 74m（4×4 块，每块 16m×16m + 5m 外边界；世界坐标 x, y ∈ [-37, 37]）
 resolution    = 0.1m
-grid_shape    = 600 × 600
+grid_shape    = 740 × 740
 occupied      = 1（障碍）
 free          = 0（可通行）
-world → grid  ix = floor((x + 30.0) / 0.1), iy = floor((y + 30.0) / 0.1)
+world → grid  ix = floor((x + 37.0) / 0.1), iy = floor((y + 37.0) / 0.1)
 ```
 
 该栅格同时用于：
 
 - A* 路径规划；
 - 碰撞惩罚（六边形 vs 占据栅格）；
-- 生成 **Warp raycast 网格**（地面平面 + 障碍基元 box/柱体；Isaac 侧静态 actor 仅用于可视化，不是 raycast 几何）。
+- 生成 **Warp raycast 网格**（地面平面 + 长方体障碍 box；Isaac 侧静态 actor 仅用于可视化，不是 raycast 几何）。
 
 实现约定：
 
-- **5×5 地块布局**：60m×60m 均分为 5×5 块（每块 12m×12m），每块地**只放置一种地形**：空（6 块）、墙（5 块）、柱（4 块）、窄通道（4 块）、单侧墙（3 块）、U 形（3 块），块内障碍与地块边保持 0.5m padding，不跨块混合；
-- **无实体围墙**：地图四周不再生成围墙；仅把**膨胀后（planning）栅格**的边界标为 blocked，保证 A* 不规划出图，occupancy 与 mesh 边界保持 free；
-- **所有矩形障碍轴对齐**（yaw ∈ {0°, 90°}），不接受任意倾斜墙；
-- **栅格是权威几何**：先由障碍基元 footprint 栅格化得到 occupancy，再由同一套基元参数生成 Warp mesh，两者必须一致；
+- **4×4 地块布局**：总地图 74m×74m，均分为 4×4 块（每块 16m×16m），四周 5m 平整边界；
+- **每块地独立运行 pd_gru_lidar 的 `pillar_field_terrain`**：随机长/短边长方体、环带放置、AABB + `min_separation` 排斥，参数见 §2.2.2；不同地块随机难度自然形成疏密不同的环境；
+- **无实体围墙**：仅把**膨胀后（planning）栅格**的边界标为 blocked，保证 A* 不规划出图，occupancy 与 mesh 边界保持 free；
+- **所有长方体轴对齐**（yaw=0），不接受任意倾斜障碍；
+- **栅格是权威几何**：先由障碍 footprint 栅格化得到 occupancy，再由同一套参数生成 Warp box 网格，两者必须一致；
 - **Warp mesh 必须包含 z=0 地面平面**（建议覆盖地图并外扩 2m）；地面只参与射线，不写入 occupancy、不参与碰撞惩罚——这是“不做地面过滤、地面距离是合法观测”的前提；
 - **膨胀自由空间连通性**：最大 8 连通分量须占全部安全格 ≥95%；每 env 的起点/终点只在最大连通分量内采样，保证 A* 有解；
-- **地图为全局一张**：所有 env 共享同一 warp mesh，`reset_idx()` 不重建地图，只重采样该 env 的起点/终点/路径/噪声状态；
-- 生成 Warp mesh 时直接使用障碍物基元参数创建 box/柱体网格（圆柱体用 N 边形近似、保持水密），不要按每个 occupied 栅格生成大量 box，避免 mesh 面数过大。
+- **地图为全局一张**：所有 env 共享同一 warp mesh，`reset_idx()` 不重建地图，只重采样该 env 的起点/终点/路径状态；
+- 生成 Warp mesh 时直接使用长方体基元参数创建水密 box 网格，不要按每个 occupied 栅格生成大量 box，避免 mesh 面数过大。
 
-#### 2.2.2 障碍物基元
+#### 2.2.2 障碍物参数（完全沿用 pd_gru_lidar）
 
-| 基元 | 说明 | 默认参数（地块内，轴对齐） |
-|---|---|---|
-| 墙体 | 每块墙地一块矩形墙 | 长 1.2~1.8m，厚 0.2~0.4m |
-| 立柱/柱体 | 每块柱地 1~2 个方/圆截面 | 半边长/半径 0.15~0.3m |
-| 窄通道 | 每块通道地两段平行墙 | 缝宽 1.0~1.4m，墙长 1.8m |
-| 单侧墙群 | 每块地一侧 2~3 段短墙 | 每段长 0.8m，侧向偏置 0.6m |
-| 死角/U 形 | 每块地一个 U 形三面墙 | 开口 0.8~1.0m，深 1.2m |
+| 参数 | 值 |
+|---|---|
+| 每块地数量 | `pillar_count_min=0, pillar_count_max=12`，难度 ∈ {0.5, 0.75, 0.9} |
+| 长/宽 | `pillar_size_x = 0.5~4.0m`，`pillar_size_y = 0.5~4.0m`（长边/短边 split 算法） |
+| 高度 | `pillar_height = 1.0~2.0m`；`allow_height_variation=True`（最终高度 60%~100%） |
+| 间距/放置 | `min_separation=2.2m`，中心净空 `center_clear_radius=3.0m`，放置半径 `spawn_radius=7.5m` |
+| 方向 | 全部轴对齐（yaw=0） |
 
-- 障碍物高度统一设为 **1.5~2.0m**，保证 LiDAR 能稳定打到；
 - 碰撞判定只看 2D 投影，不看高度；
-- **障碍物与路径的距离不能过远**，否则没有碰撞训练信号；建议障碍物距路径中心约 `0.7~1.5m`，窄通道宽度 `1.0~1.4m`；
-- 地图生成验收（验收时用**预采样验证路径**，不要依赖训练期每 env 路径；不满足则重生成，设最大尝试次数）：
-  1. 25 块地类型计数 = 空 6 / 墙 5 / 柱 4 / 通道 4 / 单侧墙 3 / U 3；
-  2. 无实体围墙、全部矩形 yaw ∈ {0°, 90°}；
+- 地图生成验收（不满足则重生成，设最大尝试次数）：
+  1. 4×4=16 块地全部为随机长方体地块；
+  2. 无实体围墙、全部矩形轴对齐；
   3. 膨胀自由空间最大连通分量 ≥ 95%；
   4. 预采样 8~16 对起点/终点跑 A*，要求全部（或 ≥80%）有解；
   5. 在这些验证路径上，至少 30% 的路径点到最近障碍距离 ∈ `[0.7, 1.5]m`。
@@ -160,71 +159,46 @@ A=( forward_limit, -front_width)   C=(0, -middle_width)   E=(backward_limit, -ba
   - 距离最近障碍至少 `0.5m`（按未膨胀的原始 occupancy 计算）；
   - 与起点的 A* 路径长度 ≥ 3m（配置化），保证路径有内容；
 - episode 内**不重规划、不换终点**；地图全局固定，因此“当前位置”就是该 env 沿自己路径推进到的位置；
-- 生成后处理顺序：A* → line-of-sight 简化 → 按固定间距重采样（`0.2m`）→ 施加路径噪声（§2.2.6）→ **切线 yaw 按 R_min 平滑** → 输出 `(x, y, yaw)`；
+- 生成后处理顺序：A* → line-of-sight 简化 → 按固定间距重采样（`0.2m`）→（路径噪声第一阶段关闭）→ **切线 yaw 按 R_min 平滑** → 输出 `(x, y, yaw)`；
 - 最小转弯半径 `R_min ≥ 1.0m`（可配置）：A* 网格的 90° 直角保留在位置几何上（位置仍在膨胀安全栅格内），但**切线 yaw 按 `abs(wrap_to_pi(Δyaw))/Δs ≤ 1/R_min` 平滑**；实际航向角速度由 §2.2.5 的 `ω_max=1.5 rad/s` 限幅，不会因网格直角出现阶跃转向；
 - 路径点输出 `(x, y, yaw)`；
 - 地图固定后，A* 仍按 env 逐个计算；初始 `num_envs` 建议 `1024~2048`，实现时先 benchmark A* 与 Warp raycast 吞吐再放大；
 - 若 Python A* 成为瓶颈：地图固定，可**预计算 K 条候选路径**（或批量/GPU 并行规划），env reset 时采样候选路径，起点改为候选路径起点。
 
-#### 2.2.5 路径速度、朝向与重采样（v2：切线相对跟踪控制）
+#### 2.2.5 路径速度与朝向（第一阶段：确定性运动）
 
-- 路径速度 `v` 在 **0.5 ~ 1.5 m/s** 之间随机采样，每 **4s** 重采样一次；
+- 路径速度固定 **`v = 1.0 m/s`**；
 - 控制频率 50Hz，每个控制 step 的弧长增量 = `v * dt`；
 - **机器人位置**沿 A* 参考路径按弧长推进，保证始终在可行路径上；
-- **目标朝向偏置** `δ_target ∈ [-20°, +20°]`（正 = 相对切线向左偏），与速度一起每 **4s** 重采样一次；
-- **朝向控制**为切线相对跟踪（而不是随机 ω 游走）：
+- **目标朝向偏置固定 `δ_target = 0`**：heading 始终跟随路径切线；
+- **朝向控制**为切线相对跟踪：
 
 ```text
-s(t+dt)   = s(t) + v·dt                              # 沿参考路径弧长推进
+s(t+dt)   = s(t) + v·dt
 heading(t+dt) = heading(t) + ω·dt
-tangent_rate = κ(s)·v                                 # 参考路径曲率 × 速度
-ω_cmd = tangent_rate + k_p · wrap_to_pi(δ_target − δ_actual)
+tangent_rate = κ(s)·v
+ω_cmd = tangent_rate + k_p · wrap_to_pi(0 − δ_actual)
 ω     = clip(ω_cmd, −ω_max, +ω_max)
 δ_actual = wrap_to_pi(heading − tangent)
 vx = v·cos(δ_actual),  vy = v·sin(δ_actual),  omega = ω
 ```
 
-- `ω_max = 1.5 rad/s`（可配置）；`k_p` 建议初始取 `5.0 1/s`，实现时调；
-- 位置沿切线推进而朝向有偏置 → 允许“蟹行”，这是 M1 有意的运动学替身；
-- `R_min ≥ 1.0m` 同时约束参考路径曲率，保证 `tangent_rate` 不超过 `v/R_min ≤ 1.5 rad/s`；
+- `ω_max = 1.5 rad/s`（可配置）；`k_p = 5.0 1/s`；
+- `R_min ≥ 1.0m` 约束参考切线曲率；实际航向角速度由 `ω_max` 限幅；
 - 走到路径终点或达到 episode 上限即结束。
 
-#### 2.2.6 路径噪声
+#### 2.2.6 路径噪声（第一阶段：关闭）
 
-- 对每个路径点，在垂直路径方向叠加有界横向偏移：`path_noise_amp = 0.15 ~ 0.25m`（每 env 每 episode 采样一次振幅）；
-  - 可执行定义：沿弧长生成一阶低通序列 `u_i`（`1Hz` 平滑的 `U(-1,1)`），逐点偏移 `offset_i = amp · clip(u_i, -1, 1)`；
-- 偏移后做拒绝采样：
-  - 新点必须在膨胀后的安全栅格中为 free；
-  - 新点与前一点之间的线段不能穿过膨胀后的 occupied 格（用栅格直线遍历判定）；
-  - 单点最多重试 `K=8` 次（可配置），仍无效则**保留原路径点**；
-- 噪声在 episode 开始时一次性作用到 A* 路径上，生成该 env 的“参考路径”；运行时的随机晃动是另一层在线扰动，两者不要混淆。
+- `path_noise_amp = 0`：A* → LOS 简化 → 0.2m 重采样后直接作为参考路径，不做横向偏移；
+- 路径位置仍全部位于膨胀安全栅格内；
+- 后续阶段需要时再开启有界噪声 + 拒绝采样。
 
-#### 2.2.7 随机晃动与高度时变（横向 + 高度）
+#### 2.2.7 运动随机量（第一阶段：全部关闭）
 
-- 位置晃动：一阶低通（AR/OU 均可，建议截止频率 `1Hz`，`a = exp(-2π f_c dt)`，`x ← a·x + sqrt(1-a²)·ε`，`ε ~ N(0,1)`，输出再乘本次采样的幅度），幅度 `0.02 ~ 0.05m`（每 env 每 episode 采样）；
-- 航向晃动：同样低通，幅度 `0.05 ~ 0.1 rad`；**叠加在控制器更新后的 heading 上（随后重算 δ_actual）**，不要叠加到 δ_target，否则会与跟踪控制器互相抵消；
-- 每次晃动后检查新位姿：若新位置所在格为 free 且“旧位置→新位置”线段不穿膨胀 occupied 格则接受；否则**退回上一合法位姿**（裁剪规则必须确定，不模糊处理）；
-- 晃动状态在 episode reset 时清零重采样。
-
-**高度时变模型（对齐学长训练约束）**：
-
-- 高度约束范围取学长 `spider_envelop` 训练口径：`h ∈ [h_min, h_max] = [0.53, 0.64]m`（`base_height_spider_target=0.53`、`base_height_mammal_target=0.64`，实际目标由 3 个 morphology prior 的均值插值；M1 直接在该区间内随机，配置化）；
-- **周期换目标**：`h_target ~ U(0.53, 0.64)` 每 `4s` 重采样一次（与 v/δ_target 同周期；`height_resample_time` 独立可配置）；
-- **平滑过渡（禁止跳变）**：一阶低通趋近目标，
-
-```text
-α = 1 − exp(−dt / τ_h),   τ_h = 0.5 ~ 1.0s（建议初值 0.8s，实现时调）
-h_filter ← h_filter + α·(h_target − h_filter)
-```
-
-- **保持期上下波动**：在 `h_filter` 上叠加一阶低通 AR 噪声（1Hz，同本节位置晃动的 AR 公式），幅度 `h_wobble_amp = 0.01 ~ 0.02m`（每 env 每 episode 采样）；
-- 总高度 `h = clip(h_filter + wobble, h_min, h_max)`，整体不越出学长高度范围；
-- 高度不影响 2D 栅格碰撞判定，也**不加入 M1 的 3 维 ego-motion 观测**（`vz/height` 由 range image 的地面距离模式隐式提供）。理由：
-  1. 不做地面过滤时，多个地面行满足 `d = h/sin(θ)`（θ 为该行的 body 俯角），距离与高度线性相关且**多行冗余**，高度可辨识；
-  2. 高度慢变（`τ_h≈0.8s`、目标 4s 一换），10Hz 下有多个连续扫描，GRU 足以跟踪；
-  3. 包络碰撞是 2D 判定，高度只作为感知侧干扰/域随机化；部署端也不需要额外的高度估计器，sim-to-real 口径更干净；
-- M2 可消融加入 `height` 或 `vz`（届时观测维数相应变化）；若 M1 训练中高度变化导致收敛困难，再按该消融升级。
-- episode reset：`h_filter` 直接置为新采样的 `h_target`（出生即目标高度），wobble 状态清零。
+- **位置/航向晃动**：关闭（幅度 0）；
+- **高度**：固定 `h = 0.52m`（无目标切换、无过渡、无上下波动）；
+- **速度/δ_target**：固定 `1.0 m/s` 与 `0°`；
+- 第一阶段仅保留：LiDAR 点云噪声、地图随机长方体、每 env 每 episode 随机起点/终点。
 
 #### 2.2.8 LiDAR 噪声（v2：LidarSensor 噪声字段，作用于所有点）
 
@@ -315,12 +289,13 @@ LidarConfig(
 安装参数：
 
 ```python
-offset_pos = [0.62, 0.0, 0.0]                # body 系安装位置
+offset_pos = [0.0, 0.0, -0.05]               # legacy envelope_adaptive body 安装位置
 sensor_offset_rpy = [0.0, π/2 + 0.35, 0.0]   # body→sensor 旋转
 ```
 
-- **雷达载体高度**：M1 载体位姿为 `(x, y, z=h(t), yaw)`，世界地面 z=0；`h(t)` 由 §2.2.7 的高度时变模型驱动（范围 `[0.53, 0.64]m`，对齐学长 spider/mammal 高度目标）；
-- 参考量级：高度 0.53~0.64m + boresight 下俯 0.35 rad，boresight **沿射线**约 `h/sin(0.35) ≈ 1.55~1.87m`（水平投影约 `h/tan(0.35) ≈ 1.45~1.75m`）处打地——这条随高度变化的地面距离是不做地面过滤时的合法观测基线，也是网络感知高度变化的主要线索；
+- **雷达载体高度固定**：M1 载体位姿为 `(x, y, z=0.52m, yaw)`，世界地面 z=0；雷达世界 z=0.47m；
+- 参考量级：雷达高 0.47m + boresight 下俯 0.35 rad，boresight **沿射线**约 `0.47/sin(0.35) ≈ 1.37m`（水平投影约 `0.47/tan(0.35) ≈ 1.29m`）处打地——这是不做地面过滤时的合法观测基线；
+- 雷达 x/y 与 body 原点重合，六边形以 body 原点绘制，因此点云与包络参考系一致。
 
 用与 `LidarSensor` 完全相同的约定（`quat_from_euler_xyz` → `quat_mul(base_quat, offset_quat)` → kernel 内 `quat_rotate`）换算后：
 
@@ -399,7 +374,7 @@ ray_index i = az·96 + el        # az∈[0,60), el∈[0,96)
 - **env reset 的空帧过渡**：某 env 在 **reset 之后、下一次全局扫描之前**，其 range image 置为全 `max_range`（空帧），直到下一次全局扫描刷新（含“reset 与扫描发生在同一步”的情形）；空帧最多持续 4 步，ego-motion 照常更新。这样不会给新 episode 喂上一 episode 的旧地理帧，也不增加 raycast 开销；
 - 若后续要求“reset 后第一步就出新鲜帧”，需给 `LidarSensor` 增加 `env_ids` 子集更新能力（kernel/输入数组按子集 launch），作为 M2 可选优化，M1 不要求；
 - 传感器位姿在每次 LiDAR 更新时取当时 body 位姿；M1 射线是**瞬时扫描**，不模拟帧内运动畸变（M3 再加）；
-- 输入 ego-motion 是 **base 系**运动；传感器装在 `x=0.62m` 处，其线速度为 `v_base + ω×[0.62,0,0]`，网络输入仍给 base 量（这是真实部署口径，M3 再做失真/估计噪声）。
+- 输入 ego-motion 是 **base 系**运动；传感器装在 `[0,0,-0.05]`（与 base 轴重合），其线速度与 base 线速度一致，网络输入 base 量。
 
 ### 2.5 网络结构（v2：修正 rsl_rl 字段归属）
 
@@ -478,7 +453,8 @@ env.set_envelope_condition(action_8, derive_priors=True)
   - **红色小球**：通道索引在映射表中且为有效命中（加噪后 `0.2 ≤ d ≤ 5.0`）的点——即真正参与 450 维聚合的点；
   - **绿色小球**：其余有效命中（不在映射表或距离超出有效范围）的点；
   - no-hit、被 dropout 的射线不画；
-  - 仅对 `debug_env_ids` 绘制（默认 `[0]`），避免逐 env 画 5760 个球。
+  - 仅对 `debug_env_ids` 绘制（默认 `[0]`），避免逐 env 画 5760 个球；
+  - **六边形包络**：完全复刻 `spider_envelop_2` 的绘制方式——6 条外轮廓 + 1 条中线的**加粗管状线**（`line_radius=0.012, line_samples=8`，青色 `(0,0.85,1)`，`z=0.02`），与点云同一 body 参考系。
 
 ### 2.8 Reward
 
@@ -515,7 +491,7 @@ M1 奖励设计：
 - LiDAR 为 **10Hz**，点云/range image 每 5 个 step 更新一次，中间 4 个 step 复用；
 - ego-motion 每个 50Hz step 都更新；
 - 每个 50Hz step `episode_length_buf += 1`；每步先清 `time_out_buf`，再判断：路径走完或 `episode_length_buf ≥ max_episode_length` 时置 done（`reset_buf`），后者同时置 `time_out_buf=True`；`reset_idx()` 末尾把该 env 的 `reset_buf` 清零；
-- **地图全程固定**；episode reset 只重采样该 env 的起点/终点/A* 路径/路径噪声/速度与 δ_target/高度目标/晃动状态，并把 **heading 对齐新路径切线**、清 `δ_actual`、`h_filter` 置为新高度目标；
+- **地图全程固定**；episode reset 只重采样该 env 的起点/终点/A* 路径，heading 对齐新路径切线、`δ_actual=0`，速度/高度/晃动为固定值；
 - **BaseTask 接口要求（train.py 固定传 `init_at_random_ep_len=True`，漏掉会崩）**：
   - env cfg 提供 `episode_length_s`（如 20s），环境初始化先自建 `self.dt = cfg.sim.dt`，再设 `self.max_episode_length = int(cfg.env.episode_length_s / self.dt)`；
   - `step()` 返回 5 元组 `(obs, privileged_obs, rew, dones, infos)`，且 `infos` 必须含 `"time_outs": self.time_out_buf`（PPO timeout bootstrap 依赖它）；
@@ -523,10 +499,10 @@ M1 奖励设计：
   - `infos["episode"]` 里写 §2.11 的指标字典（值必须是 `torch` 标量/0 维 tensor，供 PPO logger 求均值），训练日志直接可见；
 - GRU hidden state 随 `dones` 由 `ActorCriticRecurrent`/`policy.reset(dones)` 自动 reset。
 
-### 2.10 ego-motion 与晃动
+### 2.10 ego-motion 与运动随机量
 
 - M1 使用**真值 ego-motion**；
-- 随机晃动与高度时变采用一阶低通扰动（§2.2.7），横向幅度按典型行走 base 速度波动标定，高度范围/过渡/波动按学长高度约束标定；
+- 第一阶段运动确定：速度 `1.0 m/s`、δ_target `0`、高度 `0.52m`、无晃动/无路径噪声（§2.2.5-§2.2.7）；
 - M3 再对 ego-motion 加入估计误差/噪声做域随机化。
 
 ### 2.11 评估
@@ -553,7 +529,7 @@ envs/el_4090/envelope_adaptive_2/
   el_4090_ea2_config.py      # env cfg + PPO cfg（继承 LeggedRobotCfg/CfgPPO 以兼容 parse_sim_params）
   el_4090_ea2_env.py         # BaseTask 子类，M1 无机器人实体
   map_generator.py           # 障碍基元 -> occupancy -> warp mesh（含 z=0 地面）+ 生成验收
-  path_planner.py            # A* / LOS 平滑 / 0.2m 重采样 / 路径噪声 / 切线相对跟踪
+  path_planner.py            # A* / LOS 平滑 / 0.2m 重采样 / 路径噪声（第一阶段关闭）/ 切线相对跟踪
   envelope_geometry.py       # 六边形构造、精确 margin offset、栅格碰撞判定
   range_image.py             # Airy 点云 -> 450 维 range image（r_min/max_range 过滤与 min 聚合）
   airy_mount.py              # 安装参数 + 通道口径 18~42 + 映射表 + body 系覆盖自检
@@ -578,7 +554,7 @@ task_registry.register("el4090_ea2", EL_4090_EA2, El4090EA2Cfg(), El4090EA2CfgPP
    - `tests/test_range_image.py`：ray 索引公式、映射表 450 形状、空桶填 5.0；
    - `tests/test_envelope_geometry.py`：顶点顺序、半宽语义、margin offset、栅格碰撞；
    - `tests/test_path_planner.py`：A* 连通性、0.35 膨胀、噪声拒绝采样、δ_actual 跟踪。
-4. **M1 `create_sim()` 约定**（BaseTask 无机器人）：`add_ground` 建 Isaac 地面、按基元创建静态障碍 actor（仅可视化，放 **env 0** 一份即可）；创建 `num_envs` 个 env handle，**所有 env 共用世界原点（`env_origins=0`，不要按常规网格散开）**——单张 60×60 的 warp mesh 在世界原点，散开会导致 env 射线全部出图；`sensor_pos_tensor / sensor_quat_tensor` 直接用载体世界位姿（不叠加 env_origin），`sensor_pos_tensor / sensor_quat_tensor / mesh_ids` 按 legacy `_init_lidar_sensor` 的模式创建，Warp mesh 是 raycast 权威几何。
+4. **M1 `create_sim()` 约定**（BaseTask 无机器人）：`add_ground` 建 Isaac 地面、按基元创建静态障碍 actor（仅可视化，放 **env 0** 一份即可）；创建 `num_envs` 个 env handle，**所有 env 共用世界原点（`env_origins=0`，不要按常规网格散开）**——单张 74×74 的 warp mesh 在世界原点，散开会导致 env 射线全部出图；`sensor_pos_tensor / sensor_quat_tensor` 直接用载体世界位姿（不叠加 env_origin），`sensor_pos_tensor / sensor_quat_tensor / mesh_ids` 按 legacy `_init_lidar_sensor` 的模式创建，Warp mesh 是 raycast 权威几何。
 
 - 旧的 `envelope_adaptive/` 规则式实现视为 legacy，不参与新任务。
 
@@ -588,8 +564,9 @@ task_registry.register("el4090_ea2", EL_4090_EA2, El4090EA2Cfg(), El4090EA2CfgPP
 
 ### M1：最小底座
 
-- 简化 BaseTask + **全局固定地图**（60m×60m = 5×5 块，每块 12m×12m；Warp mesh 含 z=0 地面 + 障碍）+ 每 env A* 路径 + 有界路径噪声 + 低通随机晃动；
-- 起点/终点每 episode 采样；路径速度 0.5~1.5m/s、δ_target ±20°、高度目标 0.53~0.64m 每 4s 重采样；**切线相对跟踪朝向控制**（ω 限幅 ±1.5 rad/s）+ **高度一阶低通过渡与保持期 ±0.01~0.02m 波动**；
+- 简化 BaseTask + **全局固定地图**（74m×74m = 4×4 块，每块 16m×16m；Warp mesh 含 z=0 地面 + pd_gru 随机长方体障碍）+ 每 env A* 路径；
+- 起点/终点每 episode 采样；**第一阶段运动确定**：速度 1.0m/s、δ_target=0、高度 0.52m、无路径噪声/无晃动；**切线相对跟踪朝向控制**（ω 限幅 ±1.5 rad/s）；
+- 雷达 body 安装 `[0,0,-0.05]`，与六边形同参考系；六边形按 `spider_envelop_2` 加粗管状线绘制；
 - Isaac Gym + `LidarSensor` Airy 生成点云，**物理通道 18~42 / 垂直 6~95** 聚合为 450 维 range image，含 `airy_mount.py` 覆盖自检；
 - **LidarSensor `apply_noise()` 补齐**：乘性高斯 2% + dropout 2%，作用于所有点（聚合层只收 0.2~5m 有效距离），不做地面过滤；
 - 控制 50Hz / LiDAR 10Hz：全局 10Hz 时钟每 5 步扫描全部 env 并刷新 range image，中间 4 步复用；reset 落在两次扫描之间时，该 env 用全 `max_range` 空帧过渡（≤4 步）；

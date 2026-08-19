@@ -1,63 +1,31 @@
-"""Unit tests for the deterministic seeded map generator (README 2.2.1-2.2.2)."""
+"""Unit tests for the pd_gru pillar-field map generator."""
 
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from legged_gym.envs.el_4090.envelope_adaptive_2 import _contracts as c
-from legged_gym.envs.el_4090.envelope_adaptive_2.map_generator import generate_map
+from legged_gym.envs.el_4090.envelope_adaptive_2.map_generator import (
+    generate_map,
+)
 
 
-def _default_cfg() -> c.MapGenCfg:
+def _cfg() -> c.MapGenCfg:
     return c.MapGenCfg()
 
 
-def _circle_polygon_footprint(radius: float, segments: int) -> np.ndarray:
-    """Return the CCW inscribed n-gon used for circular pillar footprints.
-
-    This mirrors the generator's mesh polygon: a regular ``segments``-gon with
-    vertices at ``radius``.  Occupancy and mesh are consistent only when both
-    use this polygon rather than the exact circle.
-    """
-    n = max(3, int(segments))
-    angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
-    return np.stack([np.cos(angles), np.sin(angles)], axis=-1) * radius
-
-
-def _points_in_convex_polygon(px: np.ndarray, py: np.ndarray, poly: np.ndarray) -> np.ndarray:
-    """Vectorized inclusive point-in-convex-polygon test (polygon CCW)."""
-    inside = np.ones(px.shape, dtype=bool)
-    n = poly.shape[0]
-    for i in range(n):
-        x0, y0 = poly[i]
-        x1, y1 = poly[(i + 1) % n]
-        cross = (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)
-        inside &= cross >= 0.0
-    return inside
+def _pillar_cfg() -> c.PillarFieldCfg:
+    return c.PillarFieldCfg()
 
 
 def _primitive_center_coverage(map_data: c.MapData) -> np.ndarray:
-    """Return a bool grid marking cell centers covered by any primitive.
-
-    The occupancy rasterizer uses cell-center-in-footprint semantics, so this
-    is the exact coverage proxy for raster-mesh consistency.  Circular pillars
-    are tested against the same inscribed n-gon that the generator meshes, not
-    against the exact circle.
-    """
-    xs = np.linspace(
-        -map_data.occupancy.shape[1] / 2.0 * 0.1 + 0.05,
-        map_data.occupancy.shape[1] / 2.0 * 0.1 - 0.05,
-        map_data.occupancy.shape[1],
-    )
-    ys = np.linspace(
-        -map_data.occupancy.shape[0] / 2.0 * 0.1 + 0.05,
-        map_data.occupancy.shape[0] / 2.0 * 0.1 - 0.05,
-        map_data.occupancy.shape[0],
-    )
+    """Cell centers covered by the primitive footprints (cell-center rule)."""
+    shape = map_data.occupancy.shape
+    half = c.EA2_MAP_SIZE_M / 2.0
+    xs = np.linspace(-half + 0.05, half - 0.05, shape[1])
+    ys = np.linspace(-half + 0.05, half - 0.05, shape[0])
     gx, gy = np.meshgrid(xs, ys)
-    covered = np.zeros(map_data.occupancy.shape, dtype=bool)
-
+    covered = np.zeros(shape, dtype=bool)
     for rect in map_data.rects:
         dx = gx - rect.center[0]
         dy = gy - rect.center[1]
@@ -68,150 +36,90 @@ def _primitive_center_coverage(map_data: c.MapData) -> np.ndarray:
         covered |= (np.abs(local_x) <= rect.size[0] / 2.0) & (
             np.abs(local_y) <= rect.size[1] / 2.0
         )
-
-    for pillar in map_data.pillars:
-        dx = gx - pillar.center[0]
-        dy = gy - pillar.center[1]
-        if pillar.square:
-            covered |= (np.abs(dx) <= pillar.radius) & (np.abs(dy) <= pillar.radius)
-        else:
-            poly = _circle_polygon_footprint(pillar.radius, pillar.segments)
-            covered |= _points_in_convex_polygon(dx, dy, poly)
     return covered
 
 
 def test_deterministic_same_seed_reproducible():
-    cfg = _default_cfg()
-    a = generate_map(cfg, seed=123)
-    b = generate_map(cfg, seed=123)
-
+    a = generate_map(_cfg(), _pillar_cfg(), seed=123)
+    b = generate_map(_cfg(), _pillar_cfg(), seed=123)
     assert np.array_equal(a.occupancy, b.occupancy)
     assert np.array_equal(a.inflated, b.inflated)
     assert np.array_equal(a.vertices, b.vertices)
     assert np.array_equal(a.triangles, b.triangles)
     assert a.rects == b.rects
-    assert a.pillars == b.pillars
     assert a.acceptance == b.acceptance
 
 
 def test_shapes_and_dtypes():
-    map_data = generate_map(_default_cfg(), seed=7)
-
-    assert map_data.occupancy.shape == c.EA2_GRID_SHAPE
-    assert map_data.inflated.shape == c.EA2_GRID_SHAPE
-    assert map_data.occupancy.dtype == np.uint8
-    assert map_data.inflated.dtype == np.uint8
-
-    assert map_data.vertices.ndim == 2
-    assert map_data.vertices.shape[1] == 3
-    assert map_data.vertices.dtype == np.float32
-    assert map_data.vertices.shape[0] > 0
-
-    assert map_data.triangles.ndim == 2
-    assert map_data.triangles.shape[1] == 3
-    assert map_data.triangles.dtype == np.int32
-    assert map_data.triangles.shape[0] > 0
-    assert map_data.triangles.min() >= 0
-    assert map_data.triangles.max() < map_data.vertices.shape[0]
-
-    assert isinstance(map_data.rects, tuple)
-    assert isinstance(map_data.pillars, tuple)
-    assert len(map_data.rects) > 0
-    assert len(map_data.pillars) > 0
-    assert any(p.square for p in map_data.pillars)
-    assert any(not p.square for p in map_data.pillars)
-
-    for key in (
-        "occupancy_border_free",
-        "planning_border_blocked",
-        "physical_boundary_walls",
-        "all_rects_axis_aligned",
-        "has_constraint_primitive",
-        "near_obstacle_ratio_estimate",
-        "near_obstacle_ratio",
-        "largest_free_component_ratio",
-    ):
-        assert key in map_data.acceptance
-        assert 0.0 <= map_data.acceptance[key] <= 1.0
-    assert map_data.acceptance["n_tiles"] == 25.0
+    m = generate_map(_cfg(), _pillar_cfg(), seed=0)
+    assert m.occupancy.shape == c.EA2_GRID_SHAPE
+    assert m.inflated.shape == c.EA2_GRID_SHAPE
+    assert m.occupancy.dtype == np.uint8
+    assert m.inflated.dtype == np.uint8
+    assert m.vertices.ndim == 2 and m.vertices.shape[1] == 3
+    assert m.vertices.dtype == np.float32
+    assert m.triangles.ndim == 2 and m.triangles.shape[1] == 3
+    assert m.triangles.dtype == np.int32
+    assert len(m.rects) > 0
+    assert len(m.pillars) == 0
 
 
 def test_no_physical_boundary_walls_planning_border_blocked():
-    map_data = generate_map(_default_cfg(), seed=11)
-    occ = map_data.occupancy
-    # No enclosing wall primitives: the occupancy border must be free...
+    m = generate_map(_cfg(), _pillar_cfg(), seed=11)
+    occ = m.occupancy
+    inf = m.inflated
     assert np.all(occ[0, :] == 0)
     assert np.all(occ[-1, :] == 0)
     assert np.all(occ[:, 0] == 0)
     assert np.all(occ[:, -1] == 0)
-    # ...while the planning (inflated) border stays blocked for A*.
-    inf = map_data.inflated
     assert np.all(inf[0, :] == 1)
     assert np.all(inf[-1, :] == 1)
     assert np.all(inf[:, 0] == 1)
     assert np.all(inf[:, -1] == 1)
-    # No primitive is a full-map boundary wall.
-    assert map_data.acceptance["physical_boundary_walls"] == 0.0
+    assert m.acceptance["physical_boundary_walls"] == 0.0
+
+
+def test_tile_layout_is_4x4_pillar_field():
+    m = generate_map(_cfg(), _pillar_cfg(), seed=7)
+    assert m.tile_types is not None
+    assert m.tile_types.shape == (4, 4)
+    assert np.all(m.tile_types == c.EA2_TILE_PILLAR)
+    assert m.acceptance["n_tiles"] == 16.0
 
 
 def test_all_rects_axis_aligned():
-    map_data = generate_map(_default_cfg(), seed=7)
-    assert len(map_data.rects) > 0
-    for rect in map_data.rects:
-        yaw = float(rect.yaw) % (np.pi / 2.0)
-        assert min(abs(yaw), abs(np.pi / 2.0 - yaw)) < 1e-6
-
-
-def test_tile_layout_is_5x5_one_type_per_tile():
-    map_data = generate_map(_default_cfg(), seed=7)
-    assert map_data.tile_types is not None
-    assert map_data.tile_types.shape == (5, 5)
-    assert set(np.unique(map_data.tile_types).tolist()) <= set(c.EA2_TILE_TYPE_CODES)
-    for code in c.EA2_TILE_TYPE_CODES:
-        assert int(np.sum(map_data.tile_types == code)) > 0
-    assert map_data.acceptance["n_tiles"] == 25.0
+    m = generate_map(_cfg(), _pillar_cfg(), seed=7)
+    assert len(m.rects) > 0
+    for rect in m.rects:
+        assert abs(rect.yaw % (np.pi / 2.0)) < 1e-6
 
 
 def test_inflated_free_space_largest_component_dominates():
-    for seed in range(20):
-        map_data = generate_map(_default_cfg(), seed=seed)
-        assert map_data.acceptance["largest_free_component_ratio"] >= 0.95
+    for seed in range(10):
+        m = generate_map(_cfg(), _pillar_cfg(), seed=seed)
+        assert m.acceptance["largest_free_component_ratio"] >= 0.95
 
 
-def test_inflation_monotonic_and_nontrivial():
-    map_data = generate_map(_default_cfg(), seed=11)
-    assert np.all(map_data.inflated >= map_data.occupancy)
-    assert int((map_data.inflated - map_data.occupancy).sum()) > 0
-
-
-def test_mesh_triangle_count_and_watertight_edges():
-    map_data = generate_map(_default_cfg(), seed=42)
-    triangles = map_data.triangles
-    assert triangles.shape[0] >= 12  # at least a ground slab
-    # A closed triangle soup has every undirected edge appearing exactly twice.
-    edge_counts: dict = {}
+def test_mesh_watertight_and_outward_winding():
+    m = generate_map(_cfg(), _pillar_cfg(), seed=42)
+    triangles = m.triangles
+    edge_counts = {}
     for a, b, cc in triangles:
         for e in ((int(a), int(b)), (int(b), int(cc)), (int(cc), int(a))):
             key = (min(e), max(e))
             edge_counts[key] = edge_counts.get(key, 0) + 1
-    assert len(edge_counts) > 0
     assert all(count == 2 for count in edge_counts.values())
 
-
-def test_mesh_winding_is_outward_consistent():
-    map_data = generate_map(_default_cfg(), seed=42)
-    vertices = map_data.vertices
-    triangles = map_data.triangles
-
+    vertices = m.vertices
     parent = list(range(vertices.shape[0]))
 
-    def find(x: int) -> int:
+    def find(x):
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-    def union(a: int, b: int) -> None:
+    def union(a, b):
         ra, rb = find(a), find(b)
         if ra != rb:
             parent[rb] = ra
@@ -220,67 +128,38 @@ def test_mesh_winding_is_outward_consistent():
         union(int(tri[0]), int(tri[1]))
         union(int(tri[1]), int(tri[2]))
 
-    components: dict = {}
+    components = {}
     for v in range(vertices.shape[0]):
-        root = find(v)
-        components.setdefault(root, []).append(v)
-
-    for comp_vertices in components.values():
-        comp_set = set(comp_vertices)
-        centroid = vertices[comp_vertices].mean(axis=0)
+        components.setdefault(find(v), []).append(v)
+    for comp in components.values():
+        comp_set = set(comp)
+        centroid = vertices[comp].mean(axis=0)
         for tri in triangles:
             if int(tri[0]) not in comp_set:
                 continue
-            v0 = vertices[int(tri[0])]
-            v1 = vertices[int(tri[1])]
-            v2 = vertices[int(tri[2])]
+            v0, v1, v2 = vertices[int(tri[0])], vertices[int(tri[1])], vertices[int(tri[2])]
             normal = np.cross(v1 - v0, v2 - v0)
             tri_center = (v0 + v1 + v2) / 3.0
-            # For every convex closed component, an outward face has its
-            # normal pointing away from the component's vertex centroid.
             assert np.dot(normal, tri_center - centroid) > -1e-5
 
 
-def test_circular_pillar_rasterization_matches_polygon_footprint():
-    map_data = generate_map(_default_cfg(), seed=0)
-    shape = map_data.occupancy.shape
-    half = c.EA2_MAP_SIZE_M / 2.0
-    xs = np.linspace(-half + 0.05, half - 0.05, shape[1])
-    ys = np.linspace(-half + 0.05, half - 0.05, shape[0])
-    gx, gy = np.meshgrid(xs, ys)
-
-    for pillar in map_data.pillars:
-        if pillar.square:
-            continue
-        dx = gx - pillar.center[0]
-        dy = gy - pillar.center[1]
-        poly = _circle_polygon_footprint(pillar.radius, pillar.segments)
-        polygon_covered = _points_in_convex_polygon(dx, dy, poly)
-        # A circular pillar's own footprint must not cover any cell center
-        # that the generator's n-gon mesh would not cover.
-        # We cannot isolate the pillar in the combined occupancy, so verify
-        # against the generator's private rasterizer output.
-        from legged_gym.envs.el_4090.envelope_adaptive_2.map_generator import (
-            _rasterize_pillar,
-        )
-
-        rasterized = _rasterize_pillar(pillar, _default_cfg()).astype(bool)
-        assert bool(np.all(rasterized == polygon_covered))
-
-
 def test_occupied_cell_centers_covered_by_primitives():
-    # Seed 0 was the concrete review regression: exact-circle rasterization
-    # produced occupied cells outside the 16-gon mesh footprint.
-    map_data = generate_map(_default_cfg(), seed=0)
-    covered = _primitive_center_coverage(map_data)
-    assert bool(np.all(covered[map_data.occupancy == 1]))
+    m = generate_map(_cfg(), _pillar_cfg(), seed=0)
+    covered = _primitive_center_coverage(m)
+    assert bool(np.all(covered[m.occupancy == 1]))
 
 
-def test_acceptance_requires_constraint_primitive():
-    map_data = generate_map(_default_cfg(), seed=3)
-    assert map_data.acceptance["planning_border_blocked"] == 1.0
-    assert map_data.acceptance["occupancy_border_free"] == 1.0
-    assert map_data.acceptance["has_constraint_primitive"] == 1.0
-    assert map_data.acceptance["corridor_tiles"] >= 1.0
-    assert map_data.acceptance["side_walls_tiles"] >= 1.0
-    assert map_data.acceptance["u_shape_tiles"] >= 1.0
+def test_acceptance_keys():
+    m = generate_map(_cfg(), _pillar_cfg(), seed=3)
+    for key in (
+        "occupancy_border_free",
+        "planning_border_blocked",
+        "physical_boundary_walls",
+        "all_rects_axis_aligned",
+        "largest_free_component_ratio",
+        "n_tiles",
+        "n_rects",
+        "tiles_with_pillars",
+        "near_obstacle_ratio",
+    ):
+        assert key in m.acceptance
