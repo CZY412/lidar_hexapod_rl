@@ -73,15 +73,15 @@ def play(args) -> None:
                 ppo_runner.alg.policy.reset(dones)
 
             step += 1
-            if step % 10 == 0:
-                mapped = env.actions_mapped[0].detach().cpu().numpy()
-                print(
-                    f"[play_ea2] step={step} rew={float(rews[0]):+.3f} "
-                    f"range_min={float(env.range_image[0].min()):.2f} "
-                    f"envelope=[{mapped[0]:.3f},{mapped[1]:.3f},{mapped[2]:.3f},"
-                    f"{mapped[3]:.3f},{mapped[4]:.3f}]",
-                    flush=True,
-                )
+            # if step % 10 == 0:
+            #     mapped = env.actions_mapped[0].detach().cpu().numpy()
+            #     print(
+            #         f"[play_ea2] step={step} rew={float(rews[0]):+.3f} "
+            #         f"range_min={float(env.range_image[0].min()):.2f} "
+            #         f"envelope=[{mapped[0]:.3f},{mapped[1]:.3f},{mapped[2]:.3f},"
+            #         f"{mapped[3]:.3f},{mapped[4]:.3f}]",
+            #         flush=True,
+            #     )
 
             # Loose real-time pacing (env.dt = 0.02 s).
             elapsed = time.time() - start

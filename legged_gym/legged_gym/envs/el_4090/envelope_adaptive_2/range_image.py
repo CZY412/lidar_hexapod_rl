@@ -1,112 +1,93 @@
-"""Aggregate Airy LiDAR rays into the 450-dimensional envelope range image.
+"""Build the fixed 187-channel range image for envelope_adaptive_2.
 
-This module implements README v2 §2.4:
+The 187 channels are pre-selected from the full Airy pattern and correspond
+one-to-one to the cells of a body-frame ground region.  This module therefore
+does not perform old-style multi-ray bucket aggregation or ``r_min``/``max_range``
+filtering.  Instead:
 
-* each bucket keeps the minimum distance among the valid mapped rays in that
-  bucket;
-* valid rays satisfy ``r_min <= d <= max_range`` (defaults 0.2 m / 5.0 m);
-* no-hit rays (``far_plane``) and out-of-range rays are ignored, so an empty
-  bucket is filled with ``max_range``;
-* the range image is normalized by ``max_range`` for the policy observation.
+* each channel keeps its raw slant distance;
+* no-hit / out-of-region distances are replaced by ``max_range`` (the
+  normalization divisor);
+* the observation is normalized by ``max_range``.
 
-The input follows the frozen contract:
-
-    points: (E, 5760, 3)   -- ray end points (used for shape compatibility)
-    dists:  (E, 5760)      -- per-ray distances (source of the min aggregation)
-    mapping: (5760,) int64 -- bucket id per ray, -1 for non-selected rays
-    output: (E, 450)       -- row-major range image
+``max_range`` is the maximum slant distance among the selected 187 channels,
+rounded up to 0.1 m.
 """
 
 from __future__ import annotations
 
 import torch
 
-from ._contracts import EA2_RANGE_DIM
+from ._contracts import EA2_LIDAR_FAR_PLANE_M
 
 
-def aggregate_range_image(
-    points: torch.Tensor,
-    dists: torch.Tensor,
-    mapping: torch.Tensor,
-    max_range: float,
-    r_min: float,
-) -> torch.Tensor:
-    """Aggregate per-ray distances into a fixed-size range image.
-
-    Args:
-        points: Ray end points, shape ``(E, N, 3)`` where ``N`` is the number
-            of rays (typically 5760).  Kept in the signature for contract
-            compatibility; aggregation uses :attr:`dists`.
-        dists: Per-ray distances.  Shape ``(E, N)`` or the raw LidarSensor
-            shape ``(E, 1, N, 1)``, which is flattened to ``(E, N)``.
-        mapping: Mapping table of shape ``(N,)`` with dtype ``int64``.
-            Each entry is the row-major bucket id in ``[0, 450)`` for selected
-            rays and ``-1`` for rays outside the selected Airy channels.
-        max_range: Effective maximum range.  Empty buckets are filled with
-            this value; it is also the upper bound of the valid range.
-        r_min: Minimum valid distance.  Rays closer than this are ignored.
-
-    Returns:
-        Float tensor of shape ``(E, 450)`` containing one minimum distance per
-        bucket, with empty buckets set to :attr:`max_range`.
-    """
+def _flatten_dists(dists: torch.Tensor) -> torch.Tensor:
+    """Flatten LidarSensor-style dists to ``(E, N)``."""
     if dists.dim() == 4 and dists.shape[-1] == 1:
-        # LidarSensor can produce (E, 1, N, 1); flatten to the contract's
-        # (E, N) layout while preserving the batch dimension.
-        dists = dists.reshape(dists.shape[0], -1)
+        return dists.reshape(dists.shape[0], -1)
     if dists.dim() != 2:
         raise ValueError(
             f"dists must be 2D (E, N) or 4D (E, 1, N, 1), got shape {tuple(dists.shape)}"
         )
+    return dists
 
-    n_rays = dists.shape[1]
-    if mapping.shape[0] != n_rays:
-        raise ValueError(
-            f"mapping has {mapping.shape[0]} entries but dists has {n_rays} rays"
-        )
 
-    device = dists.device
-    dtype = dists.dtype
+def build_selected_range_image(
+    dists: torch.Tensor,
+    max_range: float,
+    far_plane: float = EA2_LIDAR_FAR_PLANE_M,
+) -> torch.Tensor:
+    """Convert the 187 selected-channel distances into a raw range image.
 
-    mapping_dev = mapping.to(device=device)
-    # scatter_reduce_ requires valid index values; non-selected -1 entries are
-    # mapped to bucket 0 with src=max_range, which cannot lower any bucket's min
-    # (empty buckets already start at max_range).
-    bucket = mapping_dev.clamp(min=0)
-    bucket_idx = bucket.unsqueeze(0).expand(dists.shape[0], -1)
+    Args:
+        dists: Per-channel distances, shape ``(E, 187)`` or ``(E, 1, 187, 1)``.
+        max_range: Normalization divisor / empty sentinel (max slant rounded up).
+        far_plane: Sensor no-hit distance; kept for explicitness.
 
-    valid = (
-        (dists >= r_min)
-        & (dists <= max_range)
-        & (mapping_dev >= 0)
-    )
-    src = torch.where(valid, dists, torch.full_like(dists, max_range))
+    Returns:
+        Float tensor of shape ``(E, 187)``.  Valid hits keep their raw slant
+        distance; no-hit and out-of-region distances are set to ``max_range``.
+    """
+    dists = _flatten_dists(dists)
+    valid = (dists >= 0.0) & (dists <= max_range) & (dists < far_plane)
+    return torch.where(valid, dists, torch.full_like(dists, max_range))
 
-    out = torch.full(
-        (dists.shape[0], EA2_RANGE_DIM),
-        max_range,
-        dtype=dtype,
-        device=device,
-    )
-    out.scatter_reduce_(
-        1,
-        bucket_idx,
-        src,
-        reduce="amin",
-        include_self=True,
-    )
-    return out
+
+def extract_selected_range_image(
+    full_dists: torch.Tensor,
+    selected_indices: torch.Tensor,
+    max_range: float,
+    far_plane: float = EA2_LIDAR_FAR_PLANE_M,
+) -> torch.Tensor:
+    """Extract the 187 selected channels from a full Airy distance cloud.
+
+    Used by the debug/full-raycast path to compute the same observation from
+    the complete 86,400-ray point cloud.
+
+    Args:
+        full_dists: Full per-ray distances, shape ``(E, N_full)`` or
+            ``(E, 1, N_full, 1)``.
+        selected_indices: Integer tensor of shape ``(187,)`` selecting rays.
+        max_range: Normalization divisor / empty sentinel.
+        far_plane: Sensor no-hit distance.
+
+    Returns:
+        Float tensor of shape ``(E, 187)`` in the fixed row-major grid order.
+    """
+    full_dists = _flatten_dists(full_dists)
+    selected = full_dists[:, selected_indices.to(device=full_dists.device)]
+    return build_selected_range_image(selected, max_range, far_plane=far_plane)
 
 
 def range_image_observation(
     range_image: torch.Tensor,
     max_range: float,
 ) -> torch.Tensor:
-    """Normalize a raw range image by dividing every bucket by ``max_range``.
+    """Normalize a raw range image by dividing every channel by ``max_range``.
 
     Args:
-        range_image: Raw aggregated range image, shape ``(..., 450)``.
-        max_range: Normalization divisor (the effective max range, 5.0 m).
+        range_image: Raw selected range image, shape ``(..., 187)``.
+        max_range: Normalization divisor (max slant rounded up).
 
     Returns:
         Normalized range image of the same shape/dtype as the input.

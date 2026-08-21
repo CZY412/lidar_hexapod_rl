@@ -1,4 +1,4 @@
-"""T0 sanity checks: frozen contracts and config match README v2 numbers."""
+"""T0 sanity checks: frozen contracts and config match the fixed-channel design."""
 
 from legged_gym.envs.el_4090.envelope_adaptive_2 import (
     El4090EA2Cfg,
@@ -9,10 +9,11 @@ from legged_gym.envs.el_4090.envelope_adaptive_2 import _contracts as c
 
 def test_env_cfg_contract():
     cfg = El4090EA2Cfg()
-    assert cfg.env.num_observations == 453
+    assert cfg.env.num_observations == 190
     assert cfg.env.num_actions == 5
     assert cfg.env.num_privileged_obs is None
-    assert cfg.env.episode_length_s == 20.0
+    assert cfg.env.episode_length_s == 40.0
+    assert cfg.env.memory_reset_prob == 0.15
     assert cfg.sim.dt == 0.02
     assert cfg.height.min_m == 0.52
     assert cfg.height.max_m == 0.52
@@ -27,13 +28,17 @@ def test_env_cfg_contract():
     assert cfg.map.grid_shape == [740, 740]
     assert cfg.map.n_tiles == 4
     assert cfg.map.tile_size_m == 16.0
-    assert cfg.obstacles.pillar_count_max == 12
+    assert cfg.obstacles.pillar_count_min == 15
+    assert cfg.obstacles.pillar_count_max == 15
     assert cfg.obstacles.pillar_size_x_min == 0.5
     assert cfg.obstacles.pillar_size_x_max == 4.0
     assert cfg.obstacles.pillar_min_separation == 2.2
-    assert cfg.lidar.offset_pos == [0.0, 0.0, -0.05]
+    assert cfg.obstacles.pillar_center_clear_radius == 2.2
+    assert cfg.lidar.offset_pos == [0.7, 0.0, -0.05]
     assert cfg.lidar.far_plane == 60.0
-    assert cfg.lidar.effective_max_range == 5.0
+    assert cfg.lidar.effective_max_range == 3.2
+    assert cfg.lidar.airy_horizontal_resolution_deg == 0.4
+    assert cfg.lidar.use_reduced_raycast is True
     assert cfg.lidar.update_frequency_hz == 10.0
     assert cfg.lidar.enable_sensor_noise is True
     assert cfg.lidar.pixel_std_dev_multiplier == 0.02
@@ -54,18 +59,21 @@ def test_ppo_cfg_contract():
     assert not hasattr(cfg.policy, "num_critic_obs")
 
 
-def test_airy_bucket_constants():
-    assert c.EA2_N_RAYS == 5760
-    assert c.EA2_SELECTED_AZ == tuple(range(18, 43))
-    assert c.EA2_SELECTED_EL == tuple(range(6, 96))
-    assert c.EA2_N_COLS == 25
-    assert c.EA2_N_ROWS == 18
-    assert c.EA2_RANGE_DIM == 450
-    assert c.EA2_SENSOR_OFFSET_POS == (0.0, 0.0, -0.05)
-    assert abs(c.EA2_SENSOR_OFFSET_RPY[1] - (3.14159265 / 2.0 + 0.35)) < 1e-6
+def test_airy_fixed_channel_constants():
+    assert c.EA2_AIRY_N_AZIMUTH_FULL == 900
+    assert c.EA2_AIRY_N_ELEVATION == 96
+    assert c.EA2_AIRY_HORIZONTAL_RES_DEG == 0.4
+    assert c.EA2_FULL_N_RAYS == 86400
+    assert c.EA2_GRID_ROWS == 11
+    assert c.EA2_GRID_COLS == 17
+    assert c.EA2_RANGE_DIM == 187
+    assert c.EA2_RANGE_MAX_M == 3.2
+    assert c.EA2_SENSOR_OFFSET_POS == (0.7, 0.0, -0.05)
+    assert abs(c.EA2_SENSOR_OFFSET_RPY[1] - (3.14159265 / 2.0 + 0.1)) < 1e-6
     assert c.EA2_MAP_SIZE_M == 74.0
     assert c.EA2_GRID_SHAPE == (740, 740)
     assert c.EA2_N_TILES == 4
+    assert c.EA2_SELECTED_CHANNELS_FILE.exists()
 
 
 def test_envelope_spec_source_exists():

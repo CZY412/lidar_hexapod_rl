@@ -117,7 +117,8 @@ def _main() -> int:
 
     # Initial observations: range image normalized to [0, 1], ego to ~[-1, 1].
     assert torch.isfinite(obs).all()
-    assert obs[:, :450].min() >= -1e-4 and obs[:, :450].max() <= 1.0 + 1e-4
+    n_range = env_cfg.env.num_observations - 3
+    assert obs[:, :n_range].min() >= -1e-4 and obs[:, :n_range].max() <= 1.0 + 1e-4
 
     steps = int(args.steps)
     max_range = float(env_cfg.lidar.effective_max_range)
@@ -141,8 +142,8 @@ def _main() -> int:
             # The legacy timer makes the first policy step a global LiDAR
             # scan.  After an initial reset, that scan must replace the empty
             # all-max_range frame with a fresh aggregate from the new pose
-            # (README 2.4).  Ground/obstacle hits in the selected Airy buckets
-            # guarantee at least one bucket below the 5.0 m empty sentinel.
+            # (README 2.4).  Ground/obstacle hits in the selected Airy channels
+            # guarantee at least one channel below the empty sentinel.
             assert (
                 env.range_image.min() < max_range - 1e-3
             ), "reset envs did not receive a fresh range image on the first scan"

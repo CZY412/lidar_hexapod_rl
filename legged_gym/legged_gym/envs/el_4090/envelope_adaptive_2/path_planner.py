@@ -42,7 +42,7 @@ def wrap_to_pi(angle: float) -> float:
 def _world_to_grid(x: float, y: float) -> Tuple[int, int]:
     """Convert world coordinates to grid indices ``(iy, ix)``.
 
-    Follows the README formula: ``ix = floor((x + 6.0) / 0.1)``.
+    Follows the README formula: ``ix = floor((x + 37.0) / 0.1)``.
     """
     ix = int(math.floor((x - EA2_WORLD_MIN_XY) / EA2_RESOLUTION_M))
     iy = int(math.floor((y - EA2_WORLD_MIN_XY) / EA2_RESOLUTION_M))
@@ -579,26 +579,6 @@ def _apply_path_noise(
     return noisy
 
 
-def _curvature_violation(points: np.ndarray, yaws: np.ndarray, cfg: PathCfg) -> bool:
-    """Return True if any discrete tangent curvature exceeds 1/R_min.
-
-    The check follows README 2.2.4 exactly: every adjacent pair contributes
-    ``abs(wrap_to_pi(Delta yaw)) / Delta s <= 1/R_min``.  Zero-length segments
-    are ignored only to avoid division by zero.
-    """
-    if points.shape[0] < 3:
-        return False
-    ds = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    dyaw = np.abs(wrap_to_pi(np.diff(yaws)))
-    max_curvature = 1.0 / max(cfg.min_turn_radius, 1e-6)
-    for k in range(len(ds)):
-        if ds[k] < 1e-9:
-            continue
-        if dyaw[k] / ds[k] > max_curvature + 1e-9:
-            return True
-    return False
-
-
 def _deduplicate_close_points(points: np.ndarray, min_spacing: float) -> np.ndarray:
     """Drop consecutive points closer than ``min_spacing``.
 
@@ -726,7 +706,7 @@ def plan_path(
     smoothing to the configured ``min_turn_radius`` bound.
 
     Args:
-        occupancy: Raw occupancy grid ``(120, 120)`` uint8 (kept for API
+        occupancy: Raw occupancy grid ``(740, 740)`` uint8 (kept for API
             compatibility; A* safety uses ``inflated``).
         inflated: 0.35 m inflated grid; 1 = blocked.
         start_xy: World-space start ``(x, y)``, must be free in ``inflated``.

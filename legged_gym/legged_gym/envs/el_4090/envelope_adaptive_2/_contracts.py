@@ -11,7 +11,7 @@ The actual implementations live in their own modules:
     - ``envelope_geometry.py``               -> hexagon / offset / grid collision
     - ``map_generator.py``                   -> primitives -> occupancy -> warp mesh
     - ``path_planner.py``                    -> A* / smoothing / noise / heading
-    - ``range_image.py``                     -> 5760 rays -> 450 range image
+    - ``range_image.py``                     -> 86400 full rays -> 187 fixed channels
     - ``el_4090_ea2_env.py``                 -> BaseTask integration
 """
 
@@ -29,7 +29,7 @@ import torch
 # Paths / constants (single source of truth)
 # ---------------------------------------------------------------------------
 EA2_DIR = Path(__file__).resolve().parent
-EA2_MAPPING_TABLE_FILE = EA2_DIR / "airy_mapping.pt"
+EA2_SELECTED_CHANNELS_FILE = EA2_DIR / "selected_airy_channels.pt"
 
 EA2_MAP_SIZE_M = 74.0    # 4 x 4 tiles of 16m x 16m + 5m border on each side
 EA2_RESOLUTION_M = 0.1
@@ -37,24 +37,27 @@ EA2_GRID_SHAPE = (740, 740)  # (rows=iy, cols=ix)
 EA2_WORLD_MIN_XY = -37.0
 EA2_WORLD_MAX_XY = 37.0
 EA2_GROUND_MARGIN_M = 2.0
+EA2_BASE_HEIGHT_M = 0.52
 
-# Airy (matches LidarSensor.generate_AIRY defaults)
-EA2_AIRY_N_AZIMUTH = 60
+# Full Airy pattern used for offline channel selection (0.4 deg horizontal).
+EA2_AIRY_N_AZIMUTH_FULL = 900
 EA2_AIRY_N_ELEVATION = 96
-EA2_AIRY_HORIZONTAL_RES_DEG = 6.0
-EA2_AIRY_VERTICAL_FOV_DEG = (0.0, 90.0)
-EA2_N_RAYS = EA2_AIRY_N_AZIMUTH * EA2_AIRY_N_ELEVATION  # 5760
+EA2_AIRY_HORIZONTAL_RES_DEG = 0.4
+EA2_FULL_N_RAYS = EA2_AIRY_N_AZIMUTH_FULL * EA2_AIRY_N_ELEVATION  # 86400
 EA2_RAY_INDEX = "i = az * 96 + el"  # LidarSensor C-order flatten
 
-# v2 bucketing: physical azimuth channels 18..42, elevation lines 6..95
-EA2_SELECTED_AZ = tuple(range(18, 43))   # 25 physical channels, theta 108..252 deg
-EA2_SELECTED_EL = tuple(range(6, 96))    # 90 lines, 5 per row -> 18 rows
-EA2_N_COLS = len(EA2_SELECTED_AZ)        # 25
-EA2_N_ROWS = len(EA2_SELECTED_EL) // 5   # 18
-EA2_RANGE_DIM = EA2_N_COLS * EA2_N_ROWS  # 450
+# Fixed 187-channel ground grid (11 rows along x, 17 cols along y).
+EA2_GRID_ROWS = 11
+EA2_GRID_COLS = 17
+EA2_RANGE_DIM = EA2_GRID_ROWS * EA2_GRID_COLS  # 187
+EA2_REGION_X_MIN = 0.65
+EA2_REGION_X_MAX = 3.65
+EA2_REGION_Y_MIN = -1.0
+EA2_REGION_Y_MAX = 1.0
 
-EA2_RANGE_MAX_M = 5.0   # effective aggregation range (normalization divisor)
-EA2_RANGE_MIN_M = 0.2   # applied in aggregation, NOT by the warp kernel
+# Normalization divisor = max slant distance among selected channels, rounded
+# up to 0.1 m.  Computed by airy_mount during channel selection.
+EA2_RANGE_MAX_M = 3.2
 EA2_LIDAR_FAR_PLANE_M = 60.0
 
 # 4x4 tile terrain layout (pd_gru pillar-field random cuboids per tile)
@@ -74,9 +77,9 @@ EA2_TILE_TYPE_CODES = (
     EA2_TILE_U_SHAPE,
 )
 
-# Sensor mount (body frame; legacy envelope_adaptive placement)
-EA2_SENSOR_OFFSET_POS = (0.0, 0.0, -0.05)
-EA2_SENSOR_OFFSET_RPY = (0.0, math.pi / 2.0 + 0.35, 0.0)
+# Sensor mount (body frame; current EA2 placement)
+EA2_SENSOR_OFFSET_POS = (0.7, 0.0, -0.05)
+EA2_SENSOR_OFFSET_RPY = (0.0, math.pi / 2.0 + 0.1, 0.0)
 
 # Envelope (must stay identical to spider_envelop config; do not duplicate)
 ENVELOPE_SPEC_CONFIG_PATH = (
@@ -114,13 +117,13 @@ class PillarPrimitive:
 class MapData:
     """Output of ``map_generator.generate_map``.
 
-    Arrays use world coordinates x/y in [-6, 6]; grid indexing follows
-    ``ix = floor((x + 6) / 0.1)``.  ``inflated`` is the 0.35 m (4-cell)
+    Arrays use world coordinates x/y in [-37, 37]; grid indexing follows
+    ``ix = floor((x + 37) / 0.1)``.  ``inflated`` is the 0.35 m (4-cell)
     safety grid for A*/path checks and is computed once per fixed map.
     """
 
-    occupancy: np.ndarray           # (120, 120) uint8, 1 = occupied
-    inflated: np.ndarray            # (120, 120) uint8, 1 = blocked (planning)
+    occupancy: np.ndarray           # (740, 740) uint8, 1 = occupied
+    inflated: np.ndarray            # (740, 740) uint8, 1 = blocked (planning)
     vertices: np.ndarray            # (V, 3) float32, watertight ground+obstacles
     triangles: np.ndarray           # (T, 3) int32, CCW/outward-consistent winding
     tile_types: Optional[np.ndarray] = None  # (5, 5) uint8 tile type codes
@@ -231,11 +234,12 @@ class LidarNoiseCfg:
 #       - reference implementation in README section 2.2.8
 #
 # airy_mount.py
-#   def build_airy_mapping_table() -> torch.Tensor          # (5760,) int64, -1
-#   def body_frame_ray_directions() -> torch.Tensor         # (5760, 3)
-#   def self_check_mapping_table(table) -> Dict[str, object]
-#       - asserts body-x>0, azimuth in [-80,80] deg,
-#         elevation in [-25,70] deg for all selected rays
+#   def generate_full_airy_directions() -> torch.Tensor     # (86400, 3)
+#   def body_frame_ray_directions() -> torch.Tensor         # (86400, 3)
+#   def select_ground_grid_channels() -> Dict[str, object]
+#       - selects 187 unique channels for the 11x17 ground grid
+#   def load_selected_channels() -> Dict[str, object]
+#   def self_check_selected_channels(data) -> Dict[str, object]
 #
 # envelope_geometry.py
 #   def compute_hex_vertices(front_width, middle_width, back_width,
@@ -263,10 +267,11 @@ class LidarNoiseCfg:
 #   def ego_motion(v, heading, tangent, omega) -> Tuple[vx, vy, omega]
 #
 # range_image.py
-#   def aggregate_range_image(points: torch.Tensor, dists: torch.Tensor,
-#                             mapping: torch.Tensor,
-#                             max_range: float, r_min: float) -> torch.Tensor
-#       # (E,5760,3)/(E,5760) -> (E,450), min per bucket, empty = max_range
+#   def build_selected_range_image(dists, max_range) -> torch.Tensor
+#       # (E,187) -> (E,187), no-hit/out-of-range = max_range
+#   def extract_selected_range_image(full_dists, selected_indices,
+#                                    max_range) -> torch.Tensor
+#       # (E,86400) + (187,) -> (E,187)
 #   def range_image_observation(range_image, max_range) -> torch.Tensor
 #
 # el_4090_ea2_env.py

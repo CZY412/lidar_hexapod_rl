@@ -49,6 +49,9 @@ class LidarConfig(BaseSensorConfig):
     horizontal_fov_deg_max: float = 180
     vertical_fov_deg_min: float = -2
     vertical_fov_deg_max: float = 57
+
+    # Airy-specific settings (used only for LidarType.AIRY)
+    airy_horizontal_resolution_deg: float = 6.0
     
     # Height scanner settings (only used when sensor_type is HEIGHT_SCANNER)
     height_scanner_size: list = field(default_factory=lambda: [2.0, 2.0])  # [length, width] in meters

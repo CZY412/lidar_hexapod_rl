@@ -2,9 +2,9 @@
 
 This module integrates T1-T6 (map, path, hex geometry, range image, Airy
 mount, LiDAR noise) into a simplified legged_gym ``BaseTask`` with no robot
-actor.  The policy sees a 453-dim observation (450 range-image + 3 ego-motion)
-and emits 5 raw envelope parameters which are mapped in the environment to the
-spider_envelop ranges.
+actor.  The policy sees a 190-dim observation (187 fixed range channels + 3
+ego-motion) and emits 5 raw envelope parameters which are mapped in the
+environment to the spider_envelop ranges.
 
 Pure helpers are kept at module level so ``tests/ea2/test_ea2_env_helpers.py``
 can exercise height/wobble, heading, rewards, observation assembly and the
@@ -27,7 +27,6 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_config import (
 from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
     collision_cell_ratio,
     compute_hex_vertices,
-    envelope_params_to_condition,
     offset_hexagon,
 )
 from legged_gym.envs.el_4090.envelope_adaptive_2.map_generator import (
@@ -40,11 +39,11 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.path_planner import (
     wrap_to_pi as _np_wrap_to_pi,
 )
 from legged_gym.envs.el_4090.envelope_adaptive_2.range_image import (
-    aggregate_range_image,
+    build_selected_range_image,
+    extract_selected_range_image,
     range_image_observation,
 )
 from legged_gym.utils.envelop.network.haa_swing_range import (
-    EnvelopeConditionSpec,
     load_envelope_condition_spec,
 )
 
@@ -56,6 +55,25 @@ from legged_gym.utils.envelop.network.haa_swing_range import (
 def wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
     """Wrap an angle/tensor to ``[-pi, pi)`` using PyTorch semantics."""
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def yaw_quat_from_heading(heading: torch.Tensor) -> torch.Tensor:
+    """Build a z-up yaw quaternion ``[x, y, z, w]`` from a body heading.
+
+    M1 has no pitch/roll, so the robot/body orientation is fully described by
+    ``heading``.  This helper is the single source of truth for converting
+    heading to the quaternion used by LiDAR raycasting and debug drawing.
+    """
+    half = heading * 0.5
+    return torch.stack(
+        [
+            torch.zeros_like(half),
+            torch.zeros_like(half),
+            torch.sin(half),
+            torch.cos(half),
+        ],
+        dim=-1,
+    )
 
 
 def height_step(
@@ -153,14 +171,6 @@ def map_actions_to_params(
     return low + norm * (high - low)
 
 
-def envelope_condition_from_params(
-    params5: torch.Tensor,
-    spec: EnvelopeConditionSpec,
-) -> torch.Tensor:
-    """Convert 5 mapped envelope params to the frozen 8-dim condition."""
-    return envelope_params_to_condition(params5, spec)
-
-
 def potential_reward(
     params5: torch.Tensor,
     low: torch.Tensor,
@@ -256,38 +266,37 @@ def refresh_range_image_from_scan(
     return range_image
 
 
-def point_cloud_debug_masks(
+def selected_channel_mask(
     dists: torch.Tensor,
-    mapping: torch.Tensor,
+    selected_indices: torch.Tensor,
+    is_reduced: bool,
     far_plane: float,
-    max_range: float,
-    r_min: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Classify rays for README 2.7 red/green visualization.
+    """Return ``(red, green)`` boolean masks for debug visualization.
+
+    In reduced mode the debug cloud contains only the 187 selected channels,
+    so every valid hit is red.  In full mode the debug cloud contains the
+    complete 86,400-ray Airy cloud, so only ``selected_indices`` are red and
+    the remaining valid hits are green.
 
     Args:
-        dists: Noisy ray distances, shape ``(..., N)``.
-        mapping: Flat Airy mapping table, shape ``(N,)``.
-        far_plane: ``LidarConfig.max_range`` (60 m); ``d >= far_plane`` is a
-            no-hit ray.
-        max_range/r_min: Effective 450-bucket range ``[r_min, max_range]``.
+        dists: Debug ray distances, shape ``(N,)``.
+        selected_indices: Full Airy indices of the 187 selected channels.
+        is_reduced: Whether ``dists`` is the reduced 187-channel cloud.
+        far_plane: Sensor no-hit distance.
 
     Returns:
         ``(red, green)`` boolean masks with the same shape as ``dists``.
-        Red = real hit whose channel is in the mapping table and whose noisy
-        distance participates in the 450-dim aggregation.  Green = other real
-        hits.  No-hit and dropout rays are excluded from both masks.
     """
-    far = float(far_plane)
-    max_r = float(max_range)
-    min_r = float(r_min)
-    hit = dists < (far - 1e-3)
-    mapped = mapping.to(device=dists.device) >= 0
-    in_agg_range = (dists >= min_r) & (dists <= max_r)
-    red = hit & mapped & in_agg_range
+    hit = dists < (float(far_plane) - 1e-3)
+    if is_reduced or dists.shape[0] == ea2c.EA2_RANGE_DIM:
+        selected = torch.ones_like(hit)
+    else:
+        selected = torch.zeros_like(hit)
+        selected[selected_indices.to(device=dists.device)] = True
+    red = selected & hit
     green = hit & ~red
     return red, green
-
 
 
 def sway_position_acceptable(
@@ -466,6 +475,27 @@ class EL_4090_EA2(BaseTask):
         largest_label = int(np.argmax(sizes)) + 1
         self._free_cells = np.argwhere(labels == largest_label)
 
+        # Spawn positions are restricted to the 4x4 tile area, excluding the
+        # 5m outer border where there are no obstacles by construction.
+        half_tile = (
+            float(self.cfg.map.size_m) / 2.0 - float(self.cfg.map.border_size_m)
+        )
+        spawn_xs = ea2c.EA2_WORLD_MIN_XY + (
+            self._free_cells[:, 1] + 0.5
+        ) * ea2c.EA2_RESOLUTION_M
+        spawn_ys = ea2c.EA2_WORLD_MIN_XY + (
+            self._free_cells[:, 0] + 0.5
+        ) * ea2c.EA2_RESOLUTION_M
+        spawn_mask = (
+            (spawn_xs >= -half_tile)
+            & (spawn_xs <= half_tile)
+            & (spawn_ys >= -half_tile)
+            & (spawn_ys <= half_tile)
+        )
+        self._spawn_cells = self._free_cells[spawn_mask]
+        if self._spawn_cells.shape[0] == 0:
+            raise RuntimeError("no spawn cells inside the 4x4 tile area")
+
         # Physics ground for Isaac (visual/ground only; Warp mesh is the
         # authoritative raycast geometry).
         plane_params = self.gymapi().PlaneParams()
@@ -566,8 +596,6 @@ class EL_4090_EA2(BaseTask):
         self.delta_actual = torch.zeros(n, dtype=torch.float32, device=device)
         self.omega = torch.zeros(n, dtype=torch.float32, device=device)
         self.base_pos = torch.zeros(n, 3, dtype=torch.float32, device=device)
-        self.base_quat = torch.zeros(n, 4, dtype=torch.float32, device=device)
-        self.base_quat[:, 3] = 1.0
 
         # Height / sway AR states
         self.height_filter = torch.zeros(n, dtype=torch.float32, device=device)
@@ -597,9 +625,6 @@ class EL_4090_EA2(BaseTask):
         self.actions_mapped = torch.zeros(
             n, self.num_actions, dtype=torch.float32, device=device
         )
-        self.condition = torch.zeros(
-            n, 8, dtype=torch.float32, device=device
-        )
 
         # LiDAR / observations
         self.range_image = empty_range_image(n, ea2c.EA2_RANGE_MAX_M, device)
@@ -613,6 +638,9 @@ class EL_4090_EA2(BaseTask):
         self.ego_motion = torch.zeros(
             n, 3, dtype=torch.float32, device=device
         )
+        self.memory_reset_buf = torch.zeros(
+            n, dtype=torch.bool, device=device
+        )
 
         # Debug point-cloud visualization state (populated only when a viewer
         # exists; stored only for cfg.lidar.debug_env_ids).
@@ -622,10 +650,9 @@ class EL_4090_EA2(BaseTask):
         self._debug_point_stride = int(
             getattr(self.cfg.lidar, "debug_point_stride", 1)
         )
-        self._debug_points = None
+        self._debug_points = None   # body-frame point cloud for debug envs
         self._debug_dists = None
-        self._debug_base_pos = None
-        self._debug_base_quat = None
+        self._debug_is_reduced = False
 
         # Episode reward sums (scaled, matching LeggedRobot logging)
         self.episode_sums = {
@@ -666,42 +693,84 @@ class EL_4090_EA2(BaseTask):
             [self._wp_mesh.id], dtype=wp.uint64, device=self.device
         )
 
-        lidar_cfg = LidarConfig(
-            sensor_type=LidarType.AIRY,
-            dt=float(self.dt),
-            update_frequency=float(self.cfg.lidar.update_frequency_hz),
-            max_range=float(self.cfg.lidar.far_plane),
-            min_range=float(self.cfg.lidar.min_range),
-            num_sensors=1,
-            horizontal_line_num=int(self.cfg.lidar.airy_n_azimuth),
-            vertical_line_num=int(self.cfg.lidar.airy_n_elevation),
-            horizontal_fov_deg_min=-180.0,
-            horizontal_fov_deg_max=180.0,
-            vertical_fov_deg_min=float(self.cfg.lidar.airy_vertical_fov_deg[0]),
-            vertical_fov_deg_max=float(self.cfg.lidar.airy_vertical_fov_deg[1]),
-            return_pointcloud=True,
-            pointcloud_in_world_frame=False,
-            randomize_placement=False,
-            enable_sensor_noise=bool(self.cfg.lidar.enable_sensor_noise),
-            pixel_std_dev_multiplier=float(
-                self.cfg.lidar.pixel_std_dev_multiplier
-            ),
-            pixel_dropout_prob=float(self.cfg.lidar.pixel_dropout_prob),
-            random_distance_noise=float(self.cfg.lidar.random_distance_noise),
-            random_angle_noise=float(self.cfg.lidar.random_angle_noise),
+        # The switch controls both train and play: when use_reduced_raycast is
+        # True, even a viewer session only creates the 187-ray buffers.
+        use_full_lidar = not bool(
+            getattr(self.cfg.lidar, "use_reduced_raycast", True)
         )
 
-        lidar_env = {
-            "device": self.device,
-            "num_envs": self.num_envs,
-            "num_sensors": 1,
-            "sensor_pos_tensor": self.sensor_pos_tensor,
-            "sensor_quat_tensor": self.sensor_quat_tensor,
-            "mesh_ids": self.mesh_ids,
-        }
-        self.lidar_sensor = LidarSensor(
-            lidar_env, None, lidar_cfg, num_sensors=1, device=self.device
+        if use_full_lidar:
+            lidar_cfg = LidarConfig(
+                sensor_type=LidarType.AIRY,
+                dt=float(self.dt),
+                update_frequency=float(self.cfg.lidar.update_frequency_hz),
+                max_range=float(self.cfg.lidar.far_plane),
+                min_range=float(self.cfg.lidar.min_range),
+                num_sensors=1,
+                horizontal_line_num=int(self.cfg.lidar.airy_n_azimuth),
+                vertical_line_num=int(self.cfg.lidar.airy_n_elevation),
+                horizontal_fov_deg_min=-180.0,
+                horizontal_fov_deg_max=180.0,
+                vertical_fov_deg_min=float(
+                    self.cfg.lidar.airy_vertical_fov_deg[0]
+                ),
+                vertical_fov_deg_max=float(
+                    self.cfg.lidar.airy_vertical_fov_deg[1]
+                ),
+                airy_horizontal_resolution_deg=float(
+                    self.cfg.lidar.airy_horizontal_resolution_deg
+                ),
+                return_pointcloud=True,
+                pointcloud_in_world_frame=False,
+                randomize_placement=False,
+                enable_sensor_noise=bool(self.cfg.lidar.enable_sensor_noise),
+                pixel_std_dev_multiplier=float(
+                    self.cfg.lidar.pixel_std_dev_multiplier
+                ),
+                pixel_dropout_prob=float(self.cfg.lidar.pixel_dropout_prob),
+                random_distance_noise=float(
+                    self.cfg.lidar.random_distance_noise
+                ),
+                random_angle_noise=float(self.cfg.lidar.random_angle_noise),
+            )
+
+            lidar_env = {
+                "device": self.device,
+                "num_envs": self.num_envs,
+                "num_sensors": 1,
+                "sensor_pos_tensor": self.sensor_pos_tensor,
+                "sensor_quat_tensor": self.sensor_quat_tensor,
+                "mesh_ids": self.mesh_ids,
+            }
+            self.lidar_sensor = LidarSensor(
+                lidar_env, None, lidar_cfg, num_sensors=1, device=self.device
+            )
+        else:
+            self.lidar_sensor = None
+
+        # Warp views of the live sensor pose tensors, used by the reduced
+        # raycast path even when no full LidarSensor is created.
+        self._lidar_positions_wp = wp.from_torch(
+            self.sensor_pos_tensor.view(self.num_envs, 1, 3), dtype=wp.vec3
         )
+        self._lidar_quat_wp = wp.from_torch(
+            self.sensor_quat_tensor.view(self.num_envs, 1, 4), dtype=wp.quat
+        )
+
+        # Lightweight noise applier reused by the reduced raycast path.
+        from types import SimpleNamespace
+
+        self._noise_ctx = SimpleNamespace(
+            sensor_cfg=SimpleNamespace(
+                enable_sensor_noise=bool(self.cfg.lidar.enable_sensor_noise),
+                pixel_std_dev_multiplier=float(
+                    self.cfg.lidar.pixel_std_dev_multiplier
+                ),
+                pixel_dropout_prob=float(self.cfg.lidar.pixel_dropout_prob),
+            ),
+            far_plane=float(self.cfg.lidar.far_plane),
+        )
+        self._apply_noise = LidarSensor.apply_noise
 
         offset_pos = list(self.cfg.lidar.offset_pos)
         self._sensor_translation = torch.tensor(
@@ -718,63 +787,172 @@ class EL_4090_EA2(BaseTask):
             self.num_envs, 1
         )
 
-        # Load the fixed Airy mapping table once.
-        self.airy_mapping = (
-            ea2c.EA2_MAPPING_TABLE_FILE.exists()
-            and torch.load(ea2c.EA2_MAPPING_TABLE_FILE, map_location="cpu")
+        # Load (or build) the fixed 187 selected channels.
+        from legged_gym.envs.el_4090.envelope_adaptive_2.airy_mount import (
+            load_selected_channels,
+            save_selected_channels,
+            select_ground_grid_channels,
         )
-        if not isinstance(self.airy_mapping, torch.Tensor):
-            from legged_gym.envs.el_4090.envelope_adaptive_2.airy_mount import (
-                build_airy_mapping_table,
-            )
 
-            self.airy_mapping = build_airy_mapping_table()
+        if ea2c.EA2_SELECTED_CHANNELS_FILE.exists():
+            self.selected_channels = load_selected_channels()
+        else:
+            self.selected_channels = select_ground_grid_channels()
+            save_selected_channels(self.selected_channels)
+        self.range_max = float(self.selected_channels["max_range"])
+        self.selected_ray_indices = self.selected_channels["ray_indices"].to(
+            self.device
+        )
+        self.selected_ray_directions = self.selected_channels[
+            "ray_directions"
+        ].to(self.device)
+        # Use the real normalization divisor now that the selected channels are
+        # loaded (the buffer was initialized with a placeholder).
+        self.range_image = empty_range_image(
+            self.num_envs, self.range_max, self.device
+        )
+
+        # Reduced 187-ray raycast buffers (training path).
+        n_sel = ea2c.EA2_RANGE_DIM
+        ray_dir_tensor = self.selected_ray_directions.unsqueeze(1).contiguous()
+        self._reduced_ray_vectors = wp.from_torch(
+            ray_dir_tensor, dtype=wp.vec3
+        )
+        self._reduced_lidar_tensor = torch.zeros(
+            (self.num_envs, 1, n_sel, 1, 3),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._reduced_dist_tensor = torch.zeros(
+            (self.num_envs, 1, n_sel, 1),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._reduced_lidar_warp = wp.from_torch(
+            self._reduced_lidar_tensor, dtype=wp.vec3
+        )
+        self._reduced_dist_warp = wp.from_torch(
+            self._reduced_dist_tensor, dtype=wp.float32
+        )
 
     def _update_lidar(self):
-        """Advance the global 10 Hz clock and refresh the 450-dim range image."""
+        """Advance the global 10 Hz clock and refresh the 187-dim range image.
+
+        Two paths are supported:
+
+        * reduced path (training, headless): raycast only the 187 selected
+          channels;
+        * full path (debug/viewer): raycast the full Airy pattern and extract
+          the 187 selected channels, keeping the full point cloud for
+          comparison.
+        """
         self._lidar_timer += 1
         if self._lidar_timer % self._lidar_decimation != 0:
             return
 
+        import warp as wp
         from isaacgym.torch_utils import quat_apply, quat_mul
+        from legged_gym.utils.LidarSensor.sensor_kernels.lidar_kernels_warp import (
+            LidarWarpKernels,
+        )
 
+        current_q = yaw_quat_from_heading(self.heading)
         self.sensor_quat_tensor.copy_(
-            quat_mul(self.base_quat, self._sensor_offset_quat)
+            quat_mul(current_q, self._sensor_offset_quat)
         )
         self.sensor_pos_tensor.copy_(
-            self.base_pos + quat_apply(self.base_quat, self._sensor_translation)
+            self.base_pos + quat_apply(current_q, self._sensor_translation)
         )
 
-        lidar_points, lidar_dist = self.lidar_sensor.update()
-        points = lidar_points.view(self.num_envs, -1, 3)
-        dists = lidar_dist.view(self.num_envs, -1)
-
-        fresh = aggregate_range_image(
-            points,
-            dists,
-            self.airy_mapping,
-            max_range=float(self.cfg.lidar.effective_max_range),
-            r_min=float(self.cfg.lidar.min_range),
-        )
-        # README 2.4 empty-frame contract: stale envs keep the all-max_range
-        # empty frame only until this global scan, at which point they receive
-        # the fresh aggregate computed from their new pose.
-        refresh_range_image_from_scan(
-            self.range_image,
-            fresh,
-            self.range_image_stale,
+        # Same switch as initialization: controls train and play uniformly.
+        use_full = not bool(
+            getattr(self.cfg.lidar, "use_reduced_raycast", True)
         )
 
-        # Keep the latest noisy point cloud for debug-env visualization only.
-        # Cloning all 5760 rays for every env would waste ~100 MB at 1024 envs.
-        if self.viewer is not None and self._debug_env_ids:
-            ids = torch.tensor(
-                self._debug_env_ids, dtype=torch.long, device=self.device
+        if use_full:
+            lidar_points, lidar_dist = self.lidar_sensor.update()
+            points = lidar_points.view(self.num_envs, -1, 3)
+            dists = lidar_dist.view(self.num_envs, -1)
+
+            # Sensor frame -> body frame for debug visualization.
+            n_total = int(points.numel() // 3)
+            points_body = (
+                quat_apply(
+                    self._sensor_offset_quat[0:1].expand(n_total, 4),
+                    points.reshape(-1, 3),
+                ).reshape(self.num_envs, -1, 3)
+                + self._sensor_translation.unsqueeze(1)
             )
-            self._debug_points = points[ids].clone()
-            self._debug_dists = dists[ids].clone()
-            self._debug_base_pos = self.base_pos[ids].clone()
-            self._debug_base_quat = self.base_quat[ids].clone()
+
+            fresh = extract_selected_range_image(
+                dists,
+                self.selected_ray_indices,
+                self.range_max,
+            )
+            refresh_range_image_from_scan(
+                self.range_image,
+                fresh,
+                self.range_image_stale,
+            )
+
+            if self.viewer is not None and self._debug_env_ids:
+                self._debug_is_reduced = False
+                ids = torch.tensor(
+                    self._debug_env_ids, dtype=torch.long, device=self.device
+                )
+                self._debug_points = points_body[ids].clone()
+                self._debug_dists = dists[ids].clone()
+        else:
+            # Reduced 187-ray raycast: reuse the existing Warp kernel with a
+            # fixed ray-direction table.  This avoids raycasting the full
+            # 86,400-ray Airy pattern during training.
+            wp.launch(
+                kernel=LidarWarpKernels.draw_optimized_kernel_pointcloud,
+                dim=(self.num_envs, 1, ea2c.EA2_RANGE_DIM, 1),
+                inputs=[
+                    self.mesh_ids,
+                    self._lidar_positions_wp,
+                    self._lidar_quat_wp,
+                    self._reduced_ray_vectors,
+                    float(self.cfg.lidar.far_plane),
+                    self._reduced_lidar_warp,
+                    self._reduced_dist_warp,
+                    False,  # pointcloud_in_world_frame
+                ],
+                device=self.device,
+            )
+
+            lidar_points = wp.to_torch(self._reduced_lidar_warp)
+            lidar_dist = wp.to_torch(self._reduced_dist_warp)
+            lidar_points, lidar_dist = self._apply_noise(
+                self._noise_ctx, lidar_points, lidar_dist
+            )
+            dists = lidar_dist.view(self.num_envs, -1)
+            fresh = build_selected_range_image(dists, self.range_max)
+            refresh_range_image_from_scan(
+                self.range_image,
+                fresh,
+                self.range_image_stale,
+            )
+
+            # In reduced mode we still keep the 187 selected points for the
+            # viewer so play can show the red sampling cloud + envelope.
+            if self.viewer is not None and self._debug_env_ids:
+                self._debug_is_reduced = True
+                points = lidar_points.view(self.num_envs, -1, 3)
+                n_total = int(points.numel() // 3)
+                points_body = (
+                    quat_apply(
+                        self._sensor_offset_quat[0:1].expand(n_total, 4),
+                        points.reshape(-1, 3),
+                    ).reshape(self.num_envs, -1, 3)
+                    + self._sensor_translation.unsqueeze(1)
+                )
+                ids = torch.tensor(
+                    self._debug_env_ids, dtype=torch.long, device=self.device
+                )
+                self._debug_points = points_body[ids].clone()
+                self._debug_dists = dists[ids].clone()
 
     def _envelope_debug_points_world(self, env_id: int) -> np.ndarray:
         """Return the 6 body-frame envelope vertices in world frame.
@@ -857,8 +1035,6 @@ class EL_4090_EA2(BaseTask):
         self.gym.clear_lines(self.viewer)
 
         far_plane = float(self.cfg.lidar.far_plane)
-        max_r = float(self.cfg.lidar.effective_max_range)
-        r_min = float(self.cfg.lidar.min_range)
         stride = max(1, self._debug_point_stride)
 
         red_geom = gymutil.WireframeSphereGeometry(
@@ -872,27 +1048,26 @@ class EL_4090_EA2(BaseTask):
             if eid >= self.num_envs:
                 continue
             dists = self._debug_dists[k]
-            red, green = point_cloud_debug_masks(
+            red, green = selected_channel_mask(
                 dists,
-                self.airy_mapping,
-                far_plane=far_plane,
-                max_range=max_r,
-                r_min=r_min,
+                self.selected_ray_indices,
+                self._debug_is_reduced,
+                far_plane,
             )
 
-            pts_sensor = self._debug_points[k][::stride]
+            pts_body = self._debug_points[k][::stride]
             red = red[::stride]
             green = green[::stride]
-            n = pts_sensor.shape[0]
+            n = pts_body.shape[0]
 
-            # sensor frame -> body frame -> world frame
-            offset_q = self._sensor_offset_quat[eid : eid + 1].expand(n, 4)
-            pts_body = (
-                quat_apply(offset_q, pts_sensor)
-                + self._sensor_translation[eid : eid + 1]
+            # Body frame -> world frame using the *current* robot pose, so the
+            # point cloud and the envelope always share the same body frame.
+            base_q = yaw_quat_from_heading(
+                self.heading[eid : eid + 1]
+            ).expand(n, 4)
+            pts_world = self.base_pos[eid : eid + 1] + quat_apply(
+                base_q, pts_body
             )
-            base_q = self._debug_base_quat[k : k + 1].expand(n, 4)
-            pts_world = self._debug_base_pos[k] + quat_apply(base_q, pts_body)
             pts_world = pts_world.detach().cpu().numpy()
 
             red_pts = pts_world[red.cpu().numpy()]
@@ -937,34 +1112,50 @@ class EL_4090_EA2(BaseTask):
     # Path / reset
     # ------------------------------------------------------------------
 
-    def _sample_free_start_goal(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Sample a start/goal pair from the largest safe connected component."""
-        free = self._free_cells
-        if free.shape[0] == 0:
-            raise RuntimeError("map has no free cells")
-        start_idx = free[self._rng.integers(0, free.shape[0])]
-        start_xy = (
-            ea2c.EA2_WORLD_MIN_XY
-            + (start_idx[1] + 0.5) * ea2c.EA2_RESOLUTION_M,
-            ea2c.EA2_WORLD_MIN_XY
-            + (start_idx[0] + 0.5) * ea2c.EA2_RESOLUTION_M,
+    def _sample_start_xy(self) -> np.ndarray:
+        """Sample a spawn position inside the 4x4 tile area (exclude 5m border)."""
+        spawn = self._spawn_cells
+        if spawn.shape[0] == 0:
+            raise RuntimeError("map has no spawn cells inside the tile area")
+        idx = spawn[self._rng.integers(0, spawn.shape[0])]
+        return np.asarray(
+            (
+                ea2c.EA2_WORLD_MIN_XY
+                + (idx[1] + 0.5) * ea2c.EA2_RESOLUTION_M,
+                ea2c.EA2_WORLD_MIN_XY
+                + (idx[0] + 0.5) * ea2c.EA2_RESOLUTION_M,
+            ),
+            dtype=np.float64,
         )
 
-        # Goal must be clear of raw obstacles by cfg.path.goal_min_obstacle_dist.
+    def _sample_goal_xy(self) -> np.ndarray:
+        """Sample a goal inside the 4x4 tile area with obstacle clearance.
+
+        Goals use the same ``_spawn_cells`` as starts so the robot does not
+        navigate into the 5m outer border / open area.
+        """
+        free = self._spawn_cells
+        if free.shape[0] == 0:
+            raise RuntimeError("map has no goal cells inside the tile area")
         goal_clearance = float(self.cfg.path.goal_min_obstacle_dist)
         for _ in range(200):
             goal_idx = free[self._rng.integers(0, free.shape[0])]
-            goal_xy = (
-                ea2c.EA2_WORLD_MIN_XY
-                + (goal_idx[1] + 0.5) * ea2c.EA2_RESOLUTION_M,
-                ea2c.EA2_WORLD_MIN_XY
-                + (goal_idx[0] + 0.5) * ea2c.EA2_RESOLUTION_M,
+            goal_xy = np.asarray(
+                (
+                    ea2c.EA2_WORLD_MIN_XY
+                    + (goal_idx[1] + 0.5) * ea2c.EA2_RESOLUTION_M,
+                    ea2c.EA2_WORLD_MIN_XY
+                    + (goal_idx[0] + 0.5) * ea2c.EA2_RESOLUTION_M,
+                ),
+                dtype=np.float64,
             )
             if self._min_obstacle_distance_world(goal_xy) >= goal_clearance:
-                return np.asarray(start_xy, dtype=np.float64), np.asarray(
-                    goal_xy, dtype=np.float64
-                )
+                return goal_xy
         raise RuntimeError("could not sample a valid goal in 200 attempts")
+
+    def _sample_free_start_goal(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample a start/goal pair from the largest safe connected component."""
+        return self._sample_start_xy(), self._sample_goal_xy()
 
     def _min_obstacle_distance_world(self, xy) -> float:
         cells = np.argwhere(self.occupancy > 0)
@@ -974,9 +1165,9 @@ class EL_4090_EA2(BaseTask):
         ys = ea2c.EA2_WORLD_MIN_XY + (cells[:, 0].astype(np.float64) + 0.5) * ea2c.EA2_RESOLUTION_M
         return float(np.min(np.hypot(xs - float(xy[0]), ys - float(xy[1]))))
 
-    def _sample_new_path(self) -> PathData:
-        """Sample a feasible start/goal and plan one noisy A* path."""
-        path_cfg = PathCfg(
+    def _make_path_cfg(self) -> PathCfg:
+        """Build the current :class:`PathCfg` from the environment config."""
+        return PathCfg(
             speed_range=tuple(self.cfg.path.speed_range),
             resample_time_s=float(self.cfg.path.resample_time_s),
             delta_target_deg_range=tuple(self.cfg.path.delta_target_deg_range),
@@ -990,6 +1181,10 @@ class EL_4090_EA2(BaseTask):
             noise_fc_hz=float(self.cfg.path.noise_fc_hz),
             noise_retries=int(self.cfg.path.noise_retries),
         )
+
+    def _sample_new_path(self) -> PathData:
+        """Sample a feasible start/goal and plan one noisy A* path."""
+        path_cfg = self._make_path_cfg()
         last_err: Optional[Exception] = None
         for _ in range(40):
             try:
@@ -1008,6 +1203,43 @@ class EL_4090_EA2(BaseTask):
             f"failed to plan a path after 40 attempts: {last_err}"
         )
 
+    def _replan_from_current(self, env_id: int) -> None:
+        """Plan a new path from the current position to a new random goal.
+
+        Called when the robot reaches a goal.  The robot keeps its current
+        pose and naturally turns toward the new path tangent on the next
+        control step; no episode/GRU reset happens here.
+        """
+        # The robot has just reached the end of the current path; the new path
+        # must start exactly at that reached goal, not at the previous
+        # interpolated position.
+        start_xy = np.asarray(
+            self.paths[env_id].points[-1], dtype=np.float64
+        )
+        path_cfg = self._make_path_cfg()
+        last_err: Optional[Exception] = None
+        for _ in range(40):
+            try:
+                goal_xy = self._sample_goal_xy()
+                path = plan_path(
+                    self.occupancy,
+                    self.inflated,
+                    start_xy,
+                    goal_xy,
+                    path_cfg,
+                    self._rng,
+                )
+                self.paths[env_id] = path
+                self.s[env_id] = 0.0
+                self.tangent[env_id] = float(path.yaws[0])
+                self.tangent_rate[env_id] = 0.0
+                return
+            except (ValueError, RuntimeError) as err:
+                last_err = err
+        raise RuntimeError(
+            f"failed to replan from current position after 40 attempts: {last_err}"
+        )
+
     def _reset_one_env(self, env_id: int):
         path = self._sample_new_path()
         self.paths[env_id] = path
@@ -1017,13 +1249,6 @@ class EL_4090_EA2(BaseTask):
         self.s[env_id] = 0.0
         self.base_pos[env_id, 0] = float(start_xy[0])
         self.base_pos[env_id, 1] = float(start_xy[1])
-
-        # Body quaternion from yaw (z-up).
-        half = start_yaw * 0.5
-        self.base_quat[env_id, 0] = 0.0
-        self.base_quat[env_id, 1] = 0.0
-        self.base_quat[env_id, 2] = math.sin(half)
-        self.base_quat[env_id, 3] = math.cos(half)
 
         self.heading[env_id] = start_yaw
         self.tangent[env_id] = start_yaw
@@ -1067,7 +1292,26 @@ class EL_4090_EA2(BaseTask):
         # action-rate penalty.
         self.last_actions[env_id] = self.actions_mapped[env_id].clone()
         self.range_image_stale[env_id] = True
-        self.range_image[env_id] = float(self.cfg.lidar.effective_max_range)
+        self.range_image[env_id] = self.range_max
+
+    def _log_segment(self, env_ids):
+        """Log accumulated reward sums for a set of envs and reset the sums.
+
+        This is used both at full environment resets and at timeout boundaries
+        (the 40s timer), independently of whether the GRU memory is cleared.
+        """
+        if len(env_ids) == 0:
+            return
+        env_ids = env_ids.to(self.device)
+        ep = {}
+        for name in self.reward_scales.keys():
+            ep[f"rew_{name}"] = (
+                self.episode_sums[name][env_ids].mean()
+                / max(self.max_episode_length, 1)
+            )
+        self.extras["episode"] = ep
+        for name in self.reward_scales.keys():
+            self.episode_sums[name][env_ids] = 0.0
 
     def reset_idx(self, env_ids):
         """Reset selected envs and log episode metrics."""
@@ -1077,14 +1321,7 @@ class EL_4090_EA2(BaseTask):
         ids = env_ids.tolist()
 
         # Log before resetting the buffers.
-        if self.episode_sums["potential"][env_ids].sum() > 0.0 or True:
-            ep = {}
-            for name in self.reward_scales.keys():
-                ep[f"rew_{name}"] = (
-                    self.episode_sums[name][env_ids].mean()
-                    / max(self.max_episode_length, 1)
-                )
-            self.extras["episode"] = ep
+        self._log_segment(env_ids)
 
         for env_id in ids:
             self._reset_one_env(env_id)
@@ -1101,9 +1338,6 @@ class EL_4090_EA2(BaseTask):
             self.ego_motion[i, 0] = vx
             self.ego_motion[i, 1] = vy
             self.ego_motion[i, 2] = omega_out
-
-        for name in self.reward_scales.keys():
-            self.episode_sums[name][env_ids] = 0.0
 
         # Assign after the resets so the returned tensor is the live timeout
         # buffer; reset_one_env intentionally does not clear it.
@@ -1124,11 +1358,14 @@ class EL_4090_EA2(BaseTask):
             if path is None:
                 continue
 
-            # Advance arc length.
+            # Advance arc length.  Reaching the goal is a soft event: the
+            # robot keeps its pose and replans from the current position to a
+            # new random goal, so no episode/GRU reset is triggered.
             self.s[i] = self.s[i] + self.v[i] * dt
             if self.s[i] >= float(path.arc[-1]):
-                self.s[i] = float(path.arc[-1])
-                self.reset_buf[i] = 1
+                self._replan_from_current(i)
+                path = self.paths[i]
+                self.s[i] = 0.0
 
             xy, tangent, tangent_rate = interpolate_path(
                 path, float(self.s[i])
@@ -1223,7 +1460,7 @@ class EL_4090_EA2(BaseTask):
         self.obs_buf[:] = assemble_observation(
             self.range_image,
             self.ego_motion,
-            max_range=float(self.cfg.lidar.effective_max_range),
+            max_range=self.range_max,
         )
 
     # ------------------------------------------------------------------
@@ -1259,18 +1496,39 @@ class EL_4090_EA2(BaseTask):
 
         # Clear timeout before deciding dones (README 2.9).
         self.time_out_buf[:] = False
-        reached_end = torch.zeros_like(self.reset_buf, dtype=torch.bool)
-        for i in range(self.num_envs):
-            path = self.paths[i]
-            if path is not None and float(self.s[i]) >= float(path.arc[-1]):
-                reached_end[i] = True
-        self.reset_buf = reached_end.to(torch.long)
-        timeout = self.episode_length_buf >= self.max_episode_length
-        self.time_out_buf = timeout
-        self.reset_buf |= timeout.to(torch.long)
 
+        # Rewards are accumulated before timeout logging so the timeout step's
+        # reward is included in the segment being logged.
         self._compute_rewards()
-        env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+
+        # Goal arrival is handled as a soft replan inside _step_kinematics, so
+        # in the normal loop there are no hard environment resets.  Keep a
+        # separate hard-reset buffer for any future true reset condition.
+        hard_reset = torch.zeros_like(self.reset_buf, dtype=torch.bool)
+
+        # 40s timeout timer: every timeout restarts the timer and logs a
+        # segment; only a probabilistic subset also clears the GRU memory.
+        timeout = self.episode_length_buf >= self.max_episode_length
+        timeout_ids = timeout.nonzero(as_tuple=False).flatten()
+        if len(timeout_ids) > 0:
+            self.episode_length_buf[timeout_ids] = 0
+            self._log_segment(timeout_ids)
+            prob = float(getattr(self.cfg.env, "memory_reset_prob", 0.0))
+            memory_reset = (
+                torch.rand(len(timeout_ids), device=self.device) < prob
+            )
+            self.memory_reset_buf[:] = False
+            self.memory_reset_buf[timeout_ids] = memory_reset
+        else:
+            self.memory_reset_buf[:] = False
+
+        # done signal returned to PPO: memory resets are non-terminal
+        # truncations that clear the recurrent hidden state via policy.reset,
+        # while time_out makes PPO bootstrap the value at that boundary.
+        self.reset_buf = (hard_reset | self.memory_reset_buf).to(torch.long)
+        self.time_out_buf = self.memory_reset_buf.clone()
+
+        env_ids = hard_reset.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
         self._compute_observations()
 

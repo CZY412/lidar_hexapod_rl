@@ -1,19 +1,17 @@
-"""Airy sensor mounting, selected-channel mapping table and body-frame checks.
+"""Airy sensor mounting and fixed 187-channel selection for envelope_adaptive_2.
 
-This module implements the v2 Airy mounting/bucketing contract:
+This module selects the 187 channels used by the EA2 fixed ground-grid
+observation:
 
-* ``EA2_SENSOR_OFFSET_RPY`` maps the sensor frame into the body frame using the
-  same quaternion convention as ``LidarSensor`` (``quat_from_euler_xyz`` then
-  ``quat_apply``).
-* The mapping table is azimuth-major (``i = az * 96 + el``) and selects
-  physical azimuth channels 18..42 and elevation lines 6..95, producing 450
-  row-major bucket indices (``flat = row * 25 + col``).
-* ``self_check_mapping_table`` verifies the table and the selected body-frame
-  ray coverage so mounting mistakes are caught at import/test time.
+* full Airy pattern: 900 azimuth x 96 elevation = 86,400 rays;
+* body-frame ground region: x in [0.65, 3.65], y in [-1, 1];
+* 11 rows (x) x 17 cols (y) = 187 cells;
+* each cell keeps the ray whose ground hit is closest to the cell centre;
+* the normalization divisor is the maximum slant distance among the selected
+  channels, rounded up to 0.1 m.
 
 The quaternion helpers are local reproductions of ``isaacgym.torch_utils``
-formulas, so this module remains importable even when the GPU/Isaac runtime is
-not available.
+formulas, so this module remains importable without Isaac Gym.
 """
 
 from __future__ import annotations
@@ -25,15 +23,20 @@ from typing import Dict, Optional, Union
 import torch
 
 from ._contracts import (
-    EA2_AIRY_N_AZIMUTH,
+    EA2_AIRY_N_AZIMUTH_FULL,
     EA2_AIRY_N_ELEVATION,
-    EA2_MAPPING_TABLE_FILE,
-    EA2_N_COLS,
-    EA2_N_RAYS,
-    EA2_N_ROWS,
+    EA2_AIRY_HORIZONTAL_RES_DEG,
+    EA2_BASE_HEIGHT_M,
+    EA2_FULL_N_RAYS,
+    EA2_GRID_COLS,
+    EA2_GRID_ROWS,
     EA2_RANGE_DIM,
-    EA2_SELECTED_AZ,
-    EA2_SELECTED_EL,
+    EA2_REGION_X_MAX,
+    EA2_REGION_X_MIN,
+    EA2_REGION_Y_MAX,
+    EA2_REGION_Y_MIN,
+    EA2_SELECTED_CHANNELS_FILE,
+    EA2_SENSOR_OFFSET_POS,
     EA2_SENSOR_OFFSET_RPY,
 )
 
@@ -43,16 +46,7 @@ _DEG2RAD = math.pi / 180.0
 
 
 def _quat_from_euler_xyz(roll: float, pitch: float, yaw: float) -> torch.Tensor:
-    """Build an xyzw quaternion from XYZ Euler angles (same as torch_utils).
-
-    Args:
-        roll: Rotation about x-axis, radians.
-        pitch: Rotation about y-axis, radians.
-        yaw: Rotation about z-axis, radians.
-
-    Returns:
-        Quaternion tensor of shape ``(4,)`` in ``[x, y, z, w]`` order.
-    """
+    """Build an xyzw quaternion from XYZ Euler angles (same as torch_utils)."""
     cy = math.cos(yaw * 0.5)
     sy = math.sin(yaw * 0.5)
     cr = math.cos(roll * 0.5)
@@ -68,58 +62,17 @@ def _quat_from_euler_xyz(roll: float, pitch: float, yaw: float) -> torch.Tensor:
 
 
 def _quat_apply(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Apply quaternion rotation(s) to vector(s), matching torch_utils.
-
-    Args:
-        q: Quaternion(s) of shape ``(..., 4)`` in ``[x, y, z, w]`` order.
-        v: Vector(s) of shape ``(..., 3)``.
-
-    Returns:
-        Rotated vector(s) of shape ``(..., 3)``.
-    """
+    """Apply quaternion rotation(s) to vector(s), matching torch_utils."""
     xyz = q[..., :3]
     t = torch.cross(xyz, v, dim=-1) * 2.0
     return v + q[..., 3:] * t + torch.cross(xyz, t, dim=-1)
 
 
-def build_airy_mapping_table() -> torch.Tensor:
-    """Build the 5760 -> 450 Airy bucket mapping table.
-
-    Ray index ``i = az * 96 + el`` follows the Airy C-order flattening.  A ray
-    is mapped only when ``az in 18..42`` and ``el in 6..95``.  The mapped value
-    is the row-major bucket index ``(el - 6) // 5 * 25 + (az - 18)``; all other
-    entries are ``-1``.
+def generate_full_airy_directions() -> torch.Tensor:
+    """Generate the full Airy sensor-frame ray directions.
 
     Returns:
-        Integer tensor of shape ``(5760,)`` with dtype ``int64``.
-    """
-    table = torch.full((EA2_N_RAYS,), -1, dtype=torch.int64)
-
-    az = torch.tensor(EA2_SELECTED_AZ, dtype=torch.int64)
-    el = torch.tensor(EA2_SELECTED_EL, dtype=torch.int64)
-
-    az_grid = az.view(-1, 1).expand(len(EA2_SELECTED_AZ), len(EA2_SELECTED_EL)).reshape(-1)
-    el_grid = el.view(1, -1).expand(len(EA2_SELECTED_AZ), len(EA2_SELECTED_EL)).reshape(-1)
-
-    ray_indices = az_grid * EA2_AIRY_N_ELEVATION + el_grid
-    rows = (el_grid - int(EA2_SELECTED_EL[0])) // 5
-    cols = az_grid - int(EA2_SELECTED_AZ[0])
-    bucket_indices = rows * EA2_N_COLS + cols
-    table[ray_indices] = bucket_indices
-    return table
-
-
-def body_frame_ray_directions() -> torch.Tensor:
-    """Return all 5760 Airy ray directions expressed in the body frame.
-
-    Uses the same spherical formula and mounting convention as ``LidarSensor``:
-    sensor frame ``x = cos(phi)cos(theta)``, ``y = cos(phi)sin(theta)``,
-    ``z = sin(phi)`` with theta = 0..360 deg / 60 channels and phi = 0..90 deg /
-    96 lines, then applies the body->sensor offset rotation to express each
-    direction in the body frame.
-
-    Returns:
-        Float tensor of shape ``(5760, 3)`` with dtype ``float32``.
+        Float tensor of shape ``(86400, 3)``, C-order ``az * 96 + el``.
     """
     phi = (
         torch.arange(EA2_AIRY_N_ELEVATION, dtype=torch.float64)
@@ -127,9 +80,9 @@ def body_frame_ray_directions() -> torch.Tensor:
         / (EA2_AIRY_N_ELEVATION - 1)
     )
     theta = (
-        torch.arange(EA2_AIRY_N_AZIMUTH, dtype=torch.float64)
+        torch.arange(EA2_AIRY_N_AZIMUTH_FULL, dtype=torch.float64)
         * (2.0 * math.pi)
-        / EA2_AIRY_N_AZIMUTH
+        / EA2_AIRY_N_AZIMUTH_FULL
     )[:, None]
 
     cos_phi = torch.cos(phi)
@@ -141,172 +94,203 @@ def body_frame_ray_directions() -> torch.Tensor:
         [
             cos_phi[None, :] * cos_theta,
             cos_phi[None, :] * sin_theta,
-            sin_phi[None, :].expand(EA2_AIRY_N_AZIMUTH, EA2_AIRY_N_ELEVATION),
+            sin_phi[None, :].expand(
+                EA2_AIRY_N_AZIMUTH_FULL, EA2_AIRY_N_ELEVATION
+            ),
         ],
         dim=-1,
     ).reshape(-1, 3)
+    return sensor_dirs
 
+
+def body_frame_ray_directions() -> torch.Tensor:
+    """Return all full Airy ray directions expressed in the body frame."""
+    sensor_dirs = generate_full_airy_directions()
     offset_q = _quat_from_euler_xyz(*EA2_SENSOR_OFFSET_RPY)
     body_dirs = _quat_apply(
-        offset_q.view(1, 4).expand(EA2_N_RAYS, 4), sensor_dirs
+        offset_q.view(1, 4).expand(EA2_FULL_N_RAYS, 4), sensor_dirs
     )
     return body_dirs.to(dtype=torch.float32)
 
 
-def self_check_mapping_table(table: torch.Tensor) -> Dict[str, object]:
-    """Run the mandatory Airy mounting/mapping self-checks.
-
-    Asserts the README/contract invariants:
-
-    * table shape is ``(5760,)`` and uses ``int64``;
-    * all 25 x 90 selected rays (2250) map to exactly 450 valid row-major
-      bucket indices;
-    * every selected ray has body-frame ``x > 0``, body azimuth in
-      ``[-80, +80]`` deg and body elevation in ``[-25, +70]`` deg;
-    * the table is exactly equal to a freshly built table (flatten-index
-      formula ``i = az * 96 + el`` and row-major bucket formula agree).
-
-    Args:
-        table: Mapping table produced by :func:`build_airy_mapping_table`.
+def _ground_hits_in_region() -> tuple:
+    """Compute body-frame ground hits for all downward full-Airy rays.
 
     Returns:
-        Dict with summary values for logging/debugging.
+        ``(valid_indices, hit_xy, slant_ranges)`` where ``valid_indices`` are
+        full ray indices with ``dir_z < 0``, ``hit_xy`` is ``(N, 2)`` and
+        ``slant_ranges`` is ``(N,)``.
     """
-    if not isinstance(table, torch.Tensor):
-        raise AssertionError("mapping table must be a torch.Tensor")
-    if table.shape != (EA2_N_RAYS,):
-        raise AssertionError(
-            f"mapping table shape must be {(EA2_N_RAYS,)}, got {tuple(table.shape)}"
-        )
-    if table.dtype != torch.int64:
-        raise AssertionError(f"mapping table dtype must be int64, got {table.dtype}")
+    sensor_pos = torch.tensor(EA2_SENSOR_OFFSET_POS, dtype=torch.float64)
+    body_dirs = body_frame_ray_directions().to(dtype=torch.float64)
 
-    expected = build_airy_mapping_table()
-    if not torch.equal(table, expected):
-        raise AssertionError("mapping table does not match the fresh built table")
+    downward = body_dirs[:, 2] < 0.0
+    valid_indices = torch.nonzero(downward, as_tuple=False).squeeze(1)
+    dirs = body_dirs[valid_indices]
 
-    mapped_mask = table >= 0
-    n_mapped = int(mapped_mask.sum().item())
-    n_expected_rays = len(EA2_SELECTED_AZ) * len(EA2_SELECTED_EL)
-    if n_mapped != n_expected_rays:
-        raise AssertionError(
-            f"expected {n_expected_rays} mapped rays, got {n_mapped}"
-        )
+    # The body frame origin is at the robot base height, so the ground plane
+    # in body coordinates is z = -EA2_BASE_HEIGHT_M.
+    ground_z = -EA2_BASE_HEIGHT_M
+    t = (ground_z - sensor_pos[2]) / dirs[:, 2]
+    hit_xy = sensor_pos[:2].unsqueeze(0) + dirs[:, :2] * t.unsqueeze(-1)
+    slant_ranges = t  # dirs are unit length
+    return valid_indices, hit_xy, slant_ranges
 
-    mapped_indices = torch.nonzero(mapped_mask, as_tuple=False).squeeze(1)
-    az = mapped_indices // EA2_AIRY_N_ELEVATION
-    el = mapped_indices % EA2_AIRY_N_ELEVATION
 
-    if az.min().item() != EA2_SELECTED_AZ[0] or az.max().item() != EA2_SELECTED_AZ[-1]:
-        raise AssertionError("selected azimuth channels differ from 18..42")
-    if el.min().item() != EA2_SELECTED_EL[0] or el.max().item() != EA2_SELECTED_EL[-1]:
-        raise AssertionError("selected elevation lines differ from 6..95")
+def select_ground_grid_channels() -> Dict[str, object]:
+    """Select the fixed 187 channels for the EA2 ground grid.
 
-    rows = (el - int(EA2_SELECTED_EL[0])) // 5
-    cols = az - int(EA2_SELECTED_AZ[0])
-    expected_buckets = rows * EA2_N_COLS + cols
-    if not torch.equal(table[mapped_indices], expected_buckets):
-        raise AssertionError("row-major bucket formula mismatch")
+    Returns:
+        Dict with ``ray_indices``, ``ray_directions``, ``cell_centers``,
+        ``ground_hits``, ``slant_ranges`` and ``max_range``.
+    """
+    valid_indices, hit_xy, slant_ranges = _ground_hits_in_region()
 
-    if (
-        mapped_indices.numel() != n_expected_rays
-        or len(torch.unique(mapped_indices)) != n_expected_rays
-    ):
-        raise AssertionError(
-            "mapped ray index set is not the expected 2250 unique rays"
-        )
+    xs = torch.linspace(
+        EA2_REGION_X_MIN, EA2_REGION_X_MAX, EA2_GRID_ROWS, dtype=torch.float64
+    )
+    ys = torch.linspace(
+        EA2_REGION_Y_MIN, EA2_REGION_Y_MAX, EA2_GRID_COLS, dtype=torch.float64
+    )
+    gx, gy = torch.meshgrid(xs, ys, indexing="ij")
+    centers = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)  # (187, 2)
 
-    n_unique_buckets = int(table[mapped_mask].unique().numel())
-    if n_unique_buckets != EA2_RANGE_DIM:
-        raise AssertionError(
-            f"expected {EA2_RANGE_DIM} unique bucket ids, got {n_unique_buckets}"
-        )
+    # Distance from each cell centre to each valid ground hit.
+    dist2 = (
+        (centers[:, None, :] - hit_xy[None, :, :]) ** 2
+    ).sum(dim=-1)  # (187, N_valid)
+    nearest = torch.argmin(dist2, dim=1)  # (187,)
 
-    dirs = body_frame_ray_directions()[mapped_indices]
-    body_x = dirs[:, 0]
-    if not bool((body_x > 0.0).all()):
-        raise AssertionError("not all selected rays have body-frame x > 0")
+    selected_full_indices = valid_indices[nearest]
+    selected_hits = hit_xy[nearest]
+    selected_slant = slant_ranges[nearest]
+    # The Warp raycast kernel expects SENSOR-frame ray directions.  Storing
+    # body-frame directions here would cause a double rotation and misaligned
+    # point clouds in the reduced-raycast path.
+    selected_dirs = generate_full_airy_directions().to(dtype=torch.float32)[
+        selected_full_indices
+    ]
 
-    azimuth_deg = torch.atan2(dirs[:, 1], dirs[:, 0]) / _DEG2RAD
-    elevation_deg = torch.asin(
-        dirs[:, 2] / torch.norm(dirs, dim=1).clamp_min(1e-6)
-    ) / _DEG2RAD
-
-    if azimuth_deg.min().item() < -80.0 or azimuth_deg.max().item() > 80.0:
-        raise AssertionError(
-            f"selected body azimuth outside [-80, 80] deg: "
-            f"[{azimuth_deg.min().item():.3f}, {azimuth_deg.max().item():.3f}]"
-        )
-    if elevation_deg.min().item() < -25.0 or elevation_deg.max().item() > 70.0:
-        raise AssertionError(
-            f"selected body elevation outside [-25, 70] deg: "
-            f"[{elevation_deg.min().item():.3f}, {elevation_deg.max().item():.3f}]"
-        )
+    max_slant = float(selected_slant.max().item())
+    max_range = math.ceil(max_slant * 10.0) / 10.0
 
     return {
-        "table_shape": tuple(table.shape),
-        "dtype": str(table.dtype),
-        "n_mapped": n_mapped,
-        "n_unique_buckets": n_unique_buckets,
-        "range_dim": EA2_RANGE_DIM,
-        "azimuth_deg_range": (
-            float(azimuth_deg.min().item()),
-            float(azimuth_deg.max().item()),
-        ),
-        "elevation_deg_range": (
-            float(elevation_deg.min().item()),
-            float(elevation_deg.max().item()),
-        ),
-        "all_body_x_positive": True,
-        "mapping_formula_consistent": True,
+        "ray_indices": selected_full_indices.to(dtype=torch.long),
+        "ray_directions": selected_dirs,  # sensor frame, (187, 3)
+        "cell_centers": centers.to(dtype=torch.float32),
+        "ground_hits": selected_hits.to(dtype=torch.float32),
+        "slant_ranges": selected_slant.to(dtype=torch.float32),
+        "max_range": float(max_range),
+        "grid_rows": int(EA2_GRID_ROWS),
+        "grid_cols": int(EA2_GRID_COLS),
     }
 
 
-def save_airy_mapping_table(
-    table: torch.Tensor, path: Optional[PathLike] = None
+def save_selected_channels(
+    data: Dict[str, object], path: Optional[PathLike] = None
 ) -> Path:
-    """Save the mapping table to ``.pt``.
-
-    Args:
-        table: Mapping table tensor to persist.
-        path: Destination path; defaults to ``EA2_MAPPING_TABLE_FILE``.
-
-    Returns:
-        The resolved path that was written.
-    """
+    """Save the selected-channel dictionary to ``.pt``."""
     if path is None:
-        path = EA2_MAPPING_TABLE_FILE
+        path = EA2_SELECTED_CHANNELS_FILE
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(table, path)
+    torch.save(data, path)
     return path
 
 
-def load_airy_mapping_table(path: Optional[PathLike] = None) -> torch.Tensor:
-    """Load a mapping table from ``.pt``.
-
-    Args:
-        path: Source path; defaults to ``EA2_MAPPING_TABLE_FILE``.
-
-    Returns:
-        The loaded mapping table tensor.
-    """
+def load_selected_channels(
+    path: Optional[PathLike] = None,
+) -> Dict[str, object]:
+    """Load the selected-channel dictionary from ``.pt``."""
     if path is None:
-        path = EA2_MAPPING_TABLE_FILE
+        path = EA2_SELECTED_CHANNELS_FILE
     return torch.load(Path(path), map_location="cpu")
 
 
+def self_check_selected_channels(data: Dict[str, object]) -> Dict[str, object]:
+    """Validate the selected-channel dictionary."""
+    ray_indices = data["ray_indices"]
+    ray_directions = data["ray_directions"]
+    cell_centers = data["cell_centers"]
+    ground_hits = data["ground_hits"]
+    slant_ranges = data["slant_ranges"]
+    max_range = float(data["max_range"])
+
+    if ray_indices.shape != (EA2_RANGE_DIM,):
+        raise AssertionError(
+            f"ray_indices shape must be {(EA2_RANGE_DIM,)}, got {tuple(ray_indices.shape)}"
+        )
+    if ray_indices.dtype != torch.long:
+        raise AssertionError(f"ray_indices dtype must be long, got {ray_indices.dtype}")
+    if len(torch.unique(ray_indices)) != EA2_RANGE_DIM:
+        raise AssertionError("selected ray indices are not unique")
+
+    if ray_directions.shape != (EA2_RANGE_DIM, 3):
+        raise AssertionError(
+            f"ray_directions shape must be {(EA2_RANGE_DIM, 3)}, "
+            f"got {tuple(ray_directions.shape)}"
+        )
+    if cell_centers.shape != (EA2_RANGE_DIM, 2):
+        raise AssertionError(
+            f"cell_centers shape must be {(EA2_RANGE_DIM, 2)}, "
+            f"got {tuple(cell_centers.shape)}"
+        )
+    if ground_hits.shape != (EA2_RANGE_DIM, 2):
+        raise AssertionError(
+            f"ground_hits shape must be {(EA2_RANGE_DIM, 2)}, "
+            f"got {tuple(ground_hits.shape)}"
+        )
+    if slant_ranges.shape != (EA2_RANGE_DIM,):
+        raise AssertionError(
+            f"slant_ranges shape must be {(EA2_RANGE_DIM,)}, "
+            f"got {tuple(slant_ranges.shape)}"
+        )
+
+    # All selected ground hits must lie inside the requested region, with a
+    # small tolerance for discrete ray coverage near the boundary.
+    margin = 0.15
+    in_region = (
+        (ground_hits[:, 0] >= EA2_REGION_X_MIN - margin)
+        & (ground_hits[:, 0] <= EA2_REGION_X_MAX + margin)
+        & (ground_hits[:, 1] >= EA2_REGION_Y_MIN - margin)
+        & (ground_hits[:, 1] <= EA2_REGION_Y_MAX + margin)
+    )
+    if not bool(in_region.all()):
+        raise AssertionError("some selected ground hits fall outside the region")
+
+    # max_range must be the max slant rounded up to 0.1 m.
+    expected_max = math.ceil(float(slant_ranges.max().item()) * 10.0) / 10.0
+    if abs(max_range - expected_max) > 1e-9:
+        raise AssertionError(
+            f"max_range {max_range} does not match expected {expected_max}"
+        )
+
+    # Stored ray_directions must be in SENSOR frame: rotating them by the
+    # sensor offset must reproduce the body-frame directions of the selected
+    # full-Airy rays.  This prevents the double-rotation bug in the reduced
+    # raycast path.
+    offset_q = _quat_from_euler_xyz(*EA2_SENSOR_OFFSET_RPY)
+    expected_body = body_frame_ray_directions()[ray_indices]
+    actual_body = _quat_apply(
+        offset_q.view(1, 4).expand(ray_directions.shape[0], 4),
+        ray_directions.to(dtype=torch.float64),
+    ).to(dtype=torch.float32)
+    if not torch.allclose(actual_body, expected_body, atol=1e-4, rtol=1e-4):
+        raise AssertionError("ray_directions are not in sensor frame")
+
+    return {
+        "n_channels": int(ray_indices.shape[0]),
+        "unique": True,
+        "max_range": max_range,
+        "grid_shape": (int(data["grid_rows"]), int(data["grid_cols"])),
+        "all_hits_in_region": True,
+    }
+
+
 def save_body_ray_projection(path: PathLike) -> Optional[Path]:
-    """Save a 2D azimuth/elevation projection of selected body-frame rays.
+    """Save a 2D azimuth/elevation projection of the selected body-frame rays.
 
-    This is an optional debug aid (README §2.3.5 item 3).  It writes a PNG only
-    when an explicit ``path`` is supplied and matplotlib is installed.
-
-    Args:
-        path: Destination PNG path.
-
-    Returns:
-        The written path, or ``None`` if matplotlib is unavailable.
+    Optional debug aid; returns ``None`` if matplotlib is unavailable.
     """
     path = Path(path)
     try:
@@ -317,18 +301,23 @@ def save_body_ray_projection(path: PathLike) -> Optional[Path]:
     except Exception:  # pragma: no cover - environment-specific
         return None
 
-    table = build_airy_mapping_table()
-    dirs = body_frame_ray_directions()[table >= 0]
-    azimuth_deg = torch.atan2(dirs[:, 1], dirs[:, 0]) / _DEG2RAD
+    data = load_selected_channels()
+    dirs = data["ray_directions"]
+    # Convert sensor-frame selected directions to body frame for plotting.
+    offset_q = _quat_from_euler_xyz(*EA2_SENSOR_OFFSET_RPY)
+    body_dirs = _quat_apply(
+        offset_q.view(1, 4).expand(dirs.shape[0], 4), dirs.to(dtype=torch.float64)
+    )
+    azimuth_deg = torch.atan2(body_dirs[:, 1], body_dirs[:, 0]) / _DEG2RAD
     elevation_deg = torch.asin(
-        dirs[:, 2] / torch.norm(dirs, dim=1).clamp_min(1e-6)
+        body_dirs[:, 2] / torch.norm(body_dirs, dim=1).clamp_min(1e-6)
     ) / _DEG2RAD
 
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.scatter(azimuth_deg.numpy(), elevation_deg.numpy(), s=6)
     ax.set_xlabel("body azimuth (deg)")
     ax.set_ylabel("body elevation (deg)")
-    ax.set_title("Airy selected rays in body frame")
+    ax.set_title("EA2 selected 187 Airy rays in body frame")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=150)

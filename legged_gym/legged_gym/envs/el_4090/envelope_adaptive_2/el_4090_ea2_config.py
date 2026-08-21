@@ -20,11 +20,12 @@ class El4090EA2Cfg(LeggedRobotCfg):
 
     class env(LeggedRobotCfg.env):
         num_envs = 1024  # start small; benchmark A*/raycast before scaling
-        num_observations = 453          # 450 range + 3 ego-motion
+        num_observations = 190          # 187 selected channels + 3 ego-motion
         num_privileged_obs = None       # no asymmetric critic
         num_actions = 5                 # raw envelope params (sigmoid-affine in env)
         env_spacing = 0.                # all envs share the single global map origin
-        episode_length_s = 20.
+        episode_length_s = 40.          # timeout timer for probabilistic GRU reset
+        memory_reset_prob = 0.15        # probability to clear GRU at each timeout
         send_timeouts = True
 
     class sim(LeggedRobotCfg.sim):
@@ -50,8 +51,6 @@ class El4090EA2Cfg(LeggedRobotCfg):
         size_m = 74.0                   # 4 x 4 tiles (16m) + 5m border each side
         resolution_m = 0.1
         grid_shape = [740, 740]
-        world_min_xy = -37.0
-        world_max_xy = 37.0
         # No physical boundary walls.  When True, only the *inflated planning*
         # grid border is blocked so A* keeps the robot inside the map.
         boundary_occupied = True
@@ -71,8 +70,8 @@ class El4090EA2Cfg(LeggedRobotCfg):
 
     class obstacles:
         # pd_gru_lidar pillar_field_terrain parameters (per 16m x 16m tile)
-        pillar_count_min = 0
-        pillar_count_max = 12
+        pillar_count_min = 15
+        pillar_count_max = 15
         pillar_size_x_min = 0.5
         pillar_size_x_max = 4.0
         pillar_size_y_min = 0.5
@@ -80,7 +79,7 @@ class El4090EA2Cfg(LeggedRobotCfg):
         pillar_height_min = 1.0
         pillar_height_max = 2.0
         pillar_min_separation = 2.2
-        pillar_center_clear_radius = 3.0
+        pillar_center_clear_radius = 2.2
         pillar_spawn_radius = 7.5
         pillar_allow_height_variation = True
 
@@ -112,17 +111,17 @@ class El4090EA2Cfg(LeggedRobotCfg):
         wobble_fc_hz = 1.0
 
     class lidar:
-        enable = True
-        airy_n_azimuth = 60
+        airy_n_azimuth = 900
         airy_n_elevation = 96
-        airy_horizontal_res_deg = 6.0
-        airy_vertical_fov_deg = [0.0, 90.0]
+        airy_horizontal_resolution_deg = 0.4
+        airy_vertical_fov_deg = [0, 90.0]
         far_plane = 60.0                 # LidarConfig.max_range
-        min_range = 0.2                  # aggregation-side only (kernel ignores it)
+        min_range = 0.2                  # kept for compatibility; not used by 187-channel path
         update_frequency_hz = 10.0
-        effective_max_range = 5.0        # 450-bucket valid range + normalization
-        offset_pos = [0.0, 0.0, -0.05]   # legacy envelope_adaptive body placement
-        sensor_offset_rpy = [0.0, math.pi / 2.0 + 0.35, 0.0]
+        effective_max_range = 3.2        # max slant of selected 187 channels
+        use_reduced_raycast = True       # train with only the 187 fixed channels
+        offset_pos = [0.7, 0.0, -0.05]   # current EA2 sensor placement
+        sensor_offset_rpy = [0.0, math.pi / 2.0 + 0.1, 0.0]
         pointcloud_in_world_frame = False
         randomize_placement = False
 
@@ -139,14 +138,9 @@ class El4090EA2Cfg(LeggedRobotCfg):
 
     class envelope:
         margin = 0.05                    # exact half-plane offset for collision
-        # 5 params + 3 priors are loaded from spider_envelop config at runtime:
-        # legged_gym.utils.envelop.network.haa_swing_range.load_envelope_condition_spec
-        spec_config_path = (
-            "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"
-            "spider_envelop/el4090_spider_config.py"
-        )
+        # 5 params + 3 priors are loaded from the frozen contract path
+        # (_contracts.ENVELOPE_SPEC_CONFIG_PATH).
         # spider_envelop_2-style bold footprint drawing
-        debug_env_ids = [0]
         debug_color = (0.0, 0.85, 1.0)
         debug_line_radius = 0.012
         debug_line_samples = 8
@@ -158,8 +152,6 @@ class El4090EA2Cfg(LeggedRobotCfg):
             potential = 1.0
             collision = -2.0
             action_rate = -0.01
-
-        collision_eps = 1e-6
 
     class normalization:
         clip_observations = 100.

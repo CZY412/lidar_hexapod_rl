@@ -213,7 +213,7 @@ def collision_cell_ratio(
             occupied.
         world_to_grid_fn: Callable mapping world ``(..., 2)`` coordinates to
             integer grid indices ``(..., 2)``.  Defaults to the canonical EA2
-            mapping ``ix = floor((x + 6.0) / 0.1)``, ``iy = floor((y + 6.0) /
+            mapping ``ix = floor((x + 37.0) / 0.1)``, ``iy = floor((y + 37.0) /
             0.1)``.
 
     Returns:

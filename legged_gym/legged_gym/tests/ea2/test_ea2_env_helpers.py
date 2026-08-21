@@ -26,10 +26,11 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_env import (
     map_actions_to_params,
     potential_reward,
     refresh_range_image_from_scan,
-    point_cloud_debug_masks,
+    selected_channel_mask,
     sway_position_acceptable,
     sway_update,
     wrap_to_pi,
+    yaw_quat_from_heading,
 )
 from legged_gym.envs.el_4090.envelope_adaptive_2.path_planner import PathData
 
@@ -49,33 +50,6 @@ def _straight_path(length: float = 8.0, step: float = 0.2) -> PathData:
     arc = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
     yaws = np.zeros_like(xs)
     return PathData(points=points, yaws=yaws, arc=arc)
-
-
-def test_point_cloud_debug_masks_match_readme_27() -> None:
-    """Red/green classification follows README 2.7."""
-    mapping = torch.full((8,), -1, dtype=torch.int64)
-    mapping[1] = 0
-    mapping[3] = 1
-    dists = torch.tensor(
-        [
-            [0.1, 2.0, 4.9, 5.1, 60.0, 0.5, 5.0, 60.0],
-            [0.1, 2.0, 4.9, 5.1, 60.0, 0.5, 5.0, 60.0],
-        ],
-        dtype=torch.float32,
-    )
-    red, green = point_cloud_debug_masks(
-        dists,
-        mapping,
-        far_plane=60.0,
-        max_range=5.0,
-        r_min=0.2,
-    )
-    # red: mapped channels inside [0.2, 5.0] and real hits
-    assert red[0].tolist() == [False, True, False, False, False, False, False, False]
-    # green: every real hit that is not red (below/above agg range included)
-    assert green[0].tolist() == [True, False, True, True, False, True, True, False]
-    # no-hit 60 m is neither red nor green
-    assert not red[:, 4].any() and not green[:, 4].any()
 
 
 def test_height_step_converges_to_target_and_stays_in_bounds() -> None:
@@ -227,24 +201,31 @@ def test_action_rate_term() -> None:
 
 
 def test_assemble_observation_shape_and_normalization() -> None:
-    """Obs = normalized range (450) + normalized ego (3)."""
-    range_image = torch.full((2, 450), 5.0, dtype=torch.float32)
+    """Obs = normalized range (187) + normalized ego (3)."""
+    range_image = torch.full(
+        (2, ea2c.EA2_RANGE_DIM), ea2c.EA2_RANGE_MAX_M, dtype=torch.float32
+    )
     range_image[0, 0] = 2.5
     ego = torch.tensor(
         [[0.75, 0.5, 0.75], [0.0, 0.0, 0.0]], dtype=torch.float32
     )
     obs = assemble_observation(range_image, ego)
-    assert obs.shape == (2, 453)
-    assert obs[0, 0].item() == pytest.approx(0.5, abs=1e-6)
-    assert obs[0, 1:450].abs().max().item() == pytest.approx(1.0, abs=1e-6)
-    assert obs[0, 450:].tolist() == pytest.approx([0.5, 0.5, 0.5], abs=1e-6)
+    assert obs.shape == (2, ea2c.EA2_RANGE_DIM + 3)
+    assert obs[0, 0].item() == pytest.approx(2.5 / ea2c.EA2_RANGE_MAX_M, abs=1e-6)
+    assert (
+        obs[0, 1 : ea2c.EA2_RANGE_DIM].abs().max().item()
+        == pytest.approx(1.0, abs=1e-6)
+    )
+    assert obs[0, ea2c.EA2_RANGE_DIM :].tolist() == pytest.approx(
+        [0.5, 0.5, 0.5], abs=1e-6
+    )
 
 
 def test_empty_range_image() -> None:
     """Empty-frame reset returns a full-max_range buffer."""
-    img = empty_range_image(4, max_range=5.0)
-    assert img.shape == (4, 450)
-    assert bool((img == 5.0).all())
+    img = empty_range_image(4, max_range=ea2c.EA2_RANGE_MAX_M)
+    assert img.shape == (4, ea2c.EA2_RANGE_DIM)
+    assert bool((img == ea2c.EA2_RANGE_MAX_M).all())
 
 
 def test_refresh_range_image_from_scan_gives_stale_envs_fresh_frame() -> None:
@@ -297,6 +278,70 @@ def test_wrap_to_pi() -> None:
     assert bool((wrapped >= -math.pi - 1e-6).all())
     assert bool((wrapped < math.pi - 1e-6).all())
     assert wrapped[0].item() == pytest.approx(3.5 - 2.0 * math.pi, abs=1e-6)
+
+
+def test_yaw_quat_from_heading_matches_z_up_yaw() -> None:
+    """Heading is the single source of body orientation in M1."""
+    q0 = yaw_quat_from_heading(torch.tensor([0.0, math.pi / 2.0, math.pi]))
+    assert q0.shape == (3, 4)
+
+    # heading=0 -> identity quaternion [0,0,0,1].
+    assert torch.allclose(q0[0], torch.tensor([0.0, 0.0, 0.0, 1.0]))
+
+    # heading=pi/2 -> z-axis 90 degree rotation.
+    assert torch.allclose(
+        q0[1],
+        torch.tensor([0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)]),
+        atol=1e-6,
+    )
+
+    # Applying the quaternion rotates +x to +y.
+    v = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32)
+    xyz = q0[1][:3]
+    t = torch.cross(xyz, v) * 2.0
+    rotated = v + q0[1][3:] * t + torch.cross(xyz, t)
+    assert torch.allclose(rotated, torch.tensor([0.0, 1.0, 0.0]), atol=1e-6)
+
+
+def test_selected_channel_mask_reduced_all_valid_hits_red() -> None:
+    """Reduced 187-channel debug cloud: all valid hits are red, no green."""
+    dists = torch.full((ea2c.EA2_RANGE_DIM,), 60.0, dtype=torch.float32)
+    dists[:5] = torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+    indices = torch.arange(ea2c.EA2_RANGE_DIM, dtype=torch.long)
+
+    red, green = selected_channel_mask(
+        dists, indices, is_reduced=True, far_plane=60.0
+    )
+
+    assert red.shape == dists.shape
+    assert green.shape == dists.shape
+    # All valid hits are red.
+    assert bool(red[:5].all())
+    assert not bool(red[5:].any())
+    # No green in reduced mode.
+    assert not bool(green.any())
+
+
+def test_selected_channel_mask_full_only_selected_red() -> None:
+    """Full 86400-ray debug cloud: only selected indices are red."""
+    n = ea2c.EA2_FULL_N_RAYS
+    dists = torch.full((n,), 60.0, dtype=torch.float32)
+    # Selected channels 10 and 20 are valid hits; others may be hits too.
+    dists[10] = 1.0
+    dists[20] = 2.0
+    dists[100] = 3.0  # non-selected valid hit -> green
+    indices = torch.tensor([10, 20], dtype=torch.long)
+
+    red, green = selected_channel_mask(
+        dists, indices, is_reduced=False, far_plane=60.0
+    )
+
+    assert bool(red[10])
+    assert bool(red[20])
+    assert not bool(red[100])
+    assert bool(green[100])
+    assert not bool(green[10])
+    assert not bool(green[20])
 
 
 def test_bold_envelope_lines_match_spider_envelop_style() -> None:

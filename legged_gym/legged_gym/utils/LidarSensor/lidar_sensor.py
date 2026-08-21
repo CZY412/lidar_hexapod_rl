@@ -287,7 +287,15 @@ class LidarSensor(BaseSensor):
             elif sensor_type_str == "os128":
                 return self.ray_generator.generate_OS128()
             elif sensor_type_str == "airy":
-                return self.ray_generator.generate_AIRY()
+                return self.ray_generator.generate_AIRY(
+                    horizontal_resolution_deg=float(
+                        getattr(
+                            self.sensor_cfg,
+                            "airy_horizontal_resolution_deg",
+                            6.0,
+                        )
+                    )
+                )
 
         raise ValueError(f"Cannot generate ray angles for sensor type: {sensor_type_str}")
 
