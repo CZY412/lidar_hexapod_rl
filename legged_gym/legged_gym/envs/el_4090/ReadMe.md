@@ -6,10 +6,184 @@
 - `spider_mammal`: 偏 mammal 形态的环境变体。
 - `spider_both`: 同时覆盖 spider/mammal 形态的环境变体。
 - `spider_envelop`: 新增的 envelope 条件环境，用可采样的足端活动范围约束策略。
+- `spider_envelop_2`: 将 envelope 保存在策略命令之外，并使用 HAA 范围网络辅助训练；策略不直接观察 envelope。
 - `safe`: 带 ATACOM 安全层的环境。
 - `thirdparty`: 第三方对称增强/接口相关代码。
 
-本文重点说明 `spider_envelop`，因为它在原有速度命令之外新增了 envelope condition，并用这些 condition 同时驱动观测、形态先验、奖励约束和可视化。
+本文分别说明 `spider_envelop` 和 `spider_envelop_2`。两者最大的区别是：
+`spider_envelop` 把 condition 放入策略观测，而 `spider_envelop_2` 的策略不观察
+condition、morphology prior 或 HAA range；这些信息只保存在环境内部。
+
+## Spider Envelop 2：策略和 HAA 网络接口
+
+### 总体数据流
+
+`spider_envelop_2` 将策略接口和 envelope 内部状态分开：
+
+```text
+5 维原始 envelope 几何
+    -> 内部推导 3 维 morphology prior
+    -> 组成 8 维 HAA 网络输入
+    -> haa_range.pt 输出六条腿的 HAA 下限/上限
+    -> 更新形态中心并计算 HAA 训练奖励
+
+68 维策略观测
+    -> locomotion policy
+    -> 18 维关节残差动作
+    -> q_target = embedded_state_default_dof_pos + 0.35 * action
+    -> PD torque
+```
+
+Envelope、morphology prior 和 HAA range 都不拼入 68 维策略观测。因此，策略是
+在隐藏 envelope 条件下训练的鲁棒策略，而不是显式的 envelope-conditioned policy。
+
+### 策略观测：68 维
+
+策略观测的形状为 `[num_envs, 68]`，布局如下：
+
+| 索引 | 维数 | 内容 | 缩放 |
+|---|---:|---|---|
+| `[0:3]` | 3 | base linear velocity | `obs_scales.lin_vel` |
+| `[3:6]` | 3 | base angular velocity | `obs_scales.ang_vel` |
+| `[6:9]` | 3 | projected gravity | 无额外缩放 |
+| `[9]` | 1 | `lin_vel_x` command | `command_lin_vel_scale` |
+| `[10]` | 1 | `lin_vel_y` command | `command_lin_vel_scale` |
+| `[11]` | 1 | `ang_vel_yaw` command | `command_ang_vel_scale` |
+| `[12:30]` | 18 | `dof_pos - embedded_state_default_dof_pos` | `obs_scales.dof_pos` |
+| `[30:48]` | 18 | DOF velocity | `obs_scales.dof_vel` |
+| `[48:66]` | 18 | 当前已施加的上一帧策略动作 | 无额外缩放 |
+| `[66]` | 1 | `sin(gait_phase)` | `obs_scales.gait_phase` |
+| `[67]` | 1 | `cos(gait_phase)` | `obs_scales.gait_phase` |
+
+其中明确不包含：
+
+- 5 维 envelope 几何；
+- 3 维 morphology prior；
+- 6 个 HAA range center；
+- 6 个 HAA half range。
+
+关节相关观测和动作使用 Isaac Gym 中的 DOF 顺序。当前 EL4090 顺序是：
+
+```text
+LB_HAA, LB_HFE, LB_KFE,
+LF_HAA, LF_HFE, LF_KFE,
+LM_HAA, LM_HFE, LM_KFE,
+RB_HAA, RB_HFE, RB_KFE,
+RF_HAA, RF_HFE, RF_KFE,
+RM_HAA, RM_HFE, RM_KFE
+```
+
+### 策略输出：18 维
+
+策略输出形状为 `[num_envs, 18]`，每个值是对应关节的目标位置残差，顺序与上面的
+18 个 DOF 完全一致。它不是绝对关节角，也不是 torque。当前 P 控制逻辑为：
+
+```text
+action_scaled = 0.35 * action
+q_target = embedded_state_default_dof_pos + action_scaled
+torque = Kp * (q_target - q) - Kd * dq
+torque = clip(torque, -torque_limit, torque_limit)
+```
+
+`embedded_state_default_dof_pos` 由三个 morphology prior 在 spider 和 mammal 默认姿态
+之间插值得到。因此，虽然策略看不到 morphology prior，内部控制中心仍会随 envelope
+变化。策略观测使用相对于这个控制中心的关节误差，保证训练和部署使用同一参考系。
+
+### `haa_range.pt` 输入：8 维
+
+网络输入形状为 `[batch, 8]`，顺序必须严格保持为：
+
+| 索引 | 名称 | 当前范围 | 来源 |
+|---|---|---:|---|
+| `0` | `front_width` | `[0.3, 0.6]` | 原始 envelope |
+| `1` | `middle_width` | `[0.3, 0.7]` | 原始 envelope |
+| `2` | `back_width` | `[0.3, 0.6]` | 原始 envelope |
+| `3` | `forward_limit` | `[0.6, 0.9]` | 原始 envelope |
+| `4` | `backward_limit` | `[-0.9, -0.6]` | 原始 envelope |
+| `5` | `morphology_front_prior` | `[0, 1]` | 由前 5 维推导 |
+| `6` | `morphology_middle_prior` | `[0, 1]` | 由前 5 维推导 |
+| `7` | `morphology_back_prior` | `[0, 1]` | 由前 5 维推导 |
+
+外部感知或规划模块只需要提供前 5 个独立几何量。后三个 prior 必须使用训练时相同的
+`apply_env_morphology_priors()` 逻辑计算，不能在部署时独立随机生成。
+
+### `haa_range.pt` 当前输出：每腿上下界
+
+当前 checkpoint 由 `HaaRangeNetwork.from_checkpoint()` 加载，对外输出形状为
+`[batch, 6, 2]`：
+
+```text
+output[:, leg, 0] = HAA lower bound
+output[:, leg, 1] = HAA upper bound
+```
+
+checkpoint 的六腿输出顺序为：
+
+```text
+RF, RM, RB, LF, LM, LB
+```
+
+环境随后使用索引 `[5, 3, 4, 2, 0, 1]` 转换成仿真 HAA 顺序：
+
+```text
+LB, LF, LM, RB, RF, RM
+```
+
+网络最后一层实际产生 12 个 raw values，并在 `forward()` 内部构造合法范围：
+
+```text
+center = joint_lower + sigmoid(raw_center) * (joint_upper - joint_lower)
+max_half = min(center - joint_lower, joint_upper - center)
+half_range = sigmoid(raw_half_range) * max_half
+lower = center - half_range
+upper = center + half_range
+```
+
+因此当前文件的环境输出契约是 `[lower, upper]`，不是直接的
+`[center, half_range]`。
+
+### 替换为 center/half-range 输出的网络
+
+新网络可以直接输出 `[center, half_range]`，形状仍为 `[batch, 6, 2]`，但不能只覆盖
+现有 `.pt` 文件。加载或适配层必须先将它转换成环境统一使用的上下界：
+
+```python
+center = prediction[..., 0].clamp(joint_lower, joint_upper)
+half_range = prediction[..., 1].clamp_min(0.0)
+max_half_range = torch.minimum(
+    center - joint_lower,
+    joint_upper - center,
+).clamp_min(0.0)
+half_range = torch.minimum(half_range, max_half_range)
+
+lower = center - half_range
+upper = center + half_range
+ranges = torch.stack((lower, upper), dim=-1)
+```
+
+建议新 checkpoint 显式保存以下元数据，避免把两种输出语义混用：
+
+```python
+{
+    "output_format": "center_half_range",
+    "condition_names": [...8 个输入名称...],
+    "leg_names": ["RF", "RM", "RB", "LF", "LM", "LB"],
+}
+```
+
+环境内部可以继续统一保存 `[lower, upper]`。这样 analytic、Monte Carlo 和 network
+三种 estimator 保持相同的下游接口，HAA 奖励代码无需分支。
+
+### HAA range 在训练和部署中的用途
+
+训练阶段，包络改变时才重新运行 HAA estimator。输出用于：
+
+1. `haa_range_violation`：惩罚 HAA 关节位置超出 `[lower, upper]`；
+2. `haa_phase_tracking`：由范围中心和半范围构造六腿相位目标。
+
+HAA range 不进入策略观测，也不直接裁剪策略动作。当前部署只运行 locomotion policy
+和 P/PD 控制时，可以不加载 `haa_range.pt`；如果部署端还需要 HAA 硬限幅、安全监控
+或在线形态约束，则应保留该网络，并在控制安全层中使用它的范围输出。
 
 ## Spider Envelop 目标
 

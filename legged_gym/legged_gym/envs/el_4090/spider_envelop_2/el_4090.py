@@ -26,7 +26,7 @@ from legged_gym.utils.envelop.network.haa_swing_range import (
 
 
 class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
-    """83-D locomotion policy with explicit HAA ranges and gait phase."""
+    """68-D locomotion policy with proprioception and gait phase."""
 
     cfg: El4090Envelop2Cfg
 
@@ -63,16 +63,6 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         self.condition_dim = self.envelope_state.condition_dim
         self.condition_low = self.envelope_state.low
         self.condition_high = self.envelope_state.high
-        self.morphology_prior_obs_indices = torch.tensor(
-            [
-                self.condition_names.index("morphology_front_prior"),
-                self.condition_names.index("morphology_middle_prior"),
-                self.condition_names.index("morphology_back_prior"),
-            ],
-            dtype=torch.long,
-            device=self.device,
-            requires_grad=False,
-        )
         range_cfg = self.cfg.haa_swing_range
         haa_leg_names = tuple(self.dof_names[index].split("_", 1)[0] for index in self.haa_indices.tolist())
         expected_legs = {"LB", "LF", "LM", "RB", "RF", "RM"}
@@ -151,7 +141,7 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         self.action_history_steps[done_mask] = 0
 
     def _get_noise_scale_vec(self, cfg) -> torch.Tensor:
-        """Noise vector for the 83-D envelop_2 policy observation."""
+        """Noise vector for the 68-D envelop_2 policy observation."""
         noise_vec = torch.zeros_like(self.obs_buf[0])
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise.noise_scales
@@ -163,14 +153,11 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         noise_vec[12:30] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
         noise_vec[30:48] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
         noise_vec[48:66] = 0.0
-        noise_vec[66:69] = 0.0
-        noise_vec[69:81] = 0.0
-        noise_vec[81:83] = 0.0
+        noise_vec[66:68] = 0.0
         return noise_vec
 
     def compute_observations(self) -> None:
-        """Policy observes proprioception, morphology, HAA ranges, and gait phase."""
-        haa_center, haa_half_range = self._get_haa_range_center_and_half()
+        """Policy observes proprioception and gait phase only."""
         gait_phase = self._get_gait_phase()
         self.obs_buf = torch.cat(
             (
@@ -183,10 +170,6 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
                 (self.dof_pos - self.embedded_state_default_dof_pos) * self.obs_scales.dof_pos,
                 self.dof_vel * self.obs_scales.dof_vel,
                 self.actions,
-                self._get_structure_condition().index_select(1, self.morphology_prior_obs_indices)
-                * self.obs_scales.morphology_prior,
-                haa_center * self.obs_scales.haa_range_center,
-                haa_half_range * self.obs_scales.haa_range_half,
                 torch.stack((torch.sin(gait_phase), torch.cos(gait_phase)), dim=1)
                 * self.obs_scales.gait_phase,
             ),

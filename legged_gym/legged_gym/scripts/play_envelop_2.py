@@ -21,7 +21,7 @@ from legged_gym.utils import export_policy_as_jit, get_args, task_registry
 
 
 TASK_NAME = "el4090_envelop_2"
-EXPECTED_OBS_DIM = 83
+EXPECTED_OBS_DIM = 68
 ENVELOPE_GEOMETRY_NAMES = (
     "front_width",
     "middle_width",
@@ -444,7 +444,7 @@ def play(args):
 
 
 if __name__ == "__main__":
-    EXPORT_POLICY = False
+    EXPORT_POLICY = True
     args = get_args(
         [
             {
