@@ -579,20 +579,83 @@ def _apply_path_noise(
     return noisy
 
 
-def _deduplicate_close_points(points: np.ndarray, min_spacing: float) -> np.ndarray:
-    """Drop consecutive points closer than ``min_spacing``.
+def _deduplicate_close_points(
+    points: np.ndarray,
+    min_spacing: float,
+    inflated: np.ndarray,
+) -> np.ndarray:
+    """Drop near-duplicate points without ever producing a blocked chord.
 
     Noise fallback can leave nearly coincident points; they add zero-length
-    segments and artificial curvature spikes.  Removing consecutive duplicates
-    can never make a previously clear polyline blocked.
+    segments and artificial curvature spikes.  A naive distance-only removal is
+    unsafe: dropping a point that is close to the last kept point can create a
+    longer chord between the last kept point and the next point, and that chord
+    may cut through an inflated occupied cell even though the original short
+    segments were clear.
+
+    This version only skips a point when the replacement chord
+    ``last_kept -> next_point`` is itself clear, so the returned polyline is
+    guaranteed to remain clear.
     """
     if points.shape[0] < 2:
         return points
+
     keep = [0]
-    for i in range(1, points.shape[0]):
-        if float(np.linalg.norm(points[i] - points[keep[-1]])) >= min_spacing:
-            keep.append(i)
+    i = 1
+    n = points.shape[0]
+    while i < n:
+        last_kept = points[keep[-1]]
+        # Try to drop a near-duplicate only if the skip is geometrically safe.
+        if (
+            i + 1 < n
+            and float(np.linalg.norm(points[i] - last_kept)) < min_spacing
+            and _segment_clear(last_kept, points[i + 1], inflated)
+        ):
+            i += 1
+            continue
+        keep.append(i)
+        i += 1
     return points[np.asarray(keep, dtype=int)]
+
+
+def _compute_segment_dirs(points: np.ndarray) -> np.ndarray:
+    """Return the direction angle of each polyline segment (radians)."""
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.shape[0] < 2:
+        return np.zeros((0,), dtype=np.float64)
+    d = np.diff(pts, axis=0)
+    return np.arctan2(d[:, 1], d[:, 0])
+
+
+def _detect_corners(
+    points: np.ndarray,
+    arc: np.ndarray,
+    angle_threshold: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Detect interior corners of a polyline.
+
+    A corner is a vertex whose incoming and outgoing segment directions differ
+    by more than ``angle_threshold`` radians.  The returned arrays contain the
+    arc length of the corner vertex and the direction of the outgoing segment,
+    which is the heading the robot must align to before continuing.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    arc_arr = np.asarray(arc, dtype=np.float64)
+    seg_dirs = _compute_segment_dirs(pts)
+    if seg_dirs.shape[0] < 2:
+        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+
+    corner_arcs = []
+    corner_targets = []
+    for i in range(1, seg_dirs.shape[0]):
+        turn = wrap_to_pi(seg_dirs[i] - seg_dirs[i - 1])
+        if abs(float(turn)) > angle_threshold:
+            corner_arcs.append(float(arc_arr[i]))
+            corner_targets.append(float(seg_dirs[i]))
+    return (
+        np.asarray(corner_arcs, dtype=np.float64),
+        np.asarray(corner_targets, dtype=np.float64),
+    )
 
 
 def _smooth_yaws_to_min_radius(
@@ -671,18 +734,46 @@ def _build_path_data(
                 resampled, inflated, cfg, rng, smoothing_passes=passes
             )
             min_spacing = max(1e-3, float(cfg.resample_dist) * 0.1)
-            noisy = _deduplicate_close_points(noisy, min_spacing)
+
+            # Safety net: if noise ever returned a non-clear polyline, fall back
+            # to the clear resampled reference before attempting cleanup.
+            if not _path_clear(noisy, inflated):
+                noisy = resampled
+
+            # Clearness-aware dedup: by construction it cannot introduce a
+            # blocked chord.  Keep a copy for the final invariant below.
+            raw_noisy = noisy
+            noisy = _deduplicate_close_points(noisy, min_spacing, inflated)
             if noisy.shape[0] < 2:
                 continue
+
+            # Final invariant: never return a blocked path.  If cleanup ever
+            # produces one, fall back to the pre-dedup clear polyline.
+            if not _path_clear(noisy, inflated):
+                noisy = raw_noisy
+            if not _path_clear(noisy, inflated):
+                noisy = resampled
             if not _path_clear(noisy, inflated):
                 raise ValueError(
-                    "path noise produced a blocked point or segment after fallback"
+                    "path cleanup could not produce a clear polyline"
                 )
+
             yaws = _smooth_yaws_to_min_radius(
                 noisy, _tangent_yaws(noisy), cfg
             )
             noisy_arc = _cumulative_arc_lengths(noisy)
-            return PathData(points=noisy, yaws=yaws, arc=noisy_arc)
+            segment_dirs = _compute_segment_dirs(noisy)
+            corner_arcs, corner_targets = _detect_corners(
+                noisy, noisy_arc, angle_threshold=0.05
+            )
+            return PathData(
+                points=noisy,
+                yaws=yaws,
+                arc=noisy_arc,
+                segment_dirs=segment_dirs,
+                corner_arcs=corner_arcs,
+                corner_targets=corner_targets,
+            )
 
     raise ValueError(
         "path noise could not produce a feasible realization; reject and "

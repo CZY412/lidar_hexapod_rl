@@ -484,11 +484,20 @@ def generate_map(
         )
 
     vertices, triangles = _build_mesh(rects, cfg)
+
+    from scipy.ndimage import distance_transform_edt
+
+    distance_field = distance_transform_edt(
+        occupancy == 0,
+        sampling=(cfg.resolution_m, cfg.resolution_m),
+    ).astype(np.float32)
+
     return MapData(
         occupancy=occupancy,
         inflated=inflated,
         vertices=vertices,
         triangles=triangles,
+        distance_field=distance_field,
         tile_types=tile_types,
         rects=tuple(rects),
         pillars=(),

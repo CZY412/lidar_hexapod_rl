@@ -15,9 +15,10 @@ from __future__ import annotations
 # have been imported yet.  Importing the envelope_geometry package first lets
 # isaacgym initialize torch itself; all later torch imports are then safe.
 from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
-    collision_cell_ratio,
     compute_hex_vertices,
     envelope_params_to_condition,
+    hex_body_sample_points,
+    hex_collision_violation,
     offset_hexagon,
     point_in_hex,
 )
@@ -31,6 +32,7 @@ from legged_gym.utils.envelop.network.haa_swing_range import (
 )
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -184,44 +186,72 @@ def test_offset_hexagon_handles_collinear_minimum_envelope() -> None:
     assert not bool(point_in_hex(outside_bottom, offset).all())
 
 
-def test_collision_cell_ratio_synthetic_occupancy() -> None:
-    """A hex covering 4 cells with 2 occupied has collision ratio 0.5."""
-    occupancy = np.zeros(c.EA2_GRID_SHAPE, dtype=np.uint8)
-    # World (0.05,0.05) -> grid (300,300); (0.15,0.05) -> (300,301).
-    occupancy[370, 370] = 1
-    occupancy[370, 371] = 1
-
-    # Degenerate CCW hexagon equal to the world rectangle [0, 0.2] x [0, 0.2].
-    # The six vertices are collinear in pairs, matching the legacy B,D,F,E,C,A
-    # order while still being a valid convex polygon for coverage tests.
-    hex_vertices = torch.tensor(
+def test_hex_body_sample_points_shape_and_inside() -> None:
+    """34 body-frame sample points, all inside the hexagon."""
+    params = torch.tensor(
         [
-            [0.20, 0.20],  # B
-            [0.10, 0.20],  # D
-            [0.00, 0.20],  # F
-            [0.00, 0.00],  # E
-            [0.10, 0.00],  # C
-            [0.20, 0.00],  # A
+            [0.45, 0.50, 0.45, 0.75, -0.75],
+            [0.30, 0.30, 0.30, 0.60, -0.60],
         ],
         dtype=torch.float32,
     )
-    ratio = collision_cell_ratio(hex_vertices, occupancy)
-    assert ratio.dim() == 0
-    assert abs(ratio.item() - 0.5) < 1e-5
+    samples = hex_body_sample_points(params)
+    assert samples.shape == (2, 34, 2)
 
-    # No occupied cell inside -> ratio 0.
-    empty_occ = np.zeros(c.EA2_GRID_SHAPE, dtype=np.uint8)
-    ratio_empty = collision_cell_ratio(hex_vertices, empty_occ)
-    assert abs(ratio_empty.item() - 0.0) < 1e-5
+    # Every sample point must be inside/on the convex hexagon.
+    verts = compute_hex_vertices(
+        params[:, 0], params[:, 1], params[:, 2], params[:, 3], params[:, 4]
+    )
+    inside = point_in_hex(samples, verts)
+    assert bool(inside.all())
 
-    # All covered cells occupied -> ratio 1.
-    full_occ = np.zeros(c.EA2_GRID_SHAPE, dtype=np.uint8)
-    full_occ[370, 370] = 1
-    full_occ[370, 371] = 1
-    full_occ[371, 370] = 1
-    full_occ[371, 371] = 1
-    ratio_full = collision_cell_ratio(hex_vertices, full_occ)
-    assert abs(ratio_full.item() - 1.0) < 1e-5
+
+def test_hex_collision_violation_synthetic_distance_field() -> None:
+    """Worst-point violation uses the sampled clearance and smooth bound."""
+    params = torch.tensor(
+        [[0.45, 0.50, 0.45, 0.75, -0.75]],
+        dtype=torch.float32,
+    )
+    # All clear: distance field is 1.0 everywhere except one occupied cell at
+    # world origin (grid 370,370).
+    distance_field = np.ones(c.EA2_GRID_SHAPE, dtype=np.float32)
+    distance_field[370, 370] = 0.0
+
+    # Hex centered at origin -> its centre sample hits the zero cell.
+    violation_center = hex_collision_violation(
+        params,
+        torch.zeros(1),
+        torch.zeros(1, 2),
+        distance_field,
+        margin=0.10,
+        soft_margin=0.10,
+    )
+    assert violation_center.shape == (1,)
+    assert violation_center.item() == pytest.approx(1.0, abs=1e-5)
+
+    # Hex far from the obstacle -> no violation.
+    violation_far = hex_collision_violation(
+        params,
+        torch.zeros(1),
+        torch.tensor([[5.0, 5.0]], dtype=torch.float32),
+        distance_field,
+        margin=0.10,
+        soft_margin=0.10,
+    )
+    assert violation_far.item() == pytest.approx(0.0, abs=1e-5)
+
+    # A sample exactly at clearance = 0.05 with margin/soft = 0.10 gives 0.5.
+    distance_field_05 = np.ones(c.EA2_GRID_SHAPE, dtype=np.float32)
+    distance_field_05[370, 370] = 0.05
+    violation_half = hex_collision_violation(
+        params,
+        torch.zeros(1),
+        torch.zeros(1, 2),
+        distance_field_05,
+        margin=0.10,
+        soft_margin=0.10,
+    )
+    assert violation_half.item() == pytest.approx(0.5, abs=1e-5)
 
 
 def test_envelope_params_to_condition_matches_apply_priors() -> None:

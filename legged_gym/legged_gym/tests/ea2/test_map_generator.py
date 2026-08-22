@@ -44,6 +44,7 @@ def test_deterministic_same_seed_reproducible():
     b = generate_map(_cfg(), _pillar_cfg(), seed=123)
     assert np.array_equal(a.occupancy, b.occupancy)
     assert np.array_equal(a.inflated, b.inflated)
+    assert np.array_equal(a.distance_field, b.distance_field)
     assert np.array_equal(a.vertices, b.vertices)
     assert np.array_equal(a.triangles, b.triangles)
     assert a.rects == b.rects
@@ -54,6 +55,9 @@ def test_shapes_and_dtypes():
     m = generate_map(_cfg(), _pillar_cfg(), seed=0)
     assert m.occupancy.shape == c.EA2_GRID_SHAPE
     assert m.inflated.shape == c.EA2_GRID_SHAPE
+    assert m.distance_field is not None
+    assert m.distance_field.shape == c.EA2_GRID_SHAPE
+    assert m.distance_field.dtype == np.float32
     assert m.occupancy.dtype == np.uint8
     assert m.inflated.dtype == np.uint8
     assert m.vertices.ndim == 2 and m.vertices.shape[1] == 3

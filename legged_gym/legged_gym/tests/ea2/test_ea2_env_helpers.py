@@ -17,7 +17,6 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_env import (
     EL_4090_EA2,
     action_rate_term,
     assemble_observation,
-    collision_ratio,
     ego_motion,
     empty_range_image,
     heading_update,
@@ -162,31 +161,6 @@ def test_potential_reward_max_min_and_backward_direction() -> None:
         _HIGH,
     )
     assert p_large.item() > p_small.item()
-
-
-def test_collision_ratio_synthetic_occupancy() -> None:
-    """Collision ratio counts covered occupied cells / covered cells."""
-    occupancy = np.zeros(ea2c.EA2_GRID_SHAPE, dtype=np.uint8)
-    # World (0.05,0.05) -> grid (300,300); (0.15,0.05) -> (300,301).
-    occupancy[370, 370] = 1
-    occupancy[370, 371] = 1
-    hex_vertices = torch.tensor(
-        [
-            [0.20, 0.20],  # B
-            [0.10, 0.20],  # D
-            [0.00, 0.20],  # F
-            [0.00, 0.00],  # E
-            [0.10, 0.00],  # C
-            [0.20, 0.00],  # A
-        ],
-        dtype=torch.float32,
-    )
-    ratio = collision_ratio(hex_vertices, occupancy, margin=0.0)
-    assert ratio.dim() == 0
-    assert ratio.item() == pytest.approx(0.5, abs=1e-5)
-
-    empty = np.zeros(ea2c.EA2_GRID_SHAPE, dtype=np.uint8)
-    assert collision_ratio(hex_vertices, empty, margin=0.0).item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_action_rate_term() -> None:

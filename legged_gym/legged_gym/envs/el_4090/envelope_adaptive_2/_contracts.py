@@ -126,6 +126,7 @@ class MapData:
     inflated: np.ndarray            # (740, 740) uint8, 1 = blocked (planning)
     vertices: np.ndarray            # (V, 3) float32, watertight ground+obstacles
     triangles: np.ndarray           # (T, 3) int32, CCW/outward-consistent winding
+    distance_field: Optional[np.ndarray] = None  # (740, 740) float32, meters to nearest obstacle
     tile_types: Optional[np.ndarray] = None  # (5, 5) uint8 tile type codes
     rects: Tuple[RectPrimitive, ...] = ()
     pillars: Tuple[PillarPrimitive, ...] = ()
@@ -139,6 +140,10 @@ class PathData:
     points: np.ndarray              # (P, 2) world x/y
     yaws: np.ndarray                # (P,) tangent yaw, radians
     arc: np.ndarray                 # (P,) cumulative arc length, starts at 0
+    # Optional polyline corner metadata for stop-and-turn motion.
+    segment_dirs: Optional[np.ndarray] = None   # (P-1,) segment direction, radians
+    corner_arcs: Optional[np.ndarray] = None    # (K,) arc position of interior corners
+    corner_targets: Optional[np.ndarray] = None # (K,) heading to align to after corner
 
 
 @dataclass(frozen=True)
@@ -247,9 +252,13 @@ class LidarNoiseCfg:
 #       # (..., 6, 2), vertex order B,D,F,E,C,A (legacy-compatible)
 #   def offset_hexagon(vertices, margin) -> torch.Tensor    # half-plane exact offset
 #   def point_in_hex(pts_xy, vertices) -> torch.Tensor      # bool mask (..., N)
-#   def collision_cell_ratio(hex_vertices_world_xy, occupancy,
-#                            world_to_grid_fn) -> torch.Tensor
-#       # covered occupied cells / covered cells, eps-protected
+#   def hex_collision_violation(params5: torch.Tensor,
+#                               heading: torch.Tensor,
+#                               base_pos_xy: torch.Tensor,
+#                               distance_field: np.ndarray | torch.Tensor,
+#                               margin: float,
+#                               soft_margin: float) -> torch.Tensor
+#       # (E,), worst-point smooth bounded violation in [0,1]
 #   def envelope_params_to_condition(params5: torch.Tensor,
 #                                    spec) -> torch.Tensor # (..., 8)
 #       # must reuse apply_env_morphology_priors (do not re-implement priors)

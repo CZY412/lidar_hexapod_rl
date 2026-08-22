@@ -12,11 +12,17 @@ Covered behaviours:
 
 import numpy as np
 import pytest
+from scipy.ndimage import label as nd_label
+from scipy.ndimage import sum as nd_sum
 
+from legged_gym.envs.el_4090.envelope_adaptive_2 import _contracts as ea2c
 from legged_gym.envs.el_4090.envelope_adaptive_2._contracts import PathCfg
+from legged_gym.envs.el_4090.envelope_adaptive_2.map_generator import generate_map
 from legged_gym.envs.el_4090.envelope_adaptive_2.path_planner import (
     _apply_path_noise,
     _astar,
+    _compute_segment_dirs,
+    _detect_corners,
     _low_pass_noise_offsets,
     _path_clear,
     _resample_polyline,
@@ -78,6 +84,12 @@ def test_straight_corridor_path_feasible_and_monotonic_arc() -> None:
     assert data.arc[-1] > 7.0
 
     _assert_points_free_and_segments_clear(data.points, inflated)
+
+    # Corner metadata for stop-and-turn motion must be present.
+    assert data.segment_dirs is not None
+    assert data.segment_dirs.shape == (data.points.shape[0] - 1,)
+    assert data.corner_arcs is not None
+    assert data.corner_targets is not None
 
     # The path is roughly straight along +x: tangent yaw should stay near 0.
     # Small lateral noise makes the yaw wiggle, so use a loose bound.
@@ -255,3 +267,88 @@ def test_sharp_path_yaws_smoothed_to_min_turn_radius() -> None:
     max_curvature = 1.0 / PathCfg().min_turn_radius
     assert np.all(ds > 0.0)
     assert np.all(dyaw / ds <= max_curvature + 1e-6)
+
+
+def test_detect_corners_straight_and_l_shape() -> None:
+    """Corner detection returns no corners for straight and one for L-shape."""
+    straight = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    straight_arc = np.array([0.0, 1.0, 2.0])
+    seg_dirs = _compute_segment_dirs(straight)
+    assert seg_dirs.shape == (2,)
+    corner_arcs, corner_targets = _detect_corners(straight, straight_arc)
+    assert len(corner_arcs) == 0
+    assert len(corner_targets) == 0
+
+    l_shape = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])
+    l_arc = np.array([0.0, 1.0, 2.0])
+    corner_arcs, corner_targets = _detect_corners(l_shape, l_arc)
+    assert len(corner_arcs) == 1
+    assert corner_arcs[0] == pytest.approx(1.0, abs=1e-9)
+    assert corner_targets[0] == pytest.approx(np.pi / 2.0, abs=1e-9)
+
+
+def test_plan_path_random_pillar_map_never_returns_blocked() -> None:
+    """Regression: random A* paths on the real pillar map must stay clear.
+
+    The old distance-only dedup could drop a near-duplicate point and create a
+    chord through an inflated blocked cell, causing random ``plan_path``
+    failures.  This stress test guards against that class of bug.
+    """
+    map_cfg = ea2c.MapGenCfg()
+    pillar_cfg = ea2c.PillarFieldCfg(
+        count_min=15,
+        count_max=15,
+        size_x_min=0.5,
+        size_x_max=4.0,
+        size_y_min=0.5,
+        size_y_max=4.0,
+        height_min=1.0,
+        height_max=2.0,
+        min_separation=2.2,
+        center_clear_radius=2.2,
+        spawn_radius=7.5,
+        allow_height_variation=True,
+    )
+    md = generate_map(map_cfg, pillar_cfg, seed=42)
+    occ = md.occupancy
+    inflated = md.inflated
+
+    free = inflated == 0
+    labels, n = nd_label(free)
+    sizes = nd_sum(free, labels, index=range(1, n + 1))
+    largest = int(np.argmax(sizes)) + 1
+    cells = np.argwhere(labels == largest)
+
+    half_tile = 74.0 / 2.0 - 5.0
+    spawn = cells
+    spawn_x = ea2c.EA2_WORLD_MIN_XY + (spawn[:, 1] + 0.5) * ea2c.EA2_RESOLUTION_M
+    spawn_y = ea2c.EA2_WORLD_MIN_XY + (spawn[:, 0] + 0.5) * ea2c.EA2_RESOLUTION_M
+    mask = (
+        (spawn_x >= -half_tile)
+        & (spawn_x <= half_tile)
+        & (spawn_y >= -half_tile)
+        & (spawn_y <= half_tile)
+    )
+    spawn = spawn[mask]
+
+    def to_world(cell):
+        return (
+            ea2c.EA2_WORLD_MIN_XY + (cell[1] + 0.5) * ea2c.EA2_RESOLUTION_M,
+            ea2c.EA2_WORLD_MIN_XY + (cell[0] + 0.5) * ea2c.EA2_RESOLUTION_M,
+        )
+
+    cfg = PathCfg(
+        speed_range=(1.0, 1.0),
+        delta_target_deg_range=(0.0, 0.0),
+        noise_amp_range=(0.0, 0.0),
+        min_path_len=3.0,
+    )
+    rng = np.random.default_rng(2024)
+
+    for _ in range(60):
+        si = rng.integers(0, spawn.shape[0])
+        gi = rng.integers(0, spawn.shape[0])
+        start = to_world(spawn[si])
+        goal = to_world(spawn[gi])
+        data = plan_path(occ, inflated, start, goal, cfg, rng)
+        assert _path_clear(data.points, inflated)

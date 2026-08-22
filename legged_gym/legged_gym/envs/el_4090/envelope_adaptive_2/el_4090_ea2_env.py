@@ -25,9 +25,8 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_config import (
     El4090EA2Cfg,
 )
 from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
-    collision_cell_ratio,
     compute_hex_vertices,
-    offset_hexagon,
+    hex_collision_violation,
 )
 from legged_gym.envs.el_4090.envelope_adaptive_2.map_generator import (
     generate_map,
@@ -190,23 +189,6 @@ def potential_reward(
         (-low5[4]) - (-high5[4])
     ).clamp_min(1e-6)
     return norm.clamp(0.0, 1.0).mean(dim=-1)
-
-
-def collision_ratio(
-    hex_vertices_world_xy: torch.Tensor,
-    occupancy,
-    margin: float = 0.05,
-) -> torch.Tensor:
-    """Collision ratio of a hexagon against raw occupancy.
-
-    The input is the world-frame hexagon vertices.  When ``margin > 0`` the
-    exact half-plane offset is applied before counting covered occupied cells.
-    The returned value is a positive ratio in ``[0, 1]``; the environment
-    multiplies it by the (negative) collision reward scale.
-    """
-    if margin > 0.0:
-        hex_vertices_world_xy = offset_hexagon(hex_vertices_world_xy, margin)
-    return collision_cell_ratio(hex_vertices_world_xy, occupancy)
 
 
 def action_rate_term(
@@ -460,6 +442,12 @@ class EL_4090_EA2(BaseTask):
         self.map_data = generate_map(map_cfg, pillar_cfg, seed=map_seed)
         self.occupancy = self.map_data.occupancy
         self.inflated = self.map_data.inflated
+        # Keep a device-side distance field for the per-step clearance reward.
+        self.distance_field = torch.as_tensor(
+            self.map_data.distance_field,
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         # Start/goal sampling must live in the largest 8-connected component
         # of the inflated free space; otherwise A* can fail for map seeds that
@@ -640,6 +628,15 @@ class EL_4090_EA2(BaseTask):
         )
         self.memory_reset_buf = torch.zeros(
             n, dtype=torch.bool, device=device
+        )
+        self._replan_reset_buf = torch.zeros(
+            n, dtype=torch.bool, device=device
+        )
+        self._turn_in_place = torch.zeros(
+            n, dtype=torch.bool, device=device
+        )
+        self._turn_target = torch.zeros(
+            n, dtype=torch.float32, device=device
         )
 
         # Debug point-cloud visualization state (populated only when a viewer
@@ -1158,12 +1155,18 @@ class EL_4090_EA2(BaseTask):
         return self._sample_start_xy(), self._sample_goal_xy()
 
     def _min_obstacle_distance_world(self, xy) -> float:
-        cells = np.argwhere(self.occupancy > 0)
-        if cells.size == 0:
+        """Return distance to the nearest obstacle using the precomputed field.
+
+        The map's unsigned distance field is computed once at generation time,
+        so this is an O(1) lookup instead of scanning all occupied cells.
+        """
+        res = ea2c.EA2_RESOLUTION_M
+        wmin = ea2c.EA2_WORLD_MIN_XY
+        ix = int(np.floor((float(xy[0]) - wmin) / res))
+        iy = int(np.floor((float(xy[1]) - wmin) / res))
+        if ix < 0 or ix >= self.occupancy.shape[1] or iy < 0 or iy >= self.occupancy.shape[0]:
             return float("inf")
-        xs = ea2c.EA2_WORLD_MIN_XY + (cells[:, 1].astype(np.float64) + 0.5) * ea2c.EA2_RESOLUTION_M
-        ys = ea2c.EA2_WORLD_MIN_XY + (cells[:, 0].astype(np.float64) + 0.5) * ea2c.EA2_RESOLUTION_M
-        return float(np.min(np.hypot(xs - float(xy[0]), ys - float(xy[1]))))
+        return float(self.map_data.distance_field[iy, ix])
 
     def _make_path_cfg(self) -> PathCfg:
         """Build the current :class:`PathCfg` from the environment config."""
@@ -1231,21 +1234,35 @@ class EL_4090_EA2(BaseTask):
                 )
                 self.paths[env_id] = path
                 self.s[env_id] = 0.0
-                self.tangent[env_id] = float(path.yaws[0])
+                first_dir = (
+                    float(path.segment_dirs[0])
+                    if path.segment_dirs is not None and len(path.segment_dirs) > 0
+                    else float(path.yaws[0])
+                )
+                self.tangent[env_id] = first_dir
                 self.tangent_rate[env_id] = 0.0
+                # Rotate in place before advancing along the new path so the
+                # body never crab-walks with a heading far from the new tangent.
+                self._turn_target[env_id] = first_dir
+                self._turn_in_place[env_id] = True
                 return
             except (ValueError, RuntimeError) as err:
                 last_err = err
-        raise RuntimeError(
-            f"failed to replan from current position after 40 attempts: {last_err}"
-        )
+        # Replanning failed after many random goals.  Do not crash a long
+        # training run: mark this env for a full reset in the enclosing step,
+        # which will resample a fresh start/path and clear the GRU memory.
+        self._replan_reset_buf[env_id] = True
 
     def _reset_one_env(self, env_id: int):
         path = self._sample_new_path()
         self.paths[env_id] = path
 
         start_xy = path.points[0]
-        start_yaw = float(path.yaws[0])
+        start_yaw = (
+            float(path.segment_dirs[0])
+            if path.segment_dirs is not None and len(path.segment_dirs) > 0
+            else float(path.yaws[0])
+        )
         self.s[env_id] = 0.0
         self.base_pos[env_id, 0] = float(start_xy[0])
         self.base_pos[env_id, 1] = float(start_xy[1])
@@ -1276,6 +1293,10 @@ class EL_4090_EA2(BaseTask):
         )
 
         self.episode_length_buf[env_id] = 0
+        # Clear transient motion/reset flags for a fresh episode.
+        self._turn_in_place[env_id] = False
+        self._turn_target[env_id] = 0.0
+        self._replan_reset_buf[env_id] = False
         # Keep the done flag set for the caller (PPO recurrent reset).  The
         # buffer is overwritten on the next step before a new decision, so
         # leaving it 1 does not carry a spurious reset into the next episode.
@@ -1358,26 +1379,116 @@ class EL_4090_EA2(BaseTask):
             if path is None:
                 continue
 
+            # After a soft replan the robot rotates in place before advancing.
+            # This prevents crab-walking with a heading far from the new path
+            # tangent, which could sweep an envelope corner into an obstacle.
+            if bool(self._turn_in_place[i]):
+                tangent = float(self._turn_target[i])
+                self.tangent[i] = tangent
+                self.tangent_rate[i] = 0.0
+                heading, omega, _ = heading_update(
+                    self.heading[i : i + 1],
+                    self.tangent[i : i + 1],
+                    torch.zeros(1, device=self.device),
+                    self.delta_target[i : i + 1],
+                    dt,
+                    float(self.cfg.path.k_p),
+                    float(self.cfg.path.omega_max),
+                )
+                self.heading[i] = heading
+                self.omega[i] = omega
+                self.delta_actual[i] = float(
+                    wrap_to_pi(self.heading[i] - tangent)
+                )
+                # Fully stationary: only angular velocity, no linear velocity.
+                self.ego_motion[i, 0] = 0.0
+                self.ego_motion[i, 1] = 0.0
+                self.ego_motion[i, 2] = float(omega)
+                if abs(float(wrap_to_pi(self.heading[i] - tangent))) < 0.05:
+                    self._turn_in_place[i] = False
+                continue
+
+            # Path corner metadata enables stop-and-turn at corners.
+            corner_arcs = getattr(path, "corner_arcs", None)
+            corner_targets = getattr(path, "corner_targets", None)
+            segment_dirs = getattr(path, "segment_dirs", None)
+            use_corner_meta = (
+                corner_arcs is not None
+                and corner_targets is not None
+                and segment_dirs is not None
+                and len(corner_arcs) > 0
+            )
+
+            # If the next corner is about to be crossed, stop at it and turn in
+            # place toward the outgoing segment before continuing.
+            if use_corner_meta:
+                s_cur = float(self.s[i])
+                next_idx = int(np.searchsorted(corner_arcs, s_cur, side="right"))
+                if next_idx < len(corner_arcs):
+                    next_corner = float(corner_arcs[next_idx])
+                    if self.s[i] + self.v[i] * dt >= next_corner:
+                        # Arrive at the corner.  Nudge a tiny amount past it so
+                        # float32 rounding cannot make this same corner appear
+                        # as the next corner forever and stall the robot.
+                        self.s[i] = min(
+                            next_corner + 1e-4, float(path.arc[-1])
+                        )
+                        xy, _, _ = interpolate_path(path, float(self.s[i]))
+                        self.base_pos[i, 0] = float(xy[0])
+                        self.base_pos[i, 1] = float(xy[1])
+                        self.base_pos[i, 2] = float(self.cfg.height.min_m)
+
+                        target = float(corner_targets[next_idx])
+                        self._turn_target[i] = target
+                        self.tangent[i] = target
+                        self.tangent_rate[i] = 0.0
+
+                        # Fully stationary at the corner while turning.
+                        self.ego_motion[i, 0] = 0.0
+                        self.ego_motion[i, 1] = 0.0
+                        self.ego_motion[i, 2] = 0.0
+
+                        if abs(float(wrap_to_pi(self.heading[i] - target))) >= 0.05:
+                            self._turn_in_place[i] = True
+                        continue
+
             # Advance arc length.  Reaching the goal is a soft event: the
             # robot keeps its pose and replans from the current position to a
             # new random goal, so no episode/GRU reset is triggered.
             self.s[i] = self.s[i] + self.v[i] * dt
             if self.s[i] >= float(path.arc[-1]):
                 self._replan_from_current(i)
-                path = self.paths[i]
-                self.s[i] = 0.0
+                if bool(self._replan_reset_buf[i]):
+                    # Replan failed; this env will be hard-reset later in this
+                    # step, so leave the current pose untouched.
+                    continue
+                # Successful replan enters turn-in-place; it will be processed
+                # on the next control step before any forward movement.
+                continue
 
             xy, tangent, tangent_rate = interpolate_path(
                 path, float(self.s[i])
             )
-            self.tangent[i] = tangent
-            self.tangent_rate[i] = tangent_rate * float(self.v[i])
 
-            # Heading controller.
+            # Heading reference is the actual segment direction (not the
+            # separately smoothed yaw), so the body never slides sideways.
+            if segment_dirs is not None and len(segment_dirs) > 0:
+                seg_idx = int(
+                    np.searchsorted(path.arc, float(self.s[i]), side="right") - 1
+                )
+                seg_idx = min(max(seg_idx, 0), len(segment_dirs) - 1)
+                seg_dir = float(segment_dirs[seg_idx])
+            else:
+                seg_dir = float(tangent)
+
+            self.tangent[i] = seg_dir
+            self.tangent_rate[i] = 0.0
+
+            # Heading controller tracks the actual segment direction.
             heading, omega, delta_actual = heading_update(
                 self.heading[i : i + 1],
                 self.tangent[i : i + 1],
-                self.tangent_rate[i : i + 1],
+                torch.zeros(1, device=self.device),
                 self.delta_target[i : i + 1],
                 dt,
                 float(self.cfg.path.k_p),
@@ -1439,16 +1550,19 @@ class EL_4090_EA2(BaseTask):
         high = self._envelope_high.to(self.device)
 
         potential = potential_reward(self.actions_mapped, low, high)
-        coll_ratio = collision_ratio(
-            self._compute_hex_world(),
-            self.occupancy,
+        violation = hex_collision_violation(
+            self.actions_mapped,
+            self.heading,
+            self.base_pos[:, :2],
+            self.distance_field,
             margin=float(self.cfg.envelope.margin),
-        ).to(self.device)
+            soft_margin=float(self.cfg.envelope.soft_margin),
+        )
         act_rate = action_rate_term(self.actions_mapped, self.last_actions)
 
         terms = {
             "potential": potential,
-            "collision": coll_ratio,
+            "collision": violation,
             "action_rate": act_rate,
         }
         for name, scale in self.reward_scales.items():
@@ -1487,6 +1601,11 @@ class EL_4090_EA2(BaseTask):
             self._envelope_high.to(self.device),
         )
 
+        # Episode metrics are only valid on the step where a timeout segment is
+        # logged; remove any stale copy from previous steps so the PPO logger
+        # does not re-sample it on every subsequent step.
+        self.extras.pop("episode", None)
+
         self.render()
         self.common_step_counter += 1
         self.episode_length_buf += 1
@@ -1502,9 +1621,11 @@ class EL_4090_EA2(BaseTask):
         self._compute_rewards()
 
         # Goal arrival is handled as a soft replan inside _step_kinematics, so
-        # in the normal loop there are no hard environment resets.  Keep a
-        # separate hard-reset buffer for any future true reset condition.
-        hard_reset = torch.zeros_like(self.reset_buf, dtype=torch.bool)
+        # in the normal loop there are usually no hard environment resets.  A
+        # rare replan failure sets the flag below to force a full reset instead
+        # of crashing a long training run.
+        hard_reset = self._replan_reset_buf.clone()
+        self._replan_reset_buf[:] = False
 
         # 40s timeout timer: every timeout restarts the timer and logs a
         # segment; only a probabilistic subset also clears the GRU memory.

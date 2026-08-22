@@ -17,7 +17,7 @@ uses the shared spider_envelop condition spec for prior derivation.
 
 from __future__ import annotations
 
-from typing import Callable, Tuple
+from typing import Tuple
 
 import torch
 from torch import Tensor
@@ -182,103 +182,145 @@ def point_in_hex(pts_xy: Tensor, vertices: Tensor) -> Tensor:
     return (cross >= 0).all(dim=-1)
 
 
-def _default_world_to_grid_fn(
-    world_min_xy: float = ea2c.EA2_WORLD_MIN_XY,
-    resolution_m: float = ea2c.EA2_RESOLUTION_M,
-) -> Callable[[Tensor], Tensor]:
-    """Return the canonical world->grid index function for the fixed EA2 map."""
+def hex_body_sample_points(params5: Tensor) -> Tensor:
+    """Return 34 body-frame sample points for one or more hexagons.
 
-    def world_to_grid_fn(world_xy: Tensor) -> Tensor:
-        return torch.floor((world_xy - world_min_xy) / resolution_m).long()
-
-    return world_to_grid_fn
-
-
-def collision_cell_ratio(
-    hex_vertices_world_xy: Tensor,
-    occupancy: Tensor | object,
-    world_to_grid_fn: Callable[[Tensor], Tensor] | None = None,
-) -> Tensor:
-    """Compute ``covered occupied cells / covered cells`` for each hexagon.
-
-    A cell is considered covered when its center lies inside the (possibly
-    offset) hexagon.  The denominator is protected with ``eps`` so empty
-    coverage yields zero instead of division by zero.
+    The sample set is:
+      * 6 vertices (B, D, F, E, C, A),
+      * 18 edge interpolation points (t = 0.25, 0.5, 0.75 on each edge),
+      * 1 centre,
+      * 9 interior points from a coarse 3x3 grid.
 
     Args:
-        hex_vertices_world_xy: Hexagon vertices in world coordinates, shape
-            ``(..., 6, 2)``.
-        occupancy: 2D occupancy array with shape ``(H, W)``.  Accepts
-            ``numpy.ndarray`` or ``torch.Tensor``; nonzero entries are
-            occupied.
-        world_to_grid_fn: Callable mapping world ``(..., 2)`` coordinates to
-            integer grid indices ``(..., 2)``.  Defaults to the canonical EA2
-            mapping ``ix = floor((x + 37.0) / 0.1)``, ``iy = floor((y + 37.0) /
-            0.1)``.
+        params5: Envelope parameters ``(..., 5)`` in the canonical order
+            ``[front_width, middle_width, back_width, forward_limit,
+            backward_limit]``.
 
     Returns:
-        Collision ratio tensor with the same leading batch shape as
-        ``hex_vertices_world_xy`` (or a scalar tensor for a single hexagon).
+        Tensor of shape ``(..., 34, 2)`` in the body frame (+x forward,
+        +y left).
     """
-    if occupancy.ndim != 2:
-        raise ValueError("occupancy must be a 2D array (H, W)")
-    occ = torch.as_tensor(occupancy, dtype=torch.bool)
-    height, width = occ.shape
+    if params5.shape[-1] != 5:
+        raise ValueError(f"Expected params5 width 5, got {params5.shape[-1]}")
 
-    if world_to_grid_fn is None:
-        world_to_grid_fn = _default_world_to_grid_fn()
+    verts = compute_hex_vertices(
+        params5[..., 0],
+        params5[..., 1],
+        params5[..., 2],
+        params5[..., 3],
+        params5[..., 4],
+    )  # (..., 6, 2)
+    next_v = torch.roll(verts, shifts=-1, dims=-2)
 
-    # Build all cell-center world coordinates once, vectorized over the grid.
-    # The canonical EA2 grid is used: cell (iy, ix) has world center
-    # (world_min + (ix + 0.5) * res, world_min + (iy + 0.5) * res).
-    # ``world_to_grid_fn`` is then applied to the flattened centers so the
-    # caller-supplied mapping is the authority for which occupancy cells are
-    # addressed (this supports custom maps that share the EA2 grid layout).
-    ix = torch.arange(width, dtype=torch.float32)
-    iy = torch.arange(height, dtype=torch.float32)
-    grid_x, grid_y = torch.meshgrid(ix, iy, indexing="xy")  # (H, W)
-    centers = torch.stack(
-        [
-            ea2c.EA2_WORLD_MIN_XY + (grid_x + 0.5) * ea2c.EA2_RESOLUTION_M,
-            ea2c.EA2_WORLD_MIN_XY + (grid_y + 0.5) * ea2c.EA2_RESOLUTION_M,
-        ],
-        dim=-1,
-    ).reshape(-1, 2)
+    edge_points = []
+    for t in (0.25, 0.5, 0.75):
+        edge_points.append(verts * (1.0 - t) + next_v * t)
 
-    grid_indices = world_to_grid_fn(centers)
-    if isinstance(grid_indices, (tuple, list)):
-        # tuple/list form follows the path_planner convention (iy, ix).
-        if len(grid_indices) != 2:
-            raise ValueError(
-                "world_to_grid_fn must return a 2-tuple (iy, ix) or a tensor"
-            )
-        grid_iy, grid_ix = grid_indices
-    else:
-        # tensor form follows the README convention: columns are (ix, iy).
-        if grid_indices.shape != centers.shape:
-            raise ValueError(
-                "world_to_grid_fn must return grid indices with shape (..., 2)"
-            )
-        grid_ix = grid_indices[..., 0]
-        grid_iy = grid_indices[..., 1]
-    grid_ix = grid_ix.long().clamp(0, width - 1)
-    grid_iy = grid_iy.long().clamp(0, height - 1)
-    flat_indices = grid_iy * width + grid_ix
-    occ_flat = occ.reshape(-1)[flat_indices]
+    center = verts.mean(dim=-2, keepdim=True)  # (..., 1, 2)
 
-    inside = point_in_hex(centers, hex_vertices_world_xy)
+    # Coarse 3x3 interior grid in the body frame.  The hexagon is not a
+    # rectangle, so for each longitudinal position the lateral half-width is
+    # linearly interpolated between back/middle/front widths.
+    front_width = params5[..., 0]
+    middle_width = params5[..., 1]
+    back_width = params5[..., 2]
+    forward_limit = params5[..., 3]
+    backward_limit = params5[..., 4]
 
-    eps = 1e-6
-    if inside.dim() == 1:
-        covered = inside.sum(dtype=torch.float32)
-        occupied_covered = (inside & occ_flat).sum(dtype=torch.float32)
-        return occupied_covered / (covered + eps)
-
-    covered = inside.sum(dim=-1, dtype=torch.float32)  # (...,)
-    occupied_covered = (inside & occ_flat.unsqueeze(0)).sum(
-        dim=-1, dtype=torch.float32
+    sx = torch.tensor(
+        [0.25, 0.5, 0.75], dtype=params5.dtype, device=params5.device
     )
-    return occupied_covered / (covered + eps)
+    sy = torch.tensor(
+        [-0.5, 0.0, 0.5], dtype=params5.dtype, device=params5.device
+    )
+
+    x = backward_limit.unsqueeze(-1) + sx * (
+        forward_limit - backward_limit
+    ).unsqueeze(-1)  # (..., 3)
+
+    # half-width at each x (upper boundary of the convex hexagon)
+    x_pos = x >= 0.0
+    w_pos = middle_width.unsqueeze(-1) + (
+        front_width - middle_width
+    ).unsqueeze(-1) * (
+        x / forward_limit.unsqueeze(-1).clamp_min(1e-6)
+    )
+    w_neg = back_width.unsqueeze(-1) + (
+        middle_width - back_width
+    ).unsqueeze(-1) * (
+        (x - backward_limit.unsqueeze(-1))
+        / (0.0 - backward_limit.unsqueeze(-1)).clamp_min(1e-6)
+    )
+    half_w = torch.where(x_pos, w_pos, w_neg).clamp_min(0.0)  # (..., 3)
+
+    y = half_w.unsqueeze(-1) * sy  # (..., 3, 3)
+    x_grid = x.unsqueeze(-1).expand(*x.shape, 3)  # (..., 3, 3)
+    interior = torch.stack([x_grid, y], dim=-1).reshape(
+        *params5.shape[:-1], 9, 2
+    )
+
+    points = torch.cat([verts] + edge_points + [center, interior], dim=-2)
+    # Nudge boundary samples a tiny amount toward the centroid so floating-point
+    # round-off cannot classify them as strictly outside the convex hexagon.
+    return center + (points - center) * (1.0 - 1e-4)
+
+
+def hex_collision_violation(
+    params5: Tensor,
+    heading: Tensor,
+    base_pos_xy: Tensor,
+    distance_field,
+    margin: float,
+    soft_margin: float,
+) -> Tensor:
+    """Worst-point smooth bounded collision violation from a distance field.
+
+    Args:
+        params5: Envelope parameters, shape ``(..., 5)``.
+        heading: Body yaw, shape ``(...,)``.
+        base_pos_xy: World ``(x, y)`` position, shape ``(..., 2)``.
+        distance_field: 2D unsigned distance-to-obstacle field, shape
+            ``(H, W)`` in metres.  Accepts ``numpy.ndarray`` or ``torch.Tensor``.
+        margin: Safe distance threshold (m).
+        soft_margin: Width over which the violation ramps from 0 to 1 (m).
+
+    Returns:
+        Violation tensor shape ``(...,)`` in ``[0, 1]``.  It is the maximum
+        per-sample ``clamp((margin - clearance) / soft_margin, 0, 1)``.
+    """
+    if soft_margin <= 0.0:
+        raise ValueError("soft_margin must be positive")
+
+    body_pts = hex_body_sample_points(params5)  # (..., 34, 2)
+
+    cos_h = torch.cos(heading).unsqueeze(-1)
+    sin_h = torch.sin(heading).unsqueeze(-1)
+    px = body_pts[..., 0]
+    py = body_pts[..., 1]
+    wx = base_pos_xy[..., 0:1] + cos_h * px - sin_h * py
+    wy = base_pos_xy[..., 1:2] + sin_h * px + cos_h * py
+
+    ix = torch.floor(
+        (wx - ea2c.EA2_WORLD_MIN_XY) / ea2c.EA2_RESOLUTION_M
+    ).long()
+    iy = torch.floor(
+        (wy - ea2c.EA2_WORLD_MIN_XY) / ea2c.EA2_RESOLUTION_M
+    ).long()
+
+    if isinstance(distance_field, torch.Tensor):
+        dist = distance_field
+    else:
+        dist = torch.as_tensor(distance_field, dtype=torch.float32)
+
+    height, width = dist.shape
+    ix = ix.clamp(0, width - 1)
+    iy = iy.clamp(0, height - 1)
+
+    dist_flat = dist.reshape(-1)
+    clearance = dist_flat[iy * width + ix]
+
+    violation = ((margin - clearance) / soft_margin).clamp(0.0, 1.0)
+    return violation.max(dim=-1).values
 
 
 def envelope_params_to_condition(

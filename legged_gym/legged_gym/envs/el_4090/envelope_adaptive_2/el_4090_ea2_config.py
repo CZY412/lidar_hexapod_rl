@@ -55,8 +55,8 @@ class El4090EA2Cfg(LeggedRobotCfg):
         # grid border is blocked so A* keeps the robot inside the map.
         boundary_occupied = True
         ground_margin_m = 2.0            # warp ground plane extends past map edges
-        inflation_m = 0.35               # A* lateral safety (3.5 cells -> 4)
-        inflation_cells = 4
+        inflation_m = 0.6               # A* lateral safety (3.5 cells -> 4)
+        inflation_cells = 6
         n_tiles = 4                      # 4 x 4 pillar-field plots
         tile_size_m = 16.0               # pd_gru terrain_length / terrain_width
         border_size_m = 5.0              # pd_gru border_size
@@ -70,16 +70,16 @@ class El4090EA2Cfg(LeggedRobotCfg):
 
     class obstacles:
         # pd_gru_lidar pillar_field_terrain parameters (per 16m x 16m tile)
-        pillar_count_min = 15
-        pillar_count_max = 15
+        pillar_count_min = 18
+        pillar_count_max = 18
         pillar_size_x_min = 0.5
         pillar_size_x_max = 4.0
         pillar_size_y_min = 0.5
         pillar_size_y_max = 4.0
         pillar_height_min = 1.0
         pillar_height_max = 2.0
-        pillar_min_separation = 2.2
-        pillar_center_clear_radius = 2.2
+        pillar_min_separation = 2.6
+        pillar_center_clear_radius = 1.0
         pillar_spawn_radius = 7.5
         pillar_allow_height_variation = True
 
@@ -137,7 +137,8 @@ class El4090EA2Cfg(LeggedRobotCfg):
         random_angle_noise = 0.0
 
     class envelope:
-        margin = 0.05                    # exact half-plane offset for collision
+        margin = 0.10                    # safe-distance threshold for clearance penalty (m)
+        soft_margin = 0.10               # width over which the violation ramps to 1 (m)
         # 5 params + 3 priors are loaded from the frozen contract path
         # (_contracts.ENVELOPE_SPEC_CONFIG_PATH).
         # spider_envelop_2-style bold footprint drawing
@@ -150,7 +151,7 @@ class El4090EA2Cfg(LeggedRobotCfg):
         # BaseTask does not auto-scale reward terms; env multiplies directly.
         class scales:
             potential = 1.0
-            collision = -2.0
+            collision = -1.0
             action_rate = -0.01
 
     class normalization:
@@ -186,7 +187,7 @@ class El4090EA2CfgPPO(LeggedRobotCfgPPO):
     class runner(LeggedRobotCfgPPO.runner):
         policy_class_name = "ActorCriticRecurrent"
         algorithm_class_name = "PPO"
-        num_steps_per_env = 50          # 1 s ~= 10 LiDAR frames per segment
+        num_steps_per_env = 24          # 1 s ~= 10 LiDAR frames per segment
         max_iterations = 3000
         save_interval = 50
         experiment_name = "el4090_ea2"

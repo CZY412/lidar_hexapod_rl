@@ -32,7 +32,7 @@ def test_env_cfg_contract():
     assert cfg.obstacles.pillar_count_max == 15
     assert cfg.obstacles.pillar_size_x_min == 0.5
     assert cfg.obstacles.pillar_size_x_max == 4.0
-    assert cfg.obstacles.pillar_min_separation == 2.2
+    assert cfg.obstacles.pillar_min_separation == 2.4
     assert cfg.obstacles.pillar_center_clear_radius == 2.2
     assert cfg.lidar.offset_pos == [0.7, 0.0, -0.05]
     assert cfg.lidar.far_plane == 60.0
@@ -43,13 +43,16 @@ def test_env_cfg_contract():
     assert cfg.lidar.enable_sensor_noise is True
     assert cfg.lidar.pixel_std_dev_multiplier == 0.02
     assert cfg.lidar.pixel_dropout_prob == 0.02
+    assert cfg.envelope.margin == 0.10
+    assert cfg.envelope.soft_margin == 0.10
+    assert cfg.rewards.scales.collision == -1.0
 
 
 def test_ppo_cfg_contract():
     cfg = El4090EA2CfgPPO()
     assert cfg.runner.policy_class_name == "ActorCriticRecurrent"
     assert cfg.runner.algorithm_class_name == "PPO"
-    assert cfg.runner.num_steps_per_env == 50
+    assert cfg.runner.num_steps_per_env == 24
     assert cfg.policy.rnn_type == "gru"
     assert cfg.policy.rnn_hidden_dim == 187
     assert cfg.policy.actor_hidden_dims == [256, 128]
