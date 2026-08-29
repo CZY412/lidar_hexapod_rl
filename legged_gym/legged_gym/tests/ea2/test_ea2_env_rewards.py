@@ -128,6 +128,10 @@ def test_compute_rewards_wiring_and_metrics():
         max_dist=float(env.cfg.envelope.oracle_max_dist),
         soft_dof_pos_limit=float(env.cfg.envelope.soft_dof_pos_limit),
         interp_crossing=interp,
+        # must mirror what the env uses, otherwise the recomputed oracle mse
+        # is compared against a different group_mode than env._compute_rewards
+        # used (the two modes give genuinely different scales)
+        group_mode=str(getattr(env.cfg.envelope, "oracle_group_mode", "coupled")),
     )
     oracle_mse = (
         (normalized_envelope_params(env.actions_mapped, low, high)
