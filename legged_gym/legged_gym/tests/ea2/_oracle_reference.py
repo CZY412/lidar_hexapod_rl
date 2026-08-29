@@ -35,18 +35,6 @@ from torch import Tensor
 _EDGE_COUNT = 24
 
 
-def full_edge_directions(low: Tensor, high: Tensor, device) -> tuple[Tensor, Tensor]:
-    """Frozen copy of ``envelope_oracle._full_edge_directions``."""
-    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
-        hex_body_sample_points,
-    )
-
-    edge = hex_body_sample_points(torch.stack([low, high]).unsqueeze(0))[0, :_EDGE_COUNT, :]
-    edge = edge.to(device=device)
-    radii = torch.linalg.norm(edge, dim=-1)
-    return edge, radii
-
-
 def axis_march_crossing(
     sample,
     start_x: Tensor,
@@ -86,6 +74,94 @@ def axis_march_crossing(
         prev_clear = clearance
         t += step
     return first_bad
+
+
+def raw_scales_coupled(
+    heading: Tensor,
+    base_pos_xy: Tensor,
+    distance_field,
+    low: Tensor,
+    high: Tensor,
+    margin: float,
+    step: float,
+    max_dist: float,
+    interp_crossing: bool,
+) -> Tensor:
+    """Frozen copy of the ``"coupled"`` branch of ``_compute_raw_scales``.
+
+    Production runs ``"axis"``, but several tests and validation scripts still
+    exercise ``"coupled"`` and one test compares the two modes, so this path is
+    frozen too: it must stay bit-exact unless a commit intentionally changes
+    coupled semantics.
+
+    NOTE: the 24-direction march uses ``_full_edge_directions``, i.e. the
+    sample points of ``max_v = _physical_min_max(low, high)[1]``.  An earlier
+    version of this reference used ``stack([low, high])`` instead, which is
+    wrong and would have silently validated a different march.
+    """
+    from legged_gym.envs.el_4090.envelope_adaptive_2 import envelope_oracle as eo
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
+        hex_body_sample_points,
+    )
+
+    device = base_pos_xy.device
+    if isinstance(distance_field, torch.Tensor):
+        dist = distance_field
+    else:
+        dist = torch.as_tensor(distance_field, dtype=torch.float32, device=device)
+    if dist.device != device:
+        dist = dist.to(device)
+    sample = eo._make_field_sampler(dist, interp_crossing, max_dist)
+
+    min_v, max_v = eo._physical_min_max(low, high)
+    full = hex_body_sample_points(max_v.unsqueeze(0))
+    edge = full[0, :_EDGE_COUNT].to(device)
+    radii = torch.norm(edge, dim=-1)
+
+    cos_h = torch.cos(heading).unsqueeze(-1)
+    sin_h = torch.sin(heading).unsqueeze(-1)
+    wx = cos_h * edge[:, 0] - sin_h * edge[:, 1]
+    wy = sin_h * edge[:, 0] + cos_h * edge[:, 1]
+    norm = torch.hypot(wx, wy).clamp_min(1e-6)
+    dir_x, dir_y = wx / norm, wy / norm
+
+    first_bad = torch.full((base_pos_xy.shape[0], _EDGE_COUNT), float("inf"),
+                           dtype=torch.float32, device=device)
+    prev_t = torch.zeros_like(first_bad)
+    prev_clear = torch.full_like(first_bad, max_dist + 1.0)
+
+    t = step
+    while t <= max_dist + 1e-9:
+        px = base_pos_xy[:, 0:1] + t * dir_x
+        py = base_pos_xy[:, 1:2] + t * dir_y
+        clearance = sample(px, py)
+        bad = clearance < margin
+        if interp_crossing:
+            frac = (prev_clear - margin) / (prev_clear - clearance).clamp_min(1e-6)
+            frac = frac.clamp(0.0, 1.0)
+            t_cross = prev_t + frac * (t - prev_t)
+            first_bad = torch.where(bad & torch.isinf(first_bad), t_cross, first_bad)
+        else:
+            first_bad = torch.where(bad & torch.isinf(first_bad), t, first_bad)
+        prev_t = torch.full_like(prev_t, t)
+        prev_clear = clearance
+        t += step
+
+    if interp_crossing:
+        allowed = torch.where(torch.isfinite(first_bad),
+                              first_bad / radii.unsqueeze(0),
+                              torch.ones_like(first_bad))
+    else:
+        allowed = torch.where(
+            torch.isfinite(first_bad),
+            ((first_bad - step) / radii.unsqueeze(0)).clamp(0.0, 1.0),
+            torch.ones_like(first_bad))
+
+    scales = []
+    for name in eo.PARAM_NAMES:
+        idx = eo.GROUP_INDICES[name]
+        scales.append(allowed[:, idx].min(dim=-1).values.clamp(0.0, 1.0))
+    return torch.stack(scales, dim=-1)
 
 
 def raw_scales_axis(

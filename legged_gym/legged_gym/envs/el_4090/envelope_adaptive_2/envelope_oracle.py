@@ -172,57 +172,22 @@ def _make_field_sampler(dist: Tensor, interp: bool, max_dist: float):
     return sample
 
 
-def _axis_march_crossing(sample, start_x: Tensor, start_y: Tensor,
-                         dir_x: Tensor, dir_y: Tensor,
-                         margin: float, step: float, max_dist: float,
-                         interp: bool) -> Tensor:
-    """Vectorised march along per-env directions; first clearance < margin
-    crossing distance (interpolated when interp), inf when clear.
-
-    The start point itself is sampled explicitly (t = 0) so a start already
-    on/beyond the margin contour yields a crossing of 0 instead of the
-    sentinel-based over-allowance of the first loop sample.
-    """
-    device = start_x.device
-    first_bad = torch.full(
-        (start_x.shape[0], 1), float("inf"), dtype=torch.float32, device=device
-    )
-    prev_t = torch.zeros_like(first_bad)
-    prev_clear = sample(start_x, start_y)
-    bad0 = prev_clear < margin
-    first_bad = torch.where(bad0, torch.zeros_like(first_bad), first_bad)
-    t = step
-    while t <= max_dist + 1e-9:
-        px = start_x + t * dir_x
-        py = start_y + t * dir_y
-        clearance = sample(px, py)
-        bad = clearance < margin
-        if interp:
-            frac = (prev_clear - margin) / (prev_clear - clearance).clamp_min(1e-6)
-            frac = frac.clamp(0.0, 1.0)
-            t_cross = prev_t + frac * (t - prev_t)
-            first_bad = torch.where(
-                bad & torch.isinf(first_bad), t_cross, first_bad
-            )
-        else:
-            first_bad = torch.where(bad & torch.isinf(first_bad), t, first_bad)
-        prev_t = torch.full_like(prev_t, t)
-        prev_clear = clearance
-        t += step
-    return first_bad
-
-
 def _axis_march_crossing_batched(sample, start_x: Tensor, start_y: Tensor,
                                  dir_x: Tensor, dir_y: Tensor,
                                  margin: float, step: float, max_dist: float,
                                  interp: bool, t_chunk: int = 8) -> Tensor:
-    """Batched equivalent of :func:`_axis_march_crossing`.
+    """Batched axis-aligned ray march: first crossing distance per direction.
 
-    The sequential loop advances one ``step`` at a time, so it issues ~21
-    rounds of tiny kernels per call; with four calls per control step and
-    1024 envs this dominates the oracle cost.  This version evaluates the
-    same march positions in a single batched sampler call and then reduces
-    "first crossing" out of them.
+    Returns the distance at which the clearance first drops below ``margin``
+    along each direction, interpolated when ``interp`` is set, and ``inf`` when
+    the ray never crosses.
+
+    The original implementation advanced one ``step`` at a time in a Python
+    loop, issuing ~21 rounds of tiny kernels per call; with four calls per
+    control step and 1024 envs that dominated the oracle cost.  This version
+    evaluates the same march positions in batched sampler calls and reduces the
+    "first crossing" out of them.  The superseded loop version is preserved in
+    ``tests/ea2/_oracle_reference.py`` as the bitwise reference.
 
     The result is *bitwise* identical to the loop: every op is elementwise
     and re-associated only across the independent ``t`` axis, and the
@@ -405,6 +370,87 @@ def _axis_decoupled_scales(
     )
 
 
+def _coupled_scales(
+    heading: Tensor,
+    base_pos_xy: Tensor,
+    low: Tensor,
+    high: Tensor,
+    margin: float,
+    step: float,
+    sample,
+    max_dist: float,
+    interp_crossing: bool,
+    device: torch.device,
+) -> Tensor:
+    """Historical 'coupled' scales from the 24-direction boundary march.
+
+    Kept as-is: production runs ``"axis"``, but several tests and validation
+    scripts still exercise ``"coupled"``, and one test compares the two modes.
+    A frozen copy for equivalence checking lives in
+    ``tests/ea2/_oracle_reference.py``.
+    """
+    edge, radii = _full_edge_directions(low, high, device)
+
+    # Rotate body-frame edge directions into world frame.
+    cos_h = torch.cos(heading).unsqueeze(-1)
+    sin_h = torch.sin(heading).unsqueeze(-1)
+    wx = cos_h * edge[:, 0] - sin_h * edge[:, 1]
+    wy = sin_h * edge[:, 0] + cos_h * edge[:, 1]
+    norm = torch.hypot(wx, wy).clamp_min(1e-6)
+    dir_x = wx / norm
+    dir_y = wy / norm
+
+    first_bad = torch.full(
+        (base_pos_xy.shape[0], _EDGE_COUNT),
+        float("inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    prev_t = torch.zeros_like(first_bad)
+    prev_clear = torch.full_like(first_bad, max_dist + 1.0)
+
+    t = step
+    while t <= max_dist + 1e-9:
+        px = base_pos_xy[:, 0:1] + t * dir_x
+        py = base_pos_xy[:, 1:2] + t * dir_y
+        clearance = sample(px, py)
+        bad = clearance < margin
+        if interp_crossing:
+            frac = (prev_clear - margin) / (prev_clear - clearance).clamp_min(1e-6)
+            frac = frac.clamp(0.0, 1.0)
+            t_cross = prev_t + frac * (t - prev_t)
+            first_bad = torch.where(
+                bad & torch.isinf(first_bad), t_cross, first_bad
+            )
+        else:
+            first_bad = torch.where(bad & torch.isinf(first_bad), t, first_bad)
+        prev_t = torch.full_like(prev_t, t)
+        prev_clear = clearance
+        t += step
+
+    if interp_crossing:
+        allowed = torch.where(
+            torch.isfinite(first_bad),
+            first_bad / radii.unsqueeze(0),
+            torch.ones_like(first_bad),
+        )
+    else:
+        allowed = torch.where(
+            torch.isfinite(first_bad),
+            ((first_bad - step) / radii.unsqueeze(0)).clamp(0.0, 1.0),
+            torch.ones_like(first_bad),
+        )
+
+    scales = []
+    for name in PARAM_NAMES:
+        idx = GROUP_INDICES[name]
+        group_allowed = allowed[:, idx]
+        s = group_allowed.min(dim=-1).values
+        scales.append(s.clamp(0.0, 1.0))
+
+    return torch.stack(scales, dim=-1)  # (E, 5)
+
+
 def _compute_raw_scales(
     heading: Tensor,
     base_pos_xy: Tensor,
@@ -479,66 +525,9 @@ def _compute_raw_scales(
         raise ValueError(
             f"unknown group_mode: {group_mode!r} (expected 'coupled' or 'axis')")
 
-    edge, radii = _full_edge_directions(low, high, device)
-
-    # Rotate body-frame edge directions into world frame.
-    cos_h = torch.cos(heading).unsqueeze(-1)
-    sin_h = torch.sin(heading).unsqueeze(-1)
-    wx = cos_h * edge[:, 0] - sin_h * edge[:, 1]
-    wy = sin_h * edge[:, 0] + cos_h * edge[:, 1]
-    norm = torch.hypot(wx, wy).clamp_min(1e-6)
-    dir_x = wx / norm
-    dir_y = wy / norm
-
-    first_bad = torch.full(
-        (base_pos_xy.shape[0], _EDGE_COUNT),
-        float("inf"),
-        dtype=torch.float32,
-        device=device,
-    )
-    prev_t = torch.zeros_like(first_bad)
-    prev_clear = torch.full_like(first_bad, max_dist + 1.0)
-
-    t = step
-    while t <= max_dist + 1e-9:
-        px = base_pos_xy[:, 0:1] + t * dir_x
-        py = base_pos_xy[:, 1:2] + t * dir_y
-        clearance = sample(px, py)
-        bad = clearance < margin
-        if interp_crossing:
-            frac = (prev_clear - margin) / (prev_clear - clearance).clamp_min(1e-6)
-            frac = frac.clamp(0.0, 1.0)
-            t_cross = prev_t + frac * (t - prev_t)
-            first_bad = torch.where(
-                bad & torch.isinf(first_bad), t_cross, first_bad
-            )
-        else:
-            first_bad = torch.where(bad & torch.isinf(first_bad), t, first_bad)
-        prev_t = torch.full_like(prev_t, t)
-        prev_clear = clearance
-        t += step
-
-    if interp_crossing:
-        allowed = torch.where(
-            torch.isfinite(first_bad),
-            first_bad / radii.unsqueeze(0),
-            torch.ones_like(first_bad),
-        )
-    else:
-        allowed = torch.where(
-            torch.isfinite(first_bad),
-            ((first_bad - step) / radii.unsqueeze(0)).clamp(0.0, 1.0),
-            torch.ones_like(first_bad),
-        )
-
-    scales = []
-    for name in PARAM_NAMES:
-        idx = GROUP_INDICES[name]
-        group_allowed = allowed[:, idx]
-        s = group_allowed.min(dim=-1).values
-        scales.append(s.clamp(0.0, 1.0))
-
-    return torch.stack(scales, dim=-1)  # (E, 5)
+    return _coupled_scales(
+        heading, base_pos_xy, low, high, margin, step, sample,
+        max_dist, interp_crossing, device)
 
 
 def _params_from_scales(

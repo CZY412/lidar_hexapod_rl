@@ -229,19 +229,54 @@ def test_axis_equivalent_over_a_multi_step_sequence(field):
 # 3. coupled mode must keep working (tests import it directly)
 # ---------------------------------------------------------------------------
 
-def test_coupled_mode_still_matches_its_own_semantics(field):
-    """The axis optimisation must not touch the coupled branch.
+def test_reference_copy_matches_production_coupled(field):
+    """Same guard as the axis one, for the coupled reference copy.
 
-    ``test_envelope_oracle.py`` compares coupled against axis, so both paths
-    must remain correct even though production runs axis.
+    An earlier draft of the frozen copy built the 24-direction march from
+    stack([low, high]) instead of max_v, which is wrong.  This test is what
+    makes such a mistake visible instead of silently validating a different
+    march.
     """
-    head, pos = _poses(64, seed=41)
+    head, pos = _poses(128, seed=61)
     for interp in (True, False):
-        out = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
-                                     _MARGIN, 0.05, 5.0, interp, "coupled")
-        assert out.shape == (64, 5)
-        assert torch.isfinite(out).all()
-        assert bool(((out >= 0.0) & (out <= 1.0)).all())
+        prod = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
+                                      _MARGIN, 0.05, 5.0, interp, "coupled")
+        frozen = ref.raw_scales_coupled(head, pos, field, _LOW, _HIGH,
+                                        _MARGIN, 0.05, 5.0, interp)
+        assert torch.equal(prod, frozen), (
+            f"frozen coupled reference diverged (interp={interp})")
+
+
+@pytest.mark.parametrize("interp", [True, False])
+def test_coupled_matches_reference_random_poses(field, interp):
+    """The axis optimisation must not disturb the coupled branch.
+
+    Production runs axis, but several tests and validation scripts exercise
+    coupled, and one test compares the two modes -- so it is frozen too.
+    """
+    head, pos = _poses(128, seed=41)
+    prod = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
+                                  _MARGIN, 0.05, 5.0, interp, "coupled")
+    frozen = ref.raw_scales_coupled(head, pos, field, _LOW, _HIGH,
+                                    _MARGIN, 0.05, 5.0, interp)
+    assert torch.equal(prod, frozen)
+
+
+@pytest.mark.parametrize("interp", [True, False])
+@pytest.mark.parametrize("margin,step,max_dist", [
+    (0.20, 0.05, 5.0),     # current production margin
+    (0.10, 0.05, 5.0),     # historical margin
+    (0.10, 0.01, 5.0),
+    (0.50, 0.05, 5.0),
+    (0.10, 0.05, 0.30),
+])
+def test_coupled_matches_reference_geometry(field, interp, margin, step, max_dist):
+    head, pos = _poses(64, seed=67)
+    prod = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
+                                  margin, step, max_dist, interp, "coupled")
+    frozen = ref.raw_scales_coupled(head, pos, field, _LOW, _HIGH,
+                                    margin, step, max_dist, interp)
+    assert torch.equal(prod, frozen)
 
 
 def test_unknown_group_mode_is_rejected(field):
