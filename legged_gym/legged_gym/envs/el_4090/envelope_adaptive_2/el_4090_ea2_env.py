@@ -1344,7 +1344,8 @@ class EL_4090_EA2(BaseTask):
           step=(float(self.cfg.envelope.oracle_step)),
           max_dist=(float(self.cfg.envelope.oracle_max_dist)),
           soft_dof_pos_limit=(float(self.cfg.envelope.soft_dof_pos_limit)),
-          interp_crossing=(bool(getattr(self.cfg.envelope, "oracle_interp_crossing", True))))
+          interp_crossing=(bool(getattr(self.cfg.envelope, "oracle_interp_crossing", True))),
+          group_mode=(str(getattr(self.cfg.envelope, "oracle_group_mode", "coupled"))))
         # Rate-limited smoothing: the supervised target (and the telemetry that
         # describes it) is the final candidate; the smoother is advanced
         # exactly once per control step here.  Disabled/absent -> identity.

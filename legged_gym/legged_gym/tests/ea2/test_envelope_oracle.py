@@ -367,3 +367,109 @@ def test_raw_scale_monotone_under_narrowing():
         if prev is not None:
             assert bool((scales <= prev + 1e-5).all())
         prev = scales
+
+
+# ---------------------------------------------------------------------------
+# group_mode="axis" -- parameter-group decoupling (verified coordinate
+# decomposition: the A-B edge is the line x = forward_limit, y = +-front_width
+# ---------------------------------------------------------------------------
+
+
+def _thick_wall_field_x(x_wall: float, cells: int = 5) -> np.ndarray:
+    mask = np.zeros((740, 740), dtype=bool)
+    ix_w = int(round((x_wall + 37.0) / 0.1))
+    mask[:, ix_w : ix_w + cells] = True
+    return ndimage.distance_transform_edt(~mask, sampling=(0.1, 0.1)).astype(np.float32)
+
+
+def test_axis_mode_front_wall_opens_width():
+    """Dead-ahead wall: axis mode shrinks forward_limit and leaves
+    front_width fully open (the coupled mode drags it down)."""
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_oracle import (
+        _compute_raw_scales,
+    )
+
+    head = torch.zeros(1)
+    pos = torch.zeros(1, 2)
+    df = _thick_wall_field_x(0.8)
+    s_cpl = _compute_raw_scales(
+        head, pos, df, _LOW, _HIGH, 0.10, 0.05, 5.0, True, "coupled"
+    )
+    s_ax = _compute_raw_scales(
+        head, pos, df, _LOW, _HIGH, 0.10, 0.05, 5.0, True, "axis"
+    )
+    # both constrain the forward extent
+    assert float(s_ax[0, 3]) < 1.0
+    # decoupling: the width opens under axis mode
+    assert float(s_ax[0, 0]) == pytest.approx(1.0, abs=1e-5)
+    assert float(s_cpl[0, 0]) < float(s_ax[0, 0]) - 1e-3
+    # rear is open in both
+    assert float(s_ax[0, 4]) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_axis_mode_corridor_constrains_widths_not_forward():
+    """Parallel walls: axis mode constrains the widths, forward stays open."""
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_oracle import (
+        _compute_raw_scales,
+    )
+
+    mask = np.zeros((740, 740), dtype=bool)
+    ys = np.arange(740) * 0.1 - 37.0
+    for iy, y in enumerate(ys):
+        if abs(y) > 0.65:
+            mask[iy, :] = True
+    df = ndimage.distance_transform_edt(~mask, sampling=(0.1, 0.1)).astype(np.float32)
+    head = torch.zeros(1)
+    pos = torch.zeros(1, 2)
+    s_ax = _compute_raw_scales(
+        head, pos, df, _LOW, _HIGH, 0.10, 0.05, 5.0, True, "axis"
+    )
+    # lateral axes hit the walls
+    assert float(s_ax[0, 0]) < 1.0 and float(s_ax[0, 1]) < 1.0 and float(s_ax[0, 2]) < 1.0
+    # nothing ahead of the robot along +x within 5 m
+    assert float(s_ax[0, 3]) == pytest.approx(1.0, abs=1e-6)
+    assert float(s_ax[0, 4]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_axis_mode_ramp_exact_values():
+    """On the y-independent linear ramp the axis-mode forward scale is exactly
+    (contour_x - robot_x) / forward_span and the width is unconstrained."""
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_oracle import (
+        _compute_raw_scales,
+    )
+
+    xs = -37.0 + (np.arange(740) + 0.5) * 0.1
+    values = (0.5 * (37.0 - xs)).astype(np.float32)
+    df = np.broadcast_to(values[None, :], (740, 740)).copy()
+    head = torch.zeros(1)
+    pos = torch.tensor([[36.0, 0.0]])
+    s_ax = _compute_raw_scales(
+        head, pos, df, _LOW, _HIGH, 0.10, 0.05, 5.0, True, "axis"
+    )
+    assert s_ax[0, 3].item() == pytest.approx((0.8 - 0.6) / 0.3, abs=1e-3)
+    assert float(s_ax[0, 0]) == pytest.approx(1.0, abs=1e-4)
+    assert float(s_ax[0, 1]) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_axis_mode_direct_output_safety_postcondition():
+    """Diagonal obstacle (axis marches are blind to it): the active-set stage
+    must still return a safe composed hexagon within hard bounds."""
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
+        hex_collision_terms,
+    )
+
+    df = _open_field()
+    # diagonal pillar at (0.85, 0.85): visible to the front-width rays'
+    # diagonal neighbours but not to the +-x axis marches
+    df[377, 378] = 0.0
+    head = torch.zeros(1)
+    pos = torch.zeros(1, 2)
+    direct, _ = compute_direct_oracle_params_with_stats(
+        head, pos, df, _LOW, _HIGH, interp_crossing=True, group_mode="axis"
+    )
+    _, hard = hex_collision_terms(
+        direct, head, pos, torch.as_tensor(df), margin=0.10, soft_margin=0.10
+    )
+    assert float(hard.max()) <= 0.06
+    assert bool((direct[:, :4] >= _LOW[:4].unsqueeze(0) - 1e-5).all())
+    assert bool((direct[:, 4] >= _LOW[4] - 1e-5) and (direct[:, 4] <= _HIGH[4] + 1e-5))

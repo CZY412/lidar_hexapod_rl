@@ -265,6 +265,39 @@ def hex_body_sample_points(params5: Tensor) -> Tensor:
     return center + (points - center) * (1.0 - 1e-4)
 
 
+def _bilinear_field_sample(dist: Tensor, wx: Tensor, wy: Tensor) -> Tensor:
+    """Bilinearly interpolate the distance field at world positions.
+
+    Cell ``k`` covers ``[world_min + k*res, world_min + (k+1)*res)`` and its
+    value is attributed to the cell centre; the interpolation therefore uses
+    the four surrounding cell centres.  Out-of-bounds positions read the
+    clamped edge value.  Used by the continuous collision variant: unlike the
+    nearest-cell read it is continuous across cell boundaries, so penalties
+    scale with sub-cell penetration depth instead of jumping a full
+    soft-margin step when a sample crosses a raster line.
+    """
+    res = ea2c.EA2_RESOLUTION_M
+    wmin = ea2c.EA2_WORLD_MIN_XY
+    height, width = dist.shape
+    u = (wx - wmin) / res - 0.5
+    v = (wy - wmin) / res - 0.5
+    ix0 = torch.floor(u).long()
+    iy0 = torch.floor(v).long()
+    fx = (u - ix0.to(u.dtype)).clamp(0.0, 1.0)
+    fy = (v - iy0.to(v.dtype)).clamp(0.0, 1.0)
+    ix1 = (ix0 + 1).clamp(0, width - 1)
+    iy1 = (iy0 + 1).clamp(0, height - 1)
+    cix0 = ix0.clamp(0, width - 1)
+    ciy0 = iy0.clamp(0, height - 1)
+    d00 = dist[ciy0, cix0]
+    d10 = dist[ciy0, ix1]
+    d01 = dist[iy1, cix0]
+    d11 = dist[iy1, ix1]
+    top = d00 + (d10 - d00) * fx
+    bot = d01 + (d11 - d01) * fx
+    return top + (bot - top) * fy
+
+
 def _hex_sample_violations(
     params5: Tensor,
     heading: Tensor,
@@ -272,6 +305,7 @@ def _hex_sample_violations(
     distance_field,
     margin: float,
     soft_margin: float,
+    sampling: str = "nearest",
 ) -> Tensor:
     """Per-sample smooth bounded collision violations for all hex samples.
 
@@ -283,12 +317,20 @@ def _hex_sample_violations(
             ``(H, W)`` in metres.  Accepts ``numpy.ndarray`` or ``torch.Tensor``.
         margin: Safe distance threshold (m).
         soft_margin: Width over which the violation ramps from 0 to 1 (m).
+        sampling: ``"nearest"`` (default) reads the containing cell's value
+            (piecewise-constant in sample position, the historical semantics);
+            ``"bilinear"`` interpolates the four surrounding cell centres
+            (continuous in sample position, so penalties scale with sub-cell
+            penetration depth instead of jumping a full ramp step at raster
+            lines).
 
     Returns:
         Violation tensor shape ``(..., 34)``, each value in ``[0, 1]``.
     """
     if soft_margin <= 0.0:
         raise ValueError("soft_margin must be positive")
+    if sampling not in ("nearest", "bilinear"):
+        raise ValueError(f"unknown sampling mode: {sampling!r}")
 
     body_pts = hex_body_sample_points(params5)  # (..., 34, 2)
 
@@ -299,24 +341,27 @@ def _hex_sample_violations(
     wx = base_pos_xy[..., 0:1] + cos_h * px - sin_h * py
     wy = base_pos_xy[..., 1:2] + sin_h * px + cos_h * py
 
-    ix = torch.floor(
-        (wx - ea2c.EA2_WORLD_MIN_XY) / ea2c.EA2_RESOLUTION_M
-    ).long()
-    iy = torch.floor(
-        (wy - ea2c.EA2_WORLD_MIN_XY) / ea2c.EA2_RESOLUTION_M
-    ).long()
-
     if isinstance(distance_field, torch.Tensor):
         dist = distance_field
     else:
         dist = torch.as_tensor(distance_field, dtype=torch.float32)
 
-    height, width = dist.shape
-    ix = ix.clamp(0, width - 1)
-    iy = iy.clamp(0, height - 1)
+    if sampling == "bilinear":
+        clearance = _bilinear_field_sample(dist, wx, wy)
+    else:
+        ix = torch.floor(
+            (wx - ea2c.EA2_WORLD_MIN_XY) / ea2c.EA2_RESOLUTION_M
+        ).long()
+        iy = torch.floor(
+            (wy - ea2c.EA2_WORLD_MIN_XY) / ea2c.EA2_RESOLUTION_M
+        ).long()
 
-    dist_flat = dist.reshape(-1)
-    clearance = dist_flat[iy * width + ix]
+        height, width = dist.shape
+        ix = ix.clamp(0, width - 1)
+        iy = iy.clamp(0, height - 1)
+
+        dist_flat = dist.reshape(-1)
+        clearance = dist_flat[iy * width + ix]
 
     return ((margin - clearance) / soft_margin).clamp(0.0, 1.0)
 
@@ -328,6 +373,7 @@ def hex_collision_violation(
     distance_field,
     margin: float,
     soft_margin: float,
+    sampling: str = "nearest",
 ) -> Tensor:
     """Worst-point smooth bounded collision violation from a distance field.
 
@@ -351,6 +397,7 @@ def hex_collision_violation(
         distance_field,
         margin,
         soft_margin,
+        sampling=sampling,
     )
     return hard
 
@@ -362,6 +409,7 @@ def hex_collision_edge_sum(
     distance_field,
     margin: float,
     soft_margin: float,
+    sampling: str = "nearest",
 ) -> Tensor:
     """Sum of smooth collision violations over the 24 hexagon boundary samples.
 
@@ -389,6 +437,7 @@ def hex_collision_edge_sum(
         distance_field,
         margin,
         soft_margin,
+        sampling=sampling,
     )
     return dense
 
@@ -400,6 +449,7 @@ def hex_collision_terms(
     distance_field,
     margin: float,
     soft_margin: float,
+    sampling: str = "nearest",
 ) -> Tuple[Tensor, Tensor]:
     """Return ``(dense_edge_sum, hard_max)`` from a single sampling pass.
 
@@ -413,6 +463,7 @@ def hex_collision_terms(
         distance_field,
         margin,
         soft_margin,
+        sampling=sampling,
     )
     return violation[..., :24].sum(dim=-1), violation.max(dim=-1).values
 

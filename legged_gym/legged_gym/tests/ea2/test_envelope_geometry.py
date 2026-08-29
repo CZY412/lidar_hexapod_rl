@@ -35,6 +35,7 @@ from legged_gym.utils.envelop.network.haa_swing_range import (
 
 import numpy as np
 import pytest
+from scipy import ndimage
 import torch
 
 
@@ -350,3 +351,107 @@ def test_hex_collision_terms_internal_consistency() -> None:
     torch.testing.assert_close(hard, hard_ref)
     # max over all 34 samples dominates the boundary-only sum's average scale
     assert float(hard) >= 0.0 and float(dense) >= 0.0
+
+
+def test_bilinear_sampling_is_continuous_across_raster_lines() -> None:
+    """Nearest-cell reads jump by a full ramp step when a sample crosses a
+    raster line; bilinear reads change smoothly.  Sweep a hex through a wall
+    approach and compare adjacent-sample violation deltas."""
+    import torch
+
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
+        _hex_sample_violations,
+    )
+
+    # thick wall (5 cells) with its front face at x ~= 0.8: the hexagon apex
+    # approaches head-on and stays inside the wall through the whole sweep
+    mask = np.zeros(c.EA2_GRID_SHAPE, dtype=bool)
+    ix_w = int(round((0.8 - c.EA2_WORLD_MIN_XY) / c.EA2_RESOLUTION_M))
+    mask[:, ix_w : ix_w + 5] = True
+    df = ndimage.distance_transform_edt(~mask, sampling=(0.1, 0.1)).astype(np.float32)
+    dft = torch.as_tensor(df)
+
+    params = torch.tensor([[0.6, 0.6, 0.6, 0.9, -0.9]])
+    heading = torch.zeros(1)
+    # sweep robot x so the front apex crosses the wall raster lines finely
+    positions = np.arange(-0.8, 0.35, 0.01)
+    v_near, v_bil = [], []
+    for x in positions:
+        pos = torch.tensor([[float(x), 0.0]])
+        v_near.append(
+            _hex_sample_violations(
+                params, heading, pos, dft, 0.10, 0.10, sampling="nearest"
+            ).max()
+        )
+        v_bil.append(
+            _hex_sample_violations(
+                params, heading, pos, dft, 0.10, 0.10, sampling="bilinear"
+            ).max()
+        )
+    v_near = torch.tensor(v_near)
+    v_bil = torch.tensor(v_bil)
+    jump_near = float((v_near[1:] - v_near[:-1]).abs().max())
+    jump_bil = float((v_bil[1:] - v_bil[:-1]).abs().max())
+    # nearest jumps a full ramp step (1.0) at raster lines; bilinear is smooth
+    assert jump_near == pytest.approx(1.0, abs=0.05)
+    assert jump_bil <= 0.35, f"bilinear still jumps: {jump_bil}"
+    # both saturate to the same deep-violation value behind the wall
+    assert float(v_near[-1]) == pytest.approx(1.0, abs=1e-5)
+    assert float(v_bil[-1]) == pytest.approx(1.0, abs=0.2)
+
+
+def test_bilinear_agrees_with_nearest_at_cell_centres() -> None:
+    """At exact cell centres both sampling modes read the same value."""
+    import torch
+
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
+        _hex_sample_violations,
+    )
+
+    df = np.ones(c.EA2_GRID_SHAPE, dtype=np.float32)
+    df[370, 370] = 0.0
+    dft = torch.as_tensor(df)
+    params = torch.tensor([[0.45, 0.5, 0.45, 0.75, -0.75]])
+    # centre of the env at the obstacle cell centre: world (0.05, 0.05)
+    pos = torch.tensor([[0.05, 0.05]])
+    heading = torch.zeros(1)
+    v_near = _hex_sample_violations(
+        params, heading, pos, dft, 0.10, 0.10, sampling="nearest"
+    )
+    v_bil = _hex_sample_violations(
+        params, heading, pos, dft, 0.10, 0.10, sampling="bilinear"
+    )
+    torch.testing.assert_close(v_near, v_bil)
+
+
+def test_sampling_mode_validation_and_wrapper_consistency() -> None:
+    """Unknown mode raises; the bilinear mode keeps wrapper consistency."""
+    import torch
+
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
+        hex_collision_edge_sum,
+        hex_collision_terms,
+        hex_collision_violation,
+    )
+
+    df = np.ones(c.EA2_GRID_SHAPE, dtype=np.float32)
+    df[370, 370] = 0.0
+    dft = torch.as_tensor(df)
+    params = torch.tensor([[0.45, 0.5, 0.45, 0.75, -0.75]])
+    heading = torch.zeros(1)
+    pos = torch.tensor([[0.05, -0.05]])
+    with pytest.raises(ValueError):
+        hex_collision_terms(
+            params, heading, pos, dft, 0.10, 0.10, sampling="cubic"
+        )
+    dense, hard = hex_collision_terms(
+        params, heading, pos, dft, 0.10, 0.10, sampling="bilinear"
+    )
+    edge_sum = hex_collision_edge_sum(
+        params, heading, pos, dft, 0.10, 0.10, sampling="bilinear"
+    )
+    hard_ref = hex_collision_violation(
+        params, heading, pos, dft, 0.10, 0.10, sampling="bilinear"
+    )
+    torch.testing.assert_close(dense, edge_sum)
+    torch.testing.assert_close(hard, hard_ref)

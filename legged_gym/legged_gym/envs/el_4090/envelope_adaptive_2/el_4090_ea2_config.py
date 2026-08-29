@@ -161,6 +161,10 @@ class El4090EA2Cfg(LeggedRobotCfg):
         target_shrink_rate = 2.0
         target_grow_rate = 0.1
         target_cooldown_seconds = 0.5
+        # Parameter-group decoupling for the oracle raw scales: "coupled"
+        # (historical shared-sample minimum) or "axis" (per-axis marches at
+        # the A-B / F-E edge lines, decoupling the width/limit pairs).
+        oracle_group_mode = "coupled"
         # 5 params + 3 priors are loaded from the frozen contract path
         # (_contracts.ENVELOPE_SPEC_CONFIG_PATH).
         # spider_envelop_2-style bold footprint drawing
