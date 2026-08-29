@@ -1,2 +1,6 @@
 .torch_extensions/
 .vscode/
+
+# EA2 test artifacts
+legged_gym/legged_gym/tests/ea2/_outputs/
+legged_gym/legged_gym/tests/ea2/__pycache__/
