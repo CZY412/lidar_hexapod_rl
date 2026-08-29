@@ -602,7 +602,7 @@ class EL_4090_EA2(BaseTask):
         from legged_gym.envs.el_4090.envelope_adaptive_2.target_smoother import (
             RateLimitedOracle,
         )
-        if bool(getattr(self.cfg.envelope, "target_rate_limit", False)):
+        if bool(getattr(self.cfg.envelope, "target_rate_limit", True)):
             def _target_safety_check(candidate):
                 viol = _hex_sample_violations(
                     candidate,
@@ -994,8 +994,8 @@ class EL_4090_EA2(BaseTask):
         """
         res = ea2c.EA2_RESOLUTION_M
         wmin = ea2c.EA2_WORLD_MIN_XY
-        ix = int(np.floor(float(xy[0]) - wmin) / res)
-        iy = int(np.floor(float(xy[1]) - wmin) / res)
+        ix = int(np.floor((float(xy[0]) - wmin) / res))
+        iy = int(np.floor((float(xy[1]) - wmin) / res))
         if (
             ix < 0
             or ix >= self.occupancy.shape[1]

@@ -100,8 +100,15 @@ def main() -> None:
             oracle = _oracle(env.heading, env.base_pos[:, :2], dft, low, high, interp=interp)
             if env._oracle_smoother is not None:
                 # mirror the training-side smoothing so the perfect policy is
-                # judged against the target it is actually trained toward
+                # judged against the target it is actually trained toward.
+                # The env's own smoother advances inside step(); snapshot and
+                # restore its state here so the probe does not double-advance
+                # it (the probe's copy advances once for the action).
+                _prev = env._oracle_smoother.prev_s.clone()
+                _cnt = env._oracle_smoother.counter.clone()
                 oracle = env._oracle_smoother.update(oracle).detach()
+                env._oracle_smoother.prev_s.copy_(_prev)
+                env._oracle_smoother.counter.copy_(_cnt)
             raw = (oracle - default) / scale
             obs, _, rew, dones, infos = env.step(raw)
 
