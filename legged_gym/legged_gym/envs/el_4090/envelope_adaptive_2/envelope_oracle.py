@@ -44,6 +44,13 @@ PARAM_NAMES: Sequence[str] = (
     "backward_limit",
 )
 
+# Number of march steps evaluated per batched sampler call in
+# _axis_march_crossing_batched.  Chunking bounds the intermediate tensor
+# (t_chunk, E, D) without changing any arithmetic -- the result is bitwise
+# identical for every chunk size.  8 measured best at N=1024 and stays
+# efficient at N=4096, where one shot (t_chunk >= T) degrades badly.
+_AXIS_MARCH_T_CHUNK = 8
+
 # Boundary-only dependency groups for the direct oracle.  Unlike the legacy
 # GROUP_INDICES, every boundary sample is assigned to *all* envelope
 # parameters that influence its coordinates.  This still uses only the 24
@@ -205,6 +212,104 @@ def _axis_march_crossing(sample, start_x: Tensor, start_y: Tensor,
     return first_bad
 
 
+def _axis_march_crossing_batched(sample, start_x: Tensor, start_y: Tensor,
+                                 dir_x: Tensor, dir_y: Tensor,
+                                 margin: float, step: float, max_dist: float,
+                                 interp: bool, t_chunk: int = 8) -> Tensor:
+    """Batched equivalent of :func:`_axis_march_crossing`.
+
+    The sequential loop advances one ``step`` at a time, so it issues ~21
+    rounds of tiny kernels per call; with four calls per control step and
+    1024 envs this dominates the oracle cost.  This version evaluates the
+    same march positions in a single batched sampler call and then reduces
+    "first crossing" out of them.
+
+    The result is *bitwise* identical to the loop: every op is elementwise
+    and re-associated only across the independent ``t`` axis, and the
+    cross-iteration state (``prev_clear``, carried as the previous row's
+    clearance) is reproduced exactly.  Chunking over ``t`` bounds the
+    intermediate memory without changing any arithmetic.
+
+    Two details that are easy to get wrong and are covered by tests in
+    ``tests/ea2/test_oracle_march_equivalence.py``:
+
+    * the explicit ``t = 0`` sample is taken BEFORE the loop and overrides any
+      later crossing; it must be kept, and kept first;
+    * ``prev_clear`` is not one value per chunk -- inside a chunk row ``i``
+      uses row ``i-1``'s clearance, and only row 0 of the first chunk uses the
+      ``t = 0`` sample.
+    """
+    device = start_x.device
+    # `start_*` may be (E, 1) broadcast against dir_* of (E, D), so the
+    # direction count must come from dir_*, not start_*.
+    E, D = dir_x.shape[0], dir_x.shape[1]
+    if start_x.shape[1] == 1:
+        start_x = start_x.expand(E, D)
+    if start_y.shape[1] == 1:
+        start_y = start_y.expand(E, D)
+
+    # t = 0 sample, taken before any marching (see _axis_march_crossing).
+    prev_clear = sample(start_x, start_y)
+    bad0 = prev_clear < margin
+
+    ts: list[float] = []
+    t = step
+    while t <= max_dist + 1e-9:
+        ts.append(t)
+        t += step
+    T = len(ts)
+
+    # No marching step fits: the result is decided by the t=0 sample alone.
+    if T == 0:
+        return torch.where(
+            bad0,
+            torch.zeros_like(prev_clear),
+            torch.full_like(prev_clear, float("inf")),
+        )
+
+    first_bad = torch.where(
+        bad0, torch.zeros_like(prev_clear), torch.full_like(prev_clear, float("inf"))
+    )
+    prev_t_all = torch.tensor([0.0] + ts[:-1], dtype=torch.float32, device=device)
+    t_all = torch.tensor(ts, dtype=torch.float32, device=device)
+    rows_all = torch.arange(T, device=device, dtype=torch.long)
+    inf_row = T + 1
+
+    for s in range(0, T, t_chunk):
+        e = min(s + t_chunk, T)
+        c = e - s
+        tv = t_all[s:e].view(c, 1, 1)
+        ptv = prev_t_all[s:e].view(c, 1, 1)
+
+        clearance = sample(start_x.view(1, E, D) + tv * dir_x.view(1, E, D),
+                          start_y.view(1, E, D) + tv * dir_y.view(1, E, D))
+        bad = clearance < margin
+
+        if interp:
+            # row i uses row i-1's clearance; row 0 of this chunk continues
+            # from `prev_clear` (the t=0 sample for the first chunk).
+            prev = torch.cat([prev_clear.unsqueeze(0), clearance[:-1]], dim=0)
+            frac = (prev - margin) / (prev - clearance).clamp_min(1e-6)
+            frac = frac.clamp(0.0, 1.0)
+            t_cross = ptv + frac * (tv - ptv)
+        else:
+            t_cross = tv.expand(c, E, D).contiguous()
+
+        rows = rows_all[s:e].view(c, 1, 1).expand(c, E, D)
+        cand = torch.where(bad, rows, torch.full_like(rows, inf_row))
+        best = cand.amin(dim=0)                    # first bad row in this chunk
+        accept = (best < inf_row) & torch.isinf(first_bad)
+
+        idx = (best - s).clamp(0, c - 1)
+        val = t_cross.permute(1, 2, 0).reshape(E * D, c).gather(
+            1, idx.reshape(E * D, 1)).reshape(E, D)
+        first_bad = torch.where(accept, val, first_bad)
+
+        prev_clear = clearance[-1]                # carry into the next chunk
+
+    return first_bad
+
+
 def _axis_decoupled_scales(
     heading: Tensor,
     base_pos_xy: Tensor,
@@ -215,12 +320,18 @@ def _axis_decoupled_scales(
     sample,
     max_dist: float,
     interp_crossing: bool,
+    t_chunk: int = _AXIS_MARCH_T_CHUNK,
 ) -> Tensor:
     """Axis-decoupled scales: four axis-aligned marches, no main march.
 
-    Extracted verbatim from the ``"axis"`` branch of :func:`_compute_raw_scales`
-    so that the branch can run *before* the 24-direction march and thus skip
-    that march entirely (it was dead code in this mode).
+    Extracted from the ``"axis"`` branch of :func:`_compute_raw_scales` so that
+    the branch can run *before* the 24-direction march and thus skip that march
+    entirely (it was dead code in this mode).
+
+    The marches use :func:`_axis_march_crossing_batched`, which collapses the
+    per-step Python loop into one batched sampler call per chunk --
+    bitwise-identical, but ~7x faster in total because the loop is host
+    dispatch bound.
 
     The march range is capped at ``fwd_min + fwd_span + margin + step``: past
     that distance the scale clamps to fully open, so marching further only
@@ -240,9 +351,9 @@ def _axis_decoupled_scales(
     axis_max_dist = min(max_dist, fwd_min + fwd_span + margin + step)
     d_long_x = torch.cat([cos_h, -cos_h], dim=1)   # (E, 2)
     d_long_y = torch.cat([sin_h, -sin_h], dim=1)
-    x_cross = _axis_march_crossing(
+    x_cross = _axis_march_crossing_batched(
         sample, bx, by, d_long_x, d_long_y, margin, step, axis_max_dist,
-        interp_crossing,
+        interp_crossing, t_chunk,
     )  # (E, 2): [front, rear]
     s_fwd = ((x_cross[:, 0:1] - fwd_min) / fwd_span).clamp(0.0, 1.0)
     s_bwd = ((x_cross[:, 1:2] - fwd_min) / fwd_span).clamp(0.0, 1.0)
@@ -258,9 +369,9 @@ def _axis_decoupled_scales(
     start_y = torch.cat([sy_f, sy_f, sy_b, sy_b], dim=1)
     d_lat_x = torch.cat([-sin_h, sin_h, -sin_h, sin_h], dim=1)
     d_lat_y = torch.cat([cos_h, -cos_h, cos_h, -cos_h], dim=1)
-    y_cross = _axis_march_crossing(
+    y_cross = _axis_march_crossing_batched(
         sample, start_x, start_y, d_lat_x, d_lat_y, margin, step,
-        axis_max_dist, interp_crossing,
+        axis_max_dist, interp_crossing, t_chunk,
     )  # (E, 4): [fwd up, fwd dn, bwd up, bwd dn]
     y_front = torch.minimum(y_cross[:, 0:1], y_cross[:, 1:2])
     s_fw = ((y_front - lat_min) / lat_span).clamp(0.0, 1.0)
@@ -270,11 +381,13 @@ def _axis_decoupled_scales(
     # D/C vertices are the only middle samples with x == 0), sharing the
     # exact affine mapping of the other widths instead of the legacy
     # radial ray-min, which over-allowed by the min_v offset.
-    y_up_m = _axis_march_crossing(
-        sample, bx, by, -sin_h, cos_h, margin, step, axis_max_dist, interp_crossing
+    y_up_m = _axis_march_crossing_batched(
+        sample, bx, by, -sin_h, cos_h, margin, step, axis_max_dist,
+        interp_crossing, t_chunk,
     )
-    y_dn_m = _axis_march_crossing(
-        sample, bx, by, sin_h, -cos_h, margin, step, axis_max_dist, interp_crossing
+    y_dn_m = _axis_march_crossing_batched(
+        sample, bx, by, sin_h, -cos_h, margin, step, axis_max_dist,
+        interp_crossing, t_chunk,
     )
     y_mid = torch.minimum(y_up_m, y_dn_m)
     lat_min_mw = float(low[1])  # middle_width's own floor (== low[0] in the
