@@ -505,8 +505,7 @@ class EL_4090_EA2(BaseTask):
             pose.p = gymapi.Vec3(float(rect.center[0]), float(rect.center[1]), sz / 2.0)
             pose.r = gymapi.Quat.from_euler_zyx(float(rect.yaw), 0.0, 0.0)
             self.gym.create_actor(env_handle, asset, pose, "ea2_visual_wall", env_index, 0, 0)
-        else:
-            for pillar in self.map_data.pillars:
+        for pillar in self.map_data.pillars:
                 side = 2.0 * float(pillar.radius)
                 sz = float(pillar.height)
                 asset = self.gym.create_box(self.sim, side, side, sz, asset_options)
@@ -598,6 +597,8 @@ class EL_4090_EA2(BaseTask):
          'oracle_mse_backward_limit':torch.zeros(n,
            dtype=(torch.float32), device=device),
          'oracle_snap_ratio':torch.zeros(n,
+           dtype=(torch.float32), device=device),
+         'oracle_floor_pinned_ratio':torch.zeros(n,
            dtype=(torch.float32), device=device)}
         from legged_gym.envs.el_4090.envelope_adaptive_2.target_smoother import (
             RateLimitedOracle,
@@ -627,6 +628,11 @@ class EL_4090_EA2(BaseTask):
             )
         else:
             self._oracle_smoother = None
+        from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_oracle import (
+            _physical_min_max,
+        )
+        _min_v, _ = _physical_min_max(self._envelope_low_dev, self._envelope_high_dev)
+        self._oracle_floor_pinned_env = _min_v
         self._rng = np.random.default_rng(int(getattr(self.cfg, "seed", 42)) + 1)
 
     def _init_lidar(self):
@@ -912,35 +918,32 @@ class EL_4090_EA2(BaseTask):
           4, 4, None, color=(0.0, 1.0, 0.0))
         for k, eid in enumerate(self._debug_env_ids):
             if eid >= self.num_envs:
-                pass
-            else:
-                dists = self._debug_dists[k]
-                red, green = selected_channel_mask(dists, self.selected_ray_indices, self._debug_is_reduced, far_plane)
-                pts_body = self._debug_points[k][::stride]
-                red = red[::stride]
-                green = green[::stride]
-                n = pts_body.shape[0]
-                base_q = yaw_quat_from_heading(self.heading[eid:eid + 1]).expand(n, 4)
-                pts_world = self.base_pos[eid:eid + 1] + quat_apply(base_q, pts_body)
-                pts_world = pts_world.detach().cpu().numpy()
-                red_pts = pts_world[red.cpu().numpy()]
-                green_pts = pts_world[green.cpu().numpy()]
-                for pt in red_pts:
-                    pose = gymapi.Transform(gymapi.Vec3(float(pt[0]), float(pt[1]), float(pt[2])))
-                    gymutil.draw_lines(red_geom, self.gym, self.viewer, self.envs[eid], pose)
-                else:
-                    for pt in green_pts:
-                        pose = gymapi.Transform(gymapi.Vec3(float(pt[0]), float(pt[1]), float(pt[2])))
-                        gymutil.draw_lines(green_geom, self.gym, self.viewer, self.envs[eid], pose)
-                    else:
-                        points = self._envelope_debug_points_world(eid)
-                        edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0), (1, 4)]
-                        color = tuple(self.cfg.envelope.debug_color)
-                        line_verts, line_colors = self._make_bold_envelope_lines(points, edges, [
-                         color] * len(edges), float(self.cfg.envelope.debug_line_radius), int(self.cfg.envelope.debug_line_samples))
+                continue
+            dists = self._debug_dists[k]
+            red, green = selected_channel_mask(dists, self.selected_ray_indices, self._debug_is_reduced, far_plane)
+            pts_body = self._debug_points[k][::stride]
+            red = red[::stride]
+            green = green[::stride]
+            n = pts_body.shape[0]
+            base_q = yaw_quat_from_heading(self.heading[eid:eid + 1]).expand(n, 4)
+            pts_world = self.base_pos[eid:eid + 1] + quat_apply(base_q, pts_body)
+            pts_world = pts_world.detach().cpu().numpy()
+            red_pts = pts_world[red.cpu().numpy()]
+            green_pts = pts_world[green.cpu().numpy()]
+            for pt in red_pts:
+                pose = gymapi.Transform(gymapi.Vec3(float(pt[0]), float(pt[1]), float(pt[2])))
+                gymutil.draw_lines(red_geom, self.gym, self.viewer, self.envs[eid], pose)
+            for pt in green_pts:
+                pose = gymapi.Transform(gymapi.Vec3(float(pt[0]), float(pt[1]), float(pt[2])))
+                gymutil.draw_lines(green_geom, self.gym, self.viewer, self.envs[eid], pose)
+            points = self._envelope_debug_points_world(eid)
+            edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0), (1, 4)]
+            color = tuple(self.cfg.envelope.debug_color)
+            line_verts, line_colors = self._make_bold_envelope_lines(points, edges, [
+             color] * len(edges), float(self.cfg.envelope.debug_line_radius), int(self.cfg.envelope.debug_line_samples))
 
-                if line_verts.size:
-                    self.gym.add_lines(self.viewer, self.envs[eid], int(line_colors.shape[0]), line_verts, line_colors)
+            if line_verts.size:
+                self.gym.add_lines(self.viewer, self.envs[eid], int(line_colors.shape[0]), line_verts, line_colors)
 
     def _sample_start_xy(self) -> np.ndarray:
         """Sample a spawn position inside the 4x4 tile area (exclude 5m border)."""
@@ -1097,23 +1100,30 @@ class EL_4090_EA2(BaseTask):
             return {env_id: self._sample_new_path() for env_id in ids}
         from concurrent.futures import as_completed
         from .path_parallel import plan_path_task
+        results = {}
         future_map = {}
         for env_id in ids:
-            start_xy, goal_xy = self._sample_free_start_goal()
+            try:
+                start_xy, goal_xy = self._sample_free_start_goal()
+            except (ValueError, RuntimeError) as err:
+                # sampling failure must never escape a 3000-iteration run:
+                # fall back to the sequential sampler for this env only
+                print(
+                    f"[el4090_ea2] env {env_id}: start/goal sampling failed "
+                    f"({err}); falling back to _sample_new_path"
+                )
+                results[env_id] = self._sample_new_path()
+                continue
             seed = int(self._rng.integers(0, 2147483647))
             future = self._path_executor.submit(plan_path_task, seed, start_xy, goal_xy)
             future_map[future] = env_id
-        else:
-            results = {}
-            for future in as_completed(future_map):
-                env_id = future_map[future]
-                try:
-                    results[env_id] = future.result()
-                except Exception:
-                    results[env_id] = self._sample_new_path()
-
-            else:
-                return results
+        for future in as_completed(future_map):
+            env_id = future_map[future]
+            try:
+                results[env_id] = future.result()
+            except Exception:
+                results[env_id] = self._sample_new_path()
+        return results
 
     def _batch_replan(self, env_ids) -> "None":
         """Replan a batch of reached-goal envs, parallel when beneficial."""
@@ -1122,27 +1132,35 @@ class EL_4090_EA2(BaseTask):
         if self._path_executor is None or len(ids) < threshold:
             for env_id in ids:
                 self._replan_from_current(env_id)
-            else:
-                return
+            return
 
         from concurrent.futures import as_completed
         from .path_parallel import plan_path_task
         future_map = {}
         for env_id in ids:
-            start_xy = np.asarray((self.paths[env_id].points[-1]),
-              dtype=(np.float64))
-            goal_xy = self._sample_goal_xy()
+            try:
+                start_xy = np.asarray((self.paths[env_id].points[-1]),
+                  dtype=(np.float64))
+                goal_xy = self._sample_goal_xy()
+            except (ValueError, RuntimeError) as err:
+                # dense-map sampling hiccups must not kill a long run:
+                # fall back to the sequential replanner for this env
+                print(
+                    f"[el4090_ea2] env {env_id}: replan sampling failed "
+                    f"({err}); falling back to _replan_from_current"
+                )
+                self._replan_from_current(env_id)
+                continue
             seed = int(self._rng.integers(0, 2147483647))
             future = self._path_executor.submit(plan_path_task, seed, start_xy, goal_xy)
             future_map[future] = env_id
-        else:
-            for future in as_completed(future_map):
-                env_id = future_map[future]
-                try:
-                    path = future.result()
-                    self._apply_replanned_path(env_id, path)
-                except Exception:
-                    self._replan_from_current(env_id)
+        for future in as_completed(future_map):
+            env_id = future_map[future]
+            try:
+                path = future.result()
+                self._apply_replanned_path(env_id, path)
+            except Exception:
+                self._replan_from_current(env_id)
 
     def _reset_one_env(self, env_id: "int", path: "Optional[PathData]"=None):
         if path is None:
@@ -1195,16 +1213,13 @@ class EL_4090_EA2(BaseTask):
         ep = {}
         for name in self.reward_scales.keys():
             ep[f"rew_{name}"] = self.episode_sums[name][env_ids].mean() / max(self.max_episode_length, 1)
-        else:
-            for name, buf in self.episode_metrics.items():
-                ep[f"ep_{name}"] = buf[env_ids].mean() / max(self.max_episode_length, 1)
-            else:
-                self.extras["episode"] = ep
-                for name in self.reward_scales.keys():
-                    self.episode_sums[name][env_ids] = 0.0
-                else:
-                    for buf in self.episode_metrics.values():
-                        buf[env_ids] = 0.0
+        for name, buf in self.episode_metrics.items():
+            ep[f"ep_{name}"] = buf[env_ids].mean() / max(self.max_episode_length, 1)
+        self.extras["episode"] = ep
+        for name in self.reward_scales.keys():
+            self.episode_sums[name][env_ids] = 0.0
+        for buf in self.episode_metrics.values():
+            buf[env_ids] = 0.0
 
     def reset_idx(self, env_ids):
         """Reset selected envs and log episode metrics."""
@@ -1216,15 +1231,13 @@ class EL_4090_EA2(BaseTask):
         preplanned = self._plan_paths_parallel(ids)
         for env_id in ids:
             self._reset_one_env(env_id, path=(preplanned.get(env_id)))
-        else:
-            for i in ids:
-                vx, vy, omega_out = ego_motion(self.v[i:i + 1], self.heading[i:i + 1], self.tangent[i:i + 1], self.omega[i:i + 1])
-                self.ego_motion[(i, 0)] = vx
-                self.ego_motion[(i, 1)] = vy
-                self.ego_motion[(i, 2)] = omega_out
-            else:
-                if self.cfg.env.send_timeouts:
-                    self.extras["time_outs"] = self.time_out_buf
+        for i in ids:
+            vx, vy, omega_out = ego_motion(self.v[i:i + 1], self.heading[i:i + 1], self.tangent[i:i + 1], self.omega[i:i + 1])
+            self.ego_motion[(i, 0)] = vx
+            self.ego_motion[(i, 1)] = vy
+            self.ego_motion[(i, 2)] = omega_out
+        if self.cfg.env.send_timeouts:
+            self.extras["time_outs"] = self.time_out_buf
 
     def _step_kinematics(self):
         """Advance each env along its reference path (batched backend)."""
@@ -1346,6 +1359,21 @@ class EL_4090_EA2(BaseTask):
           soft_dof_pos_limit=(float(self.cfg.envelope.soft_dof_pos_limit)),
           interp_crossing=(bool(getattr(self.cfg.envelope, "oracle_interp_crossing", True))),
           group_mode=(str(getattr(self.cfg.envelope, "oracle_group_mode", "coupled"))))
+        # Floor-pinned: even the minimum envelope violates at this pose, so
+        # any residual target collision is irreducible (README 2.2.3
+        # sanctions the transient collisions).  Monitored for the M2
+        # collision-weight decision.
+        self._oracle_floor_pinned = (
+            _hex_sample_violations(
+                self._oracle_floor_pinned_env,
+                self.heading,
+                self.base_pos[:, :2],
+                self.distance_field,
+                margin=float(self.cfg.envelope.margin),
+                soft_margin=float(self.cfg.envelope.soft_margin),
+            ).max(dim=-1).values
+            > 0.05
+        )
         # Rate-limited smoothing: the supervised target (and the telemetry that
         # describes it) is the final candidate; the smoother is advanced
         # exactly once per control step here.  Disabled/absent -> identity.
@@ -1369,29 +1397,35 @@ class EL_4090_EA2(BaseTask):
             rew = terms[name] * scale
             self.rew_buf += rew
             self.episode_sums[name] += rew
-        else:
-            self.episode_metrics["collision_hard_max"] += self._collision_hard
-            self.episode_metrics["raw_action_abs_mean"] += self.actions.abs().mean(dim=(-1))
-            self.episode_metrics["envelope_limits_active_ratio"] += (limit_violation > 0).to(torch.float32)
-            self.episode_metrics["oracle_unsafe_before_ratio"] += (oracle_hard_raw > 0).to(torch.float32)
-            self.episode_metrics["oracle_unsafe_ratio"] += (oracle_hard > 0).to(torch.float32)
-            self.episode_metrics["oracle_potential"] += potential_reward(oracle_params, low, high)
-            oracle_sq = (
-                normalized_envelope_params(self.actions_mapped, low, high)
-                - normalized_envelope_params(oracle_params, low, high)
-            ) ** 2
-            for j, metric_name in enumerate((
-                "oracle_mse_front_width",
-                "oracle_mse_middle_width",
-                "oracle_mse_back_width",
-                "oracle_mse_forward_limit",
-                "oracle_mse_backward_limit",
-            )):
-                self.episode_metrics[metric_name] += oracle_sq[:, j]
+        self.episode_metrics["collision_hard_max"] += self._collision_hard
+        self.episode_metrics["raw_action_abs_mean"] += self.actions.abs().mean(dim=(-1))
+        self.episode_metrics["envelope_limits_active_ratio"] += (limit_violation > 0).to(torch.float32)
+        self.episode_metrics["oracle_unsafe_before_ratio"] += (oracle_hard_raw > 0).to(torch.float32)
+        self.episode_metrics["oracle_unsafe_ratio"] += (oracle_hard > 0).to(torch.float32)
+        self.episode_metrics["oracle_potential"] += potential_reward(oracle_params, low, high)
+        oracle_sq = (
+            normalized_envelope_params(self.actions_mapped, low, high)
+            - normalized_envelope_params(oracle_params, low, high)
+        ) ** 2
+        for j, metric_name in enumerate((
+            "oracle_mse_front_width",
+            "oracle_mse_middle_width",
+            "oracle_mse_back_width",
+            "oracle_mse_forward_limit",
+            "oracle_mse_backward_limit",
+        )):
+            self.episode_metrics[metric_name] += oracle_sq[:, j]
         if smoother is not None:
             self.episode_metrics["oracle_snap_ratio"] += smoother.snapped.to(
                 torch.float32
             )
+        # Floor-pinned frames: the raw target itself hard-violates (geometry
+        # cannot fit even the minimum envelope, README 2.2.3 sanctions the
+        # transient collisions).  Monitored so the M2 collision-weight
+        # decision can be data-driven.
+        self.episode_metrics["oracle_floor_pinned_ratio"] += (
+            self._oracle_floor_pinned.to(torch.float32)
+        )
 
     def _compute_observations(self):
         self.obs_buf[:] = assemble_observation((self.range_image),

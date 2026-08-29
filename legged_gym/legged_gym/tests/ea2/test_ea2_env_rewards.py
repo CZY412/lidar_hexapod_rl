@@ -72,6 +72,7 @@ def _bare_env(device="cpu"):
             )
         },
         "oracle_snap_ratio": torch.zeros(n, device=device),
+        "oracle_floor_pinned_ratio": torch.zeros(n, device=device),
     }
     df, _ = tl.corridor_field(1.0)
     env.distance_field = torch.as_tensor(df, dtype=torch.float32, device=device)
@@ -86,6 +87,10 @@ def _bare_env(device="cpu"):
         device=device,
     )
     # mixed envelopes: env 0/2 wide-open, env 1/3 narrow
+    env._oracle_floor_pinned_env = torch.tensor(
+        [[0.3, 0.3, 0.3, 0.6, -0.6]], device=device
+    )
+    env._oracle_smoother = None
     env.actions_mapped = torch.stack([tl.HIGH, tl.LOW, tl.HIGH, tl.LOW]).to(device)
     env.actions = torch.tensor(
         [[2.0, 0.0, -1.0, 0.5, 1.0]] * 2 + [[-2.0, 1.0, 0.0, -0.5, -1.0]] * 2,
@@ -172,6 +177,16 @@ def test_compute_rewards_wiring_and_metrics():
     assert torch.allclose(
         env.episode_metrics["oracle_potential"], potential_reward(oracle, low, high)
     )
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
+        _hex_sample_violations as _hsv,
+    )
+    floor_pinned = (
+        _hsv(env._oracle_floor_pinned_env, env.heading, env.base_pos[:, :2], df,
+             margin=0.10, soft_margin=0.10).max(dim=-1).values > 0.05
+    )
+    assert torch.allclose(
+        env.episode_metrics['oracle_floor_pinned_ratio'], floor_pinned.float()
+    )
     oracle_sq = (
         normalized_envelope_params(env.actions_mapped, low, high)
         - normalized_envelope_params(oracle, low, high)
@@ -202,6 +217,7 @@ def test_compute_rewards_consumes_smoother_candidate_when_enabled():
 
     class _Stub:
         snapped = torch.zeros(env.num_envs, dtype=torch.bool)
+
 
         def update(self, raw):
             return shifted.clone()
