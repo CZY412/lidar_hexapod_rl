@@ -45,8 +45,8 @@ class RateLimitedOracle:
         low: torch.Tensor,
         high: torch.Tensor,
         shrink_rate: float = 2.0,
-        grow_rate: float = 0.1,
-        cooldown_seconds: float = 0.5,
+        grow_rate: float = 0.5,
+        cooldown_seconds: float = 0.2,
         grow_tol_frac: float = 0.5,
         safety_check=None,
     ):

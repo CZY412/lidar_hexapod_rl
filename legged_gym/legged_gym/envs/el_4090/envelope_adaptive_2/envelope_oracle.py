@@ -352,11 +352,23 @@ def _compute_raw_scales(
         s_fw = ((y_front - lat_min) / lat_span).clamp(0.0, 1.0)
         y_back = torch.minimum(y_cross[:, 2:3], y_cross[:, 3:4])
         s_bw = ((y_back - lat_min) / lat_span).clamp(0.0, 1.0)
-        s_mw = allowed[:, GROUP_INDICES["middle_width"]].min(dim=-1).values
+        # middle_width uses the same vertical-march semantics at x = 0 (the
+        # D/C vertices are the only middle samples with x == 0), sharing the
+        # exact affine mapping of the other widths instead of the legacy
+        # radial ray-min, which over-allowed by the min_v offset.
+        y_up_m = _axis_march_crossing(
+            sample, bx, by, -sin_h, cos_h, margin, step, axis_max_dist, interp_crossing
+        )
+        y_dn_m = _axis_march_crossing(
+            sample, bx, by, sin_h, -cos_h, margin, step, axis_max_dist, interp_crossing
+        )
+        y_mid = torch.minimum(y_up_m, y_dn_m)
+        mw_span = float(high[1] - low[1])
+        s_mw = ((y_mid - lat_min) / mw_span).clamp(0.0, 1.0)
         return torch.cat(
             [
                 s_fw.clamp(0.0, 1.0),
-                s_mw.unsqueeze(-1).clamp(0.0, 1.0),
+                s_mw.clamp(0.0, 1.0),
                 s_bw.clamp(0.0, 1.0),
                 s_fwd,
                 s_bwd,

@@ -54,8 +54,8 @@ def test_env_cfg_contract():
     # target_smoother.RateLimitedOracle)
     assert cfg.envelope.target_rate_limit is True
     assert cfg.envelope.target_shrink_rate == 2.0
-    assert cfg.envelope.target_grow_rate == 0.1
-    assert cfg.envelope.target_cooldown_seconds == 0.5
+    assert cfg.envelope.target_grow_rate == 0.5
+    assert cfg.envelope.target_cooldown_seconds == 0.2
     assert cfg.envelope.oracle_step == 0.05
     assert cfg.envelope.oracle_max_dist == 5.0
     assert cfg.rewards.scales.collision == 0.0

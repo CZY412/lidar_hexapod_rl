@@ -21,7 +21,7 @@ MIN_V = torch.tensor([0.3, 0.3, 0.3, 0.6, -0.6])  # all extents = 0
 def _smoother(**kw):
     defaults = dict(
         num_envs=N, dt=DT, device="cpu", low=LOW, high=HIGH,
-        shrink_rate=2.0, grow_rate=0.1, cooldown_seconds=0.5,
+        shrink_rate=2.0, grow_rate=0.5, cooldown_seconds=0.2,
     )
     defaults.update(kw)
     return RateLimitedOracle(**defaults)
@@ -31,9 +31,9 @@ def test_step_size_matches_physical_rate_spec():
     rl = _smoother()
     # shrink_rate 2.0 m/s at dt=0.02 -> 0.04 m per call -> extent step 0.04/span
     assert torch.allclose(rl.shrink_n, 0.04 / rl.span.abs(), atol=1e-6)
-    # grow_rate 0.1 m/s -> 0.002 m per call; cooldown 0.5 s -> 25 calls
-    assert torch.allclose(rl.grow_n, 0.002 / rl.span.abs(), atol=1e-6)
-    assert rl.cooldown_calls == 25
+    # grow_rate 0.5 m/s -> 0.01 m per call; cooldown 0.2 s -> 10 calls
+    assert torch.allclose(rl.grow_n, 0.01 / rl.span.abs(), atol=1e-6)
+    assert rl.cooldown_calls == 10
 
 
 def test_shrink_rate_limited_toward_raw():

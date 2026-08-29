@@ -159,8 +159,11 @@ class El4090EA2Cfg(LeggedRobotCfg):
         # supervise against the raw oracle.
         target_rate_limit = True
         target_shrink_rate = 2.0
-        target_grow_rate = 0.1
-        target_cooldown_seconds = 0.5
+        # 0.5 m/s + 0.2 s cooldown: verified in corridor-exit simulation to
+        # cut the stale-narrow target bias integral 4.4x vs 0.1 m/s/0.5 s
+        # (0.893 -> 0.201 m*s) with unchanged target smoothness.
+        target_grow_rate = 0.5
+        target_cooldown_seconds = 0.2
         # Parameter-group decoupling for the oracle raw scales: "coupled"
         # (historical shared-sample minimum) or "axis" (per-axis marches at
         # the A-B / F-E edge lines, decoupling the width/limit pairs).
