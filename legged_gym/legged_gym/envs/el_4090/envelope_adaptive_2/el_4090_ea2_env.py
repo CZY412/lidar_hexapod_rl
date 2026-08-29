@@ -585,6 +585,16 @@ class EL_4090_EA2(BaseTask):
          'oracle_unsafe_before_ratio':torch.zeros(n,
            dtype=(torch.float32), device=device), 
          'oracle_potential':torch.zeros(n,
+           dtype=(torch.float32), device=device),
+         'oracle_mse_front_width':torch.zeros(n,
+           dtype=(torch.float32), device=device),
+         'oracle_mse_middle_width':torch.zeros(n,
+           dtype=(torch.float32), device=device),
+         'oracle_mse_back_width':torch.zeros(n,
+           dtype=(torch.float32), device=device),
+         'oracle_mse_forward_limit':torch.zeros(n,
+           dtype=(torch.float32), device=device),
+         'oracle_mse_backward_limit':torch.zeros(n,
            dtype=(torch.float32), device=device)}
         self._rng = np.random.default_rng(int(getattr(self.cfg, "seed", 42)) + 1)
 
@@ -1326,6 +1336,18 @@ class EL_4090_EA2(BaseTask):
             self.episode_metrics["oracle_unsafe_before_ratio"] += (oracle_hard_raw > 0).to(torch.float32)
             self.episode_metrics["oracle_unsafe_ratio"] += (oracle_hard > 0).to(torch.float32)
             self.episode_metrics["oracle_potential"] += potential_reward(oracle_params, low, high)
+            oracle_sq = (
+                normalized_envelope_params(self.actions_mapped, low, high)
+                - normalized_envelope_params(oracle_params, low, high)
+            ) ** 2
+            for j, metric_name in enumerate((
+                "oracle_mse_front_width",
+                "oracle_mse_middle_width",
+                "oracle_mse_back_width",
+                "oracle_mse_forward_limit",
+                "oracle_mse_backward_limit",
+            )):
+                self.episode_metrics[metric_name] += oracle_sq[:, j]
 
     def _compute_observations(self):
         self.obs_buf[:] = assemble_observation((self.range_image),

@@ -64,6 +64,13 @@ def _bare_env(device="cpu"):
         "oracle_unsafe_before_ratio": torch.zeros(n, device=device),
         "oracle_unsafe_ratio": torch.zeros(n, device=device),
         "oracle_potential": torch.zeros(n, device=device),
+        **{
+            f"oracle_mse_{part}": torch.zeros(n, device=device)
+            for part in (
+                "front_width", "middle_width", "back_width",
+                "forward_limit", "backward_limit",
+            )
+        },
     }
     df, _ = tl.corridor_field(1.0)
     env.distance_field = torch.as_tensor(df, dtype=torch.float32, device=device)
@@ -164,6 +171,17 @@ def test_compute_rewards_wiring_and_metrics():
     assert torch.allclose(
         env.episode_metrics["oracle_potential"], potential_reward(oracle, low, high)
     )
+    oracle_sq = (
+        normalized_envelope_params(env.actions_mapped, low, high)
+        - normalized_envelope_params(oracle, low, high)
+    ) ** 2
+    for j, part in enumerate((
+        "front_width", "middle_width", "back_width",
+        "forward_limit", "backward_limit",
+    )):
+        assert torch.allclose(
+            env.episode_metrics[f"oracle_mse_{part}"], oracle_sq[:, j]
+        )
 
 
 def test_compute_rewards_accumulates_over_steps():
