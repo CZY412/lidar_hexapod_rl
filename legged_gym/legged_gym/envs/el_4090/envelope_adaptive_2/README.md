@@ -363,7 +363,7 @@ class env:
     num_observations = 190        # 187 range + 3 ego-motion
     num_actions = 5
     num_privileged_obs = None    # 不用 asymmetric critic；碰撞栅格只进 reward
-    episode_length_s = 40.       # timeout 计时器，非 hard reset 周期
+    episode_length_s = 30.       # 超时即全量 reset（位置/路径/GRU 同步重置）
 
 # PPO cfg（policy_cfg 里绝对不能再写 num_actor_obs / num_critic_obs）
 class policy:
@@ -449,16 +449,15 @@ M1 奖励设计：
 - M1 默认每个 env step 为 **50Hz**（`sim.dt=0.02`，无 decimation）；
 - LiDAR 为 **10Hz**，点云/range image 每 5 个 step 更新一次，中间 4 个 step 复用；
 - ego-motion 每个 50Hz step 都更新；
-- 每个 50Hz step `episode_length_buf += 1`，它只作为 **40s timeout 计时器**；
+- 每个 50Hz step `episode_length_buf += 1`，它作为 **30s timeout 计时器**；
 - **到达终点**：不置 done、不 reset 环境；`_replan_from_current()` 以当前位置为新起点，随机选一个新终点并规划新路径，机器人保留当前 heading 自然转向；
-- **timeout（默认 40s）**：
-  - 所有到达 timeout 的 env 清零 `episode_length_buf`，并按段记录/清零 `episode_sums`；
-  - 以 `memory_reset_prob`（默认 0.15）概率对该 env 做 **GRU memory reset**：`done=1, time_out=1`，PPO 会调用 `policy.reset(dones)` 清空 hidden，并在该处做 value bootstrap；
-  - 其余 timeout env 不置 done，继续保留 GRU 记忆；
-  - timeout 不改变机器人位置/终点/路径，也不调用 `reset_idx()`；
+- **timeout（默认 30s，v2 实现为确定性全量 reset）**：
+  - 所有到达 timeout 的 env 调用 `reset_idx()`：重新采样起点/终点/路径、传送位姿，并置 `done=1, time_out=1`（PPO 据此清空 GRU hidden 并做 value bootstrap）；
+  - 实现口径：`_reset_one_env` 是唯一的 episode 边界（软重规划不经过它）；
+  - 历史 v1 曾设计 40s + `memory_reset_prob=0.15` 的概率性 GRU-only 重置，该机制未进入实现，`memory_reset_prob` 字段不存在；
 - **真正 hard reset** 只在初始 reset（或未来显式 full reset）时发生：重新采样出生点并清空 GRU；
 - **BaseTask 接口要求（train.py 固定传 `init_at_random_ep_len=True`，漏掉会崩）**：
-  - env cfg 提供 `episode_length_s`（默认 40s），环境初始化先自建 `self.dt = cfg.sim.dt`，再设 `self.max_episode_length = int(cfg.env.episode_length_s / self.dt)`；
+  - env cfg 提供 `episode_length_s`（默认 30s），环境初始化先自建 `self.dt = cfg.sim.dt`，再设 `self.max_episode_length = int(cfg.env.episode_length_s / self.dt)`；
   - `step()` 返回 5 元组 `(obs, privileged_obs, rew, dones, infos)`，且 `infos` 必须含 `"time_outs": self.time_out_buf`（PPO timeout bootstrap 依赖它）；
   - **BaseTask 不会自动 clip**：`step()` 入口先按 `cfg.normalization.clip_actions` 截断 raw actions，返回前按 `cfg.normalization.clip_observations` 截断 obs（参照 `LeggedRobot.step` 的两段 clip）；
   - `infos["episode"]` 里写 §2.11 的指标字典（值必须是 `torch` 标量/0 维 tensor，供 PPO logger 求均值），训练日志直接可见；
