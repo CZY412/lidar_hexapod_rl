@@ -15,18 +15,20 @@ import math
 from legged_gym.envs.el_4090.envelope_adaptive_2 import _contracts as ea2c
 from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_env import (
     EL_4090_EA2,
-    action_rate_term,
     assemble_observation,
+    default_params,
     ego_motion,
     empty_range_image,
+    envelope_action_scale,
+    envelope_limit_violation,
     heading_update,
     height_step,
-    interpolate_path,
     map_actions_to_params,
+    map_actions_to_params_with_target,
     potential_reward,
+    raw_action_rate_term,
     refresh_range_image_from_scan,
     selected_channel_mask,
-    sway_position_acceptable,
     sway_update,
     wrap_to_pi,
     yaw_quat_from_heading,
@@ -127,18 +129,69 @@ def test_ego_motion_crab_decomposition() -> None:
     assert vx.item() == pytest.approx(np.cos(0.2), abs=1e-6)
     assert vy.item() == pytest.approx(np.sin(0.2), abs=1e-6)
     assert out_omega.item() == pytest.approx(0.3, abs=1e-6)
+    # non-zero tangent shifts the body-relative decomposition
+    vx2, vy2, _ = ego_motion(
+        torch.tensor([2.0]),
+        torch.tensor([0.5]),
+        torch.tensor([0.2]),
+        torch.tensor([0.1]),
+    )
+    assert vx2.item() == pytest.approx(2.0 * np.cos(0.3), abs=1e-6)
+    assert vy2.item() == pytest.approx(2.0 * np.sin(0.3), abs=1e-6)
 
 
-def test_map_actions_to_params_sigmoid_affine() -> None:
-    """Raw actions are mapped into the envelope parameter bounds."""
+def test_default_params_and_action_scale() -> None:
+    """Default params are the midpoint; scale is per-parameter linear."""
+    expected_mid = (_LOW + _HIGH) / 2.0
+    torch.testing.assert_close(default_params(_LOW, _HIGH), expected_mid)
+
+    scale = envelope_action_scale(_LOW, _HIGH, 0.9, 4.0)
+    assert scale.shape == (5,)
+    # For a=4, target should hit the 90% soft bound, so scale must be
+    # span * 0.9 / (2 * action_max).
+    expected_scale = (_HIGH - _LOW) * 0.9 / (2.0 * 4.0)
+    torch.testing.assert_close(scale, expected_scale, atol=1e-6, rtol=1e-6)
+
+
+def test_map_actions_to_params_linear_and_clamp() -> None:
+    """Linear mapping is bounded by hard clamp; old interface stays compatible."""
     actions = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
-    mapped = map_actions_to_params(actions, _LOW, _HIGH)
+    mapped = map_actions_to_params(actions, _LOW, _HIGH, 0.9, 4.0)
     expected_mid = (_LOW + _HIGH) / 2.0
     torch.testing.assert_close(mapped[0], expected_mid, atol=1e-5, rtol=1e-5)
 
     large = torch.tensor([[50.0, 50.0, 50.0, 50.0, 50.0]], dtype=torch.float32)
-    mapped_large = map_actions_to_params(large, _LOW, _HIGH)
+    mapped_large, target_large = map_actions_to_params_with_target(
+        large, _LOW, _HIGH, 0.9, 4.0
+    )
     torch.testing.assert_close(mapped_large[0], _HIGH, atol=1e-4, rtol=1e-4)
+    assert bool((target_large > _HIGH).all())
+
+
+def test_envelope_limit_violation() -> None:
+    """Soft limit penalty is zero inside the working range and grows after."""
+    a0 = torch.zeros(1, 5, dtype=torch.float32)
+    _, t0 = map_actions_to_params_with_target(a0, _LOW, _HIGH, 0.9, 4.0)
+    assert envelope_limit_violation(t0, _LOW, _HIGH, 0.9).item() == 0.0
+
+    a4 = torch.full((1, 5), 4.0, dtype=torch.float32)
+    _, t4 = map_actions_to_params_with_target(a4, _LOW, _HIGH, 0.9, 4.0)
+    assert envelope_limit_violation(t4, _LOW, _HIGH, 0.9).item() == pytest.approx(0.0, abs=1e-6)
+
+    a10 = torch.full((1, 5), 10.0, dtype=torch.float32)
+    _, t10 = map_actions_to_params_with_target(a10, _LOW, _HIGH, 0.9, 4.0)
+    assert envelope_limit_violation(t10, _LOW, _HIGH, 0.9).item() > 0.0
+
+
+def test_raw_action_rate_term() -> None:
+    """Raw action rate is sum squared change (standard legged_gym style)."""
+    a = torch.zeros(3, 5, dtype=torch.float32)
+    b = torch.zeros(3, 5, dtype=torch.float32)
+    torch.testing.assert_close(raw_action_rate_term(a, b), torch.zeros(3))
+
+    a2 = torch.zeros(2, 5, dtype=torch.float32)
+    b2 = torch.ones(2, 5, dtype=torch.float32)
+    torch.testing.assert_close(raw_action_rate_term(a2, b2), torch.full((2,), 5.0))
 
 
 def test_potential_reward_max_min_and_backward_direction() -> None:
@@ -161,17 +214,6 @@ def test_potential_reward_max_min_and_backward_direction() -> None:
         _HIGH,
     )
     assert p_large.item() > p_small.item()
-
-
-def test_action_rate_term() -> None:
-    """Action-rate is mean squared mapped-parameter change."""
-    a = torch.zeros(3, 5, dtype=torch.float32)
-    b = torch.zeros(3, 5, dtype=torch.float32)
-    torch.testing.assert_close(action_rate_term(a, b), torch.zeros(3))
-
-    a2 = torch.zeros(2, 5, dtype=torch.float32)
-    b2 = torch.ones(2, 5, dtype=torch.float32)
-    torch.testing.assert_close(action_rate_term(a2, b2), torch.ones(2))
 
 
 def test_assemble_observation_shape_and_normalization() -> None:
@@ -222,27 +264,6 @@ def test_refresh_range_image_from_scan_gives_stale_envs_fresh_frame() -> None:
     assert range_image[0, 0].item() == pytest.approx(0.5, abs=1e-6)
     assert range_image[1, 0].item() == pytest.approx(2.5, abs=1e-6)
     assert range_image[2, 0].item() == pytest.approx(1.25, abs=1e-6)
-
-
-def test_interpolate_path_straight() -> None:
-    """Interpolate path returns positions, tangent and curvature along a line."""
-    path = _straight_path()
-    xy, tangent, tangent_rate = interpolate_path(path, 2.5)
-    assert xy[0] == pytest.approx(2.5, abs=1e-6)
-    assert xy[1] == pytest.approx(0.0, abs=1e-6)
-    assert tangent == pytest.approx(0.0, abs=1e-6)
-    assert tangent_rate == pytest.approx(0.0, abs=1e-6)
-
-
-def test_sway_position_acceptable_rejects_blocked_cells() -> None:
-    """Sway acceptance rejects a candidate in an inflated occupied cell."""
-    inflated = np.zeros(ea2c.EA2_GRID_SHAPE, dtype=np.uint8)
-    # Mark a single cell at world (2.0, 2.0) blocked.
-    ix = int(np.floor((2.0 - ea2c.EA2_WORLD_MIN_XY) / ea2c.EA2_RESOLUTION_M))
-    iy = int(np.floor((2.0 - ea2c.EA2_WORLD_MIN_XY) / ea2c.EA2_RESOLUTION_M))
-    inflated[iy, ix] = 1
-    assert sway_position_acceptable((1.0, 1.0), (1.0, 1.1), inflated)
-    assert not sway_position_acceptable((1.0, 1.0), (2.0, 2.0), inflated)
 
 
 def test_wrap_to_pi() -> None:
@@ -348,3 +369,32 @@ def test_bold_envelope_lines_match_spider_envelop_style() -> None:
         for k in range(1, n_offsets):
             offset = verts[(e * n_offsets + k) * 2] - p0
             assert abs(float(np.linalg.norm(offset)) - radius) < 1e-5
+
+
+def test_normalized_envelope_params_direction_and_clamp() -> None:
+    """Backward_limit is normalized in its physical direction (more negative
+    = larger extent = 1) and outputs clamp to [0, 1]."""
+    import torch
+
+    from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_env import (
+        normalized_envelope_params,
+    )
+
+    low = torch.tensor([0.3, 0.3, 0.3, 0.6, -0.9])
+    high = torch.tensor([0.6, 0.7, 0.6, 0.9, -0.6])
+    # bounds themselves -> 0/1
+    at_low = normalized_envelope_params(low.unsqueeze(0), low, high)
+    at_high = normalized_envelope_params(high.unsqueeze(0), low, high)
+    assert torch.allclose(at_low[0, :4], torch.zeros(4), atol=1e-6)
+    assert torch.allclose(at_high[0, :4], torch.ones(4), atol=1e-6)
+    # backward: value at low (-0.9, largest rear extent) -> 1
+    assert at_low[0, 4].item() == pytest.approx(1.0, abs=1e-6)
+    assert at_high[0, 4].item() == pytest.approx(0.0, abs=1e-6)
+    # midpoint
+    mid = 0.5 * (low + high)
+    norm_mid = normalized_envelope_params(mid.unsqueeze(0), low, high)
+    assert torch.allclose(norm_mid, torch.full((1, 5), 0.5), atol=1e-6)
+    # out-of-range values clamp into [0, 1]
+    out = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0]])
+    norm_out = normalized_envelope_params(out, low, high)
+    assert bool((norm_out >= 0).all()) and bool((norm_out <= 1).all())

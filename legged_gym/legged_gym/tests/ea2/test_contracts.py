@@ -12,8 +12,7 @@ def test_env_cfg_contract():
     assert cfg.env.num_observations == 190
     assert cfg.env.num_actions == 5
     assert cfg.env.num_privileged_obs is None
-    assert cfg.env.episode_length_s == 40.0
-    assert cfg.env.memory_reset_prob == 0.15
+    assert cfg.env.episode_length_s == 30.0
     assert cfg.sim.dt == 0.02
     assert cfg.height.min_m == 0.52
     assert cfg.height.max_m == 0.52
@@ -28,12 +27,12 @@ def test_env_cfg_contract():
     assert cfg.map.grid_shape == [740, 740]
     assert cfg.map.n_tiles == 4
     assert cfg.map.tile_size_m == 16.0
-    assert cfg.obstacles.pillar_count_min == 15
-    assert cfg.obstacles.pillar_count_max == 15
+    assert cfg.obstacles.pillar_count_min == 18
+    assert cfg.obstacles.pillar_count_max == 18
     assert cfg.obstacles.pillar_size_x_min == 0.5
     assert cfg.obstacles.pillar_size_x_max == 4.0
-    assert cfg.obstacles.pillar_min_separation == 2.4
-    assert cfg.obstacles.pillar_center_clear_radius == 2.2
+    assert cfg.obstacles.pillar_min_separation == 2.6
+    assert cfg.obstacles.pillar_center_clear_radius == 1.0
     assert cfg.lidar.offset_pos == [0.7, 0.0, -0.05]
     assert cfg.lidar.far_plane == 60.0
     assert cfg.lidar.effective_max_range == 3.2
@@ -45,7 +44,17 @@ def test_env_cfg_contract():
     assert cfg.lidar.pixel_dropout_prob == 0.02
     assert cfg.envelope.margin == 0.10
     assert cfg.envelope.soft_margin == 0.10
-    assert cfg.rewards.scales.collision == -1.0
+    assert cfg.envelope.action_max == 4.0
+    assert cfg.envelope.soft_dof_pos_limit == 0.9
+    assert cfg.envelope.oracle_margin == 0.10
+    # the env reads this via getattr(..., True); pin it so a rename/delete of
+    # the key cannot silently flip the reward oracle back to nearest-cell mode
+    assert cfg.envelope.oracle_interp_crossing is True
+    assert cfg.envelope.oracle_step == 0.05
+    assert cfg.envelope.oracle_max_dist == 5.0
+    assert cfg.rewards.scales.collision == 0.0
+    assert cfg.rewards.scales.envelope_limits == -0.8
+    assert cfg.rewards.scales.oracle_mse == -3.0
 
 
 def test_ppo_cfg_contract():
@@ -60,6 +69,7 @@ def test_ppo_cfg_contract():
     # num_actor_obs / num_critic_obs must NOT be declared in policy cfg
     assert not hasattr(cfg.policy, "num_actor_obs")
     assert not hasattr(cfg.policy, "num_critic_obs")
+    assert cfg.algorithm.entropy_coef == 0.01
 
 
 def test_airy_fixed_channel_constants():

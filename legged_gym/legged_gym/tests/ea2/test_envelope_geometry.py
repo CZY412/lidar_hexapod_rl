@@ -18,6 +18,8 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
     compute_hex_vertices,
     envelope_params_to_condition,
     hex_body_sample_points,
+    hex_collision_edge_sum,
+    hex_collision_terms,
     hex_collision_violation,
     offset_hexagon,
     point_in_hex,
@@ -254,6 +256,50 @@ def test_hex_collision_violation_synthetic_distance_field() -> None:
     assert violation_half.item() == pytest.approx(0.5, abs=1e-5)
 
 
+def test_hex_collision_edge_sum_uses_only_boundary_samples() -> None:
+    """Edge sum rewards boundary collisions while ignoring interior-only hits."""
+    params = torch.tensor(
+        [[0.45, 0.50, 0.45, 0.75, -0.75]],
+        dtype=torch.float32,
+    )
+    distance_field = np.ones(c.EA2_GRID_SHAPE, dtype=np.float32)
+
+    # Center obstacle: worst-point hard violation is 1, but edge sum is 0.
+    distance_field[370, 370] = 0.0
+    edge_center = hex_collision_edge_sum(
+        params,
+        torch.zeros(1),
+        torch.zeros(1, 2),
+        distance_field,
+        margin=0.10,
+        soft_margin=0.10,
+    )
+    hard_center = hex_collision_violation(
+        params,
+        torch.zeros(1),
+        torch.zeros(1, 2),
+        distance_field,
+        margin=0.10,
+        soft_margin=0.10,
+    )
+    assert hard_center.item() == pytest.approx(1.0, abs=1e-5)
+    assert edge_center.item() == pytest.approx(0.0, abs=1e-5)
+
+    # Obstacle near the front edge (world x=0.75): the edge sum must be > 0.
+    distance_field_front = np.ones(c.EA2_GRID_SHAPE, dtype=np.float32)
+    distance_field_front[370, 377] = 0.0
+    edge_front = hex_collision_edge_sum(
+        params,
+        torch.zeros(1),
+        torch.zeros(1, 2),
+        distance_field_front,
+        margin=0.10,
+        soft_margin=0.10,
+    )
+    assert edge_front.shape == (1,)
+    assert edge_front.item() > 0.0
+
+
 def test_envelope_params_to_condition_matches_apply_priors() -> None:
     """5->8 conversion must equal apply_env_morphology_priors on zero-padded input."""
     spec = load_envelope_condition_spec(c.ENVELOPE_SPEC_CONFIG_PATH)
@@ -279,3 +325,28 @@ def test_envelope_params_to_condition_matches_apply_priors() -> None:
     # Priors are in [0, 1].
     assert bool((actual[..., 5:] >= 0.0).all())
     assert bool((actual[..., 5:] <= 1.0).all())
+
+
+def test_hex_collision_terms_internal_consistency() -> None:
+    """``hex_collision_terms`` must agree with its two documented wrappers:
+    dense output == ``hex_collision_edge_sum`` and hard output ==
+    ``hex_collision_violation``."""
+    distance_field = np.ones(c.EA2_GRID_SHAPE, dtype=np.float32)
+    distance_field[370, 370] = 0.0
+    params = torch.tensor([[0.45, 0.50, 0.45, 0.75, -0.75]])
+    heading = torch.tensor([0.3])
+    pos = torch.tensor([[0.05, -0.05]])
+
+    dense, hard = hex_collision_terms(
+        params, heading, pos, distance_field, margin=0.10, soft_margin=0.10
+    )
+    edge_sum = hex_collision_edge_sum(
+        params, heading, pos, distance_field, margin=0.10, soft_margin=0.10
+    )
+    hard_ref = hex_collision_violation(
+        params, heading, pos, distance_field, margin=0.10, soft_margin=0.10
+    )
+    torch.testing.assert_close(dense, edge_sum)
+    torch.testing.assert_close(hard, hard_ref)
+    # max over all 34 samples dominates the boundary-only sum's average scale
+    assert float(hard) >= 0.0 and float(dense) >= 0.0

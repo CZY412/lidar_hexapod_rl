@@ -28,8 +28,6 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.path_planner import (
     _resample_polyline,
     _segment_clear,
     _simplify_path,
-    ego_motion,
-    heading_update,
     plan_path,
     wrap_to_pi,
 )
@@ -167,51 +165,6 @@ def test_apply_path_noise_fallback_stays_clear_on_narrow_corridor() -> None:
 
     noisy = _apply_path_noise(resampled, inflated, cfg, rng)
     assert _path_clear(noisy, inflated)
-
-
-def test_heading_update_converges_to_delta_target_on_straight_path() -> None:
-    """Heading tracking drives the relative yaw error to zero on a straight path."""
-    tangent = 0.0
-    delta_target = 0.1
-    heading = 0.2
-    dt = 0.02
-    k_p = 5.0
-    omega_max = 1.5
-
-    for _ in range(2000):
-        heading, omega, delta_actual = heading_update(
-            heading,
-            tangent,
-            0.0,          # tangent_rate = kappa * v = 0 on a straight path
-            delta_target,
-            1.0,          # v
-            dt,
-            k_p,
-            omega_max,
-        )
-        assert abs(omega) <= omega_max + 1e-9
-
-    assert heading == pytest.approx(delta_target, abs=1e-3)
-    assert delta_actual == pytest.approx(delta_target, abs=1e-3)
-
-
-def test_ego_motion_formula_values() -> None:
-    """Ego-motion is the crab-walk decomposition around the tangent frame."""
-    v = 1.0
-    heading = 0.2
-    tangent = 0.0
-    omega = 0.3
-    vx, vy, out_omega = ego_motion(v, heading, tangent, omega)
-
-    delta = heading - tangent
-    assert vx == pytest.approx(v * np.cos(delta), abs=1e-12)
-    assert vy == pytest.approx(v * np.sin(delta), abs=1e-12)
-    assert out_omega == pytest.approx(omega, abs=1e-12)
-
-    # A non-zero tangent shifts the body-relative decomposition.
-    vx2, vy2, _ = ego_motion(2.0, 0.5, 0.2, 0.1)
-    assert vx2 == pytest.approx(2.0 * np.cos(0.3), abs=1e-12)
-    assert vy2 == pytest.approx(2.0 * np.sin(0.3), abs=1e-12)
 
 
 def test_segment_clear_does_not_overstep_endpoint_cell() -> None:

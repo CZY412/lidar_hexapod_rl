@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from legged_gym.envs.el_4090.envelope_adaptive_2 import _contracts as c
 from legged_gym.envs.el_4090.envelope_adaptive_2.map_generator import (
@@ -167,3 +168,17 @@ def test_acceptance_keys():
         "near_obstacle_ratio",
     ):
         assert key in m.acceptance
+
+
+def test_distance_field_invariants() -> None:
+    """Occupied cells have zero distance; free cells positive; distances are
+    bounded by the map diagonal."""
+    m = generate_map(_cfg(), _pillar_cfg(), seed=3)
+    df = m.distance_field
+    assert df is not None
+    occupied = m.occupancy == 1
+    free = ~occupied
+    assert float(df[occupied].max(initial=0.0)) == pytest.approx(0.0, abs=1e-6)
+    assert float(df[free].min()) > 0.0
+    diag = np.hypot(*df.shape) * 0.1
+    assert float(df.max()) <= diag + 1e-6
