@@ -41,9 +41,54 @@ from .el_4090.safe.el_4090_safe_config import El4090SafeCfg, El4090SafeCfgPPO
 from .el_4090.spider_mammal.el_4090 import EL_4090_Mammal
 from .el_4090.spider_mammal.el4090_spider_config import El4090MammalCfg,El4090MammalCfgPPO
 
+# LiDAR-based confined space navigation
+from .elspider_air.elspider_lidar import ElSpiderLidar
+from .elspider_air.elspider_lidar_confined_config import (
+    ElSpiderLidarConfinedCfg, ElSpiderLidarConfinedCfgPPO,
+    ElSpiderLidarConfinedSimpleCfg, ElSpiderLidarConfinedSimpleCfgPPO,
+    ElSpiderLidarTimberPileCfg, ElSpiderLidarTimberPileCfgPPO,
+    ElSpiderLidarTunnelCfg, ElSpiderLidarTunnelCfgPPO,
+    ElSpiderLidarCaveCfg, ElSpiderLidarCaveCfgPPO,
+    ElSpiderLidarPoseAdaptSameDimCfg, ElSpiderLidarPoseAdaptSameDimCfgPPO,
+    ElSpiderLidarFlatSkillSameDimCfg, ElSpiderLidarFlatSkillSameDimCfgPPO,
+    ElSpiderLidarMixedTerrainSameDimCfg, ElSpiderLidarMixedTerrainSameDimCfgPPO,
+    ElSpiderLidarNavBarrierSameDimCfg, ElSpiderLidarNavBarrierSameDimCfgPPO,
+    ElSpiderLidarFlatPretrainCfg, ElSpiderLidarFlatPretrainCfgPPO,
+    ElSpiderLidarConfinedEasySameDimCfg, ElSpiderLidarConfinedEasySameDimCfgPPO,
+    ElSpiderLidarWalkFlatSameDimCfg, ElSpiderLidarWalkFlatSameDimCfgPPO,
+    ElSpiderLidarNavFlatSameDimCfg, ElSpiderLidarNavFlatSameDimCfgPPO,
+)
 
 
 # Register EL_4090 environments
 task_registry.register("el4090_spider", EL_4090, El4090SpiderCfg(), El4090SpiderCfgPPO())
 task_registry.register("el_4090_safe", EL_4090_Safe, El4090SafeCfg(), El4090SafeCfgPPO())
 task_registry.register("el4090_mammal",EL_4090_Mammal,El4090MammalCfg(),El4090MammalCfgPPO())
+
+# Register ElSpider LiDAR confined space tasks
+task_registry.register("elspider_lidar_confined", ElSpiderLidar,
+                       ElSpiderLidarConfinedCfg(), ElSpiderLidarConfinedCfgPPO())
+task_registry.register("elspider_lidar_confined_simple", ElSpiderLidar,
+                       ElSpiderLidarConfinedSimpleCfg(), ElSpiderLidarConfinedSimpleCfgPPO())
+task_registry.register("elspider_lidar_timber_pile", ElSpiderLidar,
+                       ElSpiderLidarTimberPileCfg(), ElSpiderLidarTimberPileCfgPPO())
+task_registry.register("elspider_lidar_tunnel", ElSpiderLidar,
+                       ElSpiderLidarTunnelCfg(), ElSpiderLidarTunnelCfgPPO())
+task_registry.register("elspider_lidar_cave", ElSpiderLidar,
+                       ElSpiderLidarCaveCfg(), ElSpiderLidarCaveCfgPPO())
+task_registry.register("elspider_lidar_pose_adapt_same_dim", ElSpiderLidar,
+                       ElSpiderLidarPoseAdaptSameDimCfg(), ElSpiderLidarPoseAdaptSameDimCfgPPO())
+task_registry.register("elspider_lidar_flat_same_dim", ElSpiderLidar,
+                       ElSpiderLidarFlatSkillSameDimCfg(), ElSpiderLidarFlatSkillSameDimCfgPPO())
+task_registry.register("elspider_lidar_mixed_terrains_same_dim", ElSpiderLidar,
+                       ElSpiderLidarMixedTerrainSameDimCfg(), ElSpiderLidarMixedTerrainSameDimCfgPPO())
+task_registry.register("elspider_lidar_nav_barrier_same_dim", ElSpiderLidar,
+                       ElSpiderLidarNavBarrierSameDimCfg(), ElSpiderLidarNavBarrierSameDimCfgPPO())
+task_registry.register("elspider_lidar_flat_pretrain", ElSpiderLidar,
+                       ElSpiderLidarFlatPretrainCfg(), ElSpiderLidarFlatPretrainCfgPPO())
+task_registry.register("elspider_lidar_walk_flat_same_dim", ElSpiderLidar,
+                       ElSpiderLidarWalkFlatSameDimCfg(), ElSpiderLidarWalkFlatSameDimCfgPPO())
+task_registry.register("elspider_lidar_nav_flat_same_dim", ElSpiderLidar,
+                       ElSpiderLidarNavFlatSameDimCfg(), ElSpiderLidarNavFlatSameDimCfgPPO())
+task_registry.register("elspider_lidar_confined_easy_same_dim", ElSpiderLidar,
+                       ElSpiderLidarConfinedEasySameDimCfg(), ElSpiderLidarConfinedEasySameDimCfgPPO())

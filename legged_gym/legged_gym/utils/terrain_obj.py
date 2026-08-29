@@ -114,6 +114,9 @@ class TerrainObj:
         self.verbose_print(
             f"Minimum corner at: {new_bounds[0][0:2]}, should be close to: [{-self.border_size}, {-self.border_size}]")
 
+        self.spawn_height_offset = getattr(self.cfg, 'spawn_height_offset', 0.35)
+        self.spawn_height_clearance = getattr(self.cfg, 'spawn_height_clearance', 0.10)
+
         # Initialize ray mesh intersector for height evaluation
         self.ray_intersector = trimesh.ray.ray_triangle.RayMeshIntersector(self.terrain_mesh)
 
@@ -124,16 +127,44 @@ class TerrainObj:
         # Calculate the environment origins based on IsaacGym's positioning
         self.env_origins = np.zeros((cfg.num_rows, cfg.num_cols, 3))
 
+        use_custom_spawn_origin = hasattr(self.cfg, 'spawn_origin_x') or hasattr(self.cfg, 'spawn_origin_y')
+        custom_spawn_origin_x = getattr(self.cfg, 'spawn_origin_x', 0.0)
+        custom_spawn_origin_y = getattr(self.cfg, 'spawn_origin_y', 0.0)
+        bounds = self.terrain_mesh.bounds
+
         # Calculate environment origins relative to the terrain mesh position
         # IsaacGym positions environments in a grid starting at the origin
         for i in range(cfg.num_rows):
             for j in range(cfg.num_cols):
-                # Position environments in a grid with proper spacing
-                env_origin_x = j * self.env_length - 0.5 * self.border_size
-                env_origin_y = i * self.env_width - 0.5 * self.border_size
+                # Allow a custom spawn origin for object meshes such as cave.obj
+                if use_custom_spawn_origin:
+                    env_origin_x = custom_spawn_origin_x + j * self.env_length
+                    env_origin_y = custom_spawn_origin_y + i * self.env_width
 
-                # Get terrain height at this position (currently set to 0)
-                height = 10.0
+                    # Guard against mismatched mesh/spawn settings
+                    mesh_x = env_origin_x + self.border_size
+                    mesh_y = env_origin_y + self.border_size
+                    custom_origin_out_of_bounds = (
+                        mesh_x < bounds[0][0] or mesh_x > bounds[1][0] or
+                        mesh_y < bounds[0][1] or mesh_y > bounds[1][1]
+                    )
+                    if custom_origin_out_of_bounds:
+                        env_origin_x = j * self.env_length - 0.5 * self.border_size
+                        env_origin_y = i * self.env_width - 0.5 * self.border_size
+                else:
+                    # Position environments in a grid with proper spacing
+                    env_origin_x = j * self.env_length - 0.5 * self.border_size
+                    env_origin_y = i * self.env_width - 0.5 * self.border_size
+
+                # Ceiling/floor-aware height calculation
+                floor_height = self.get_height(env_origin_x, env_origin_y, cast_dir=1)
+                ceiling_height = self.get_height(env_origin_x, env_origin_y, cast_dir=-1)
+
+                if ceiling_height > floor_height:
+                    available_clearance = max(ceiling_height - floor_height - self.spawn_height_clearance, 0.0)
+                    height = floor_height + min(self.spawn_height_offset, available_clearance)
+                else:
+                    height = floor_height + self.spawn_height_offset
 
                 # Store the environment origin
                 self.env_origins[i, j] = [env_origin_x, env_origin_y, height]
