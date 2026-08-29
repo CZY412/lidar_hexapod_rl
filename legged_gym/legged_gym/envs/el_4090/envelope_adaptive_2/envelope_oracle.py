@@ -205,6 +205,93 @@ def _axis_march_crossing(sample, start_x: Tensor, start_y: Tensor,
     return first_bad
 
 
+def _axis_decoupled_scales(
+    heading: Tensor,
+    base_pos_xy: Tensor,
+    low: Tensor,
+    high: Tensor,
+    margin: float,
+    step: float,
+    sample,
+    max_dist: float,
+    interp_crossing: bool,
+) -> Tensor:
+    """Axis-decoupled scales: four axis-aligned marches, no main march.
+
+    Extracted verbatim from the ``"axis"`` branch of :func:`_compute_raw_scales`
+    so that the branch can run *before* the 24-direction march and thus skip
+    that march entirely (it was dead code in this mode).
+
+    The march range is capped at ``fwd_min + fwd_span + margin + step``: past
+    that distance the scale clamps to fully open, so marching further only
+    burns iterations.
+    """
+    fwd_min = float(low[3])
+    fwd_span = float(high[3] - low[3])
+    lat_min = float(low[0])
+    lat_span = float(high[0] - low[0])
+    bx = base_pos_xy[:, 0:1]
+    by = base_pos_xy[:, 1:2]
+    cos_h = torch.cos(heading).unsqueeze(-1)
+    sin_h = torch.sin(heading).unsqueeze(-1)
+    # longitudinal: both body +-x marches batched in one loop.  The axis
+    # march only needs to cover the largest extent plus margin -- beyond
+    # that the scale clamps to fully open -- so its range is capped.
+    axis_max_dist = min(max_dist, fwd_min + fwd_span + margin + step)
+    d_long_x = torch.cat([cos_h, -cos_h], dim=1)   # (E, 2)
+    d_long_y = torch.cat([sin_h, -sin_h], dim=1)
+    x_cross = _axis_march_crossing(
+        sample, bx, by, d_long_x, d_long_y, margin, step, axis_max_dist,
+        interp_crossing,
+    )  # (E, 2): [front, rear]
+    s_fwd = ((x_cross[:, 0:1] - fwd_min) / fwd_span).clamp(0.0, 1.0)
+    s_bwd = ((x_cross[:, 1:2] - fwd_min) / fwd_span).clamp(0.0, 1.0)
+    # lateral: vertical marches at the already-shrunk apex positions,
+    # batched (front apex up/down + rear apex up/down) in one loop
+    fx_local = fwd_min + s_fwd * fwd_span
+    bwd_local = fwd_min + s_bwd * fwd_span
+    sx_f = bx + fx_local * cos_h
+    sy_f = by + fx_local * sin_h
+    sx_b = bx - bwd_local * cos_h
+    sy_b = by - bwd_local * sin_h
+    start_x = torch.cat([sx_f, sx_f, sx_b, sx_b], dim=1)
+    start_y = torch.cat([sy_f, sy_f, sy_b, sy_b], dim=1)
+    d_lat_x = torch.cat([-sin_h, sin_h, -sin_h, sin_h], dim=1)
+    d_lat_y = torch.cat([cos_h, -cos_h, cos_h, -cos_h], dim=1)
+    y_cross = _axis_march_crossing(
+        sample, start_x, start_y, d_lat_x, d_lat_y, margin, step,
+        axis_max_dist, interp_crossing,
+    )  # (E, 4): [fwd up, fwd dn, bwd up, bwd dn]
+    y_front = torch.minimum(y_cross[:, 0:1], y_cross[:, 1:2])
+    s_fw = ((y_front - lat_min) / lat_span).clamp(0.0, 1.0)
+    y_back = torch.minimum(y_cross[:, 2:3], y_cross[:, 3:4])
+    s_bw = ((y_back - lat_min) / lat_span).clamp(0.0, 1.0)
+    # middle_width uses the same vertical-march semantics at x = 0 (the
+    # D/C vertices are the only middle samples with x == 0), sharing the
+    # exact affine mapping of the other widths instead of the legacy
+    # radial ray-min, which over-allowed by the min_v offset.
+    y_up_m = _axis_march_crossing(
+        sample, bx, by, -sin_h, cos_h, margin, step, axis_max_dist, interp_crossing
+    )
+    y_dn_m = _axis_march_crossing(
+        sample, bx, by, sin_h, -cos_h, margin, step, axis_max_dist, interp_crossing
+    )
+    y_mid = torch.minimum(y_up_m, y_dn_m)
+    lat_min_mw = float(low[1])  # middle_width's own floor (== low[0] in the
+    mw_span = float(high[1] - low[1])  # current contract, but not by necessity)
+    s_mw = ((y_mid - lat_min_mw) / mw_span).clamp(0.0, 1.0)
+    return torch.cat(
+        [
+            s_fw.clamp(0.0, 1.0),
+            s_mw.clamp(0.0, 1.0),
+            s_bw.clamp(0.0, 1.0),
+            s_fwd,
+            s_bwd,
+        ],
+        dim=1,
+    )
+
+
 def _compute_raw_scales(
     heading: Tensor,
     base_pos_xy: Tensor,
@@ -239,6 +326,10 @@ def _compute_raw_scales(
       marches at the already-shrunk apex position.  The composed hexagon is
       still verified by the active-set stage, which backstops the
       diagonal-visibility loss of axis marches.
+
+    In ``"axis"`` mode the 24-direction main march below is dead code (its
+    ``allowed`` result is never read), so the function branches to
+    :func:`_axis_decoupled_scales` before performing it.
     """
     if distance_field is None:
         raise ValueError("distance_field must be provided")
@@ -256,6 +347,24 @@ def _compute_raw_scales(
         dist = torch.as_tensor(distance_field, dtype=torch.float32, device=device)
     if dist.device != device:
         dist = dist.to(device)
+
+    # The four axis marches below return a complete result on their own: the
+    # 24-direction main march is *never* consumed in this mode (it computes
+    # `allowed`, which the axis branch never reads).  Branching early avoids
+    # ~576 discarded ray samples per env per control step.
+    #
+    # This is a pure dead-code elimination -- `sample` is the only piece the
+    # axis branch needs from the shared setup, and it is built here as before.
+    # Verified bitwise-identical against the frozen reference in
+    # tests/ea2/_oracle_reference.py.
+    sample = _make_field_sampler(dist, interp_crossing, max_dist)
+    if group_mode == "axis":
+        return _axis_decoupled_scales(
+            heading, base_pos_xy, low, high, margin, step, sample,
+            max_dist, interp_crossing)
+    if group_mode != "coupled":
+        raise ValueError(
+            f"unknown group_mode: {group_mode!r} (expected 'coupled' or 'axis')")
 
     edge, radii = _full_edge_directions(low, high, device)
 
@@ -276,8 +385,6 @@ def _compute_raw_scales(
     )
     prev_t = torch.zeros_like(first_bad)
     prev_clear = torch.full_like(first_bad, max_dist + 1.0)
-
-    sample = _make_field_sampler(dist, interp_crossing, max_dist)
 
     t = step
     while t <= max_dist + 1e-9:
@@ -309,72 +416,6 @@ def _compute_raw_scales(
             torch.isfinite(first_bad),
             ((first_bad - step) / radii.unsqueeze(0)).clamp(0.0, 1.0),
             torch.ones_like(first_bad),
-        )
-
-    if group_mode == "axis":
-        fwd_min = float(low[3])
-        fwd_span = float(high[3] - low[3])
-        lat_min = float(low[0])
-        lat_span = float(high[0] - low[0])
-        bx = base_pos_xy[:, 0:1]
-        by = base_pos_xy[:, 1:2]
-        cos_h = torch.cos(heading).unsqueeze(-1)
-        sin_h = torch.sin(heading).unsqueeze(-1)
-        # longitudinal: both body +-x marches batched in one loop.  The axis
-        # march only needs to cover the largest extent plus margin -- beyond
-        # that the scale clamps to fully open -- so its range is capped.
-        axis_max_dist = min(max_dist, fwd_min + fwd_span + margin + step)
-        d_long_x = torch.cat([cos_h, -cos_h], dim=1)   # (E, 2)
-        d_long_y = torch.cat([sin_h, -sin_h], dim=1)
-        x_cross = _axis_march_crossing(
-            sample, bx, by, d_long_x, d_long_y, margin, step, axis_max_dist,
-            interp_crossing,
-        )  # (E, 2): [front, rear]
-        s_fwd = ((x_cross[:, 0:1] - fwd_min) / fwd_span).clamp(0.0, 1.0)
-        s_bwd = ((x_cross[:, 1:2] - fwd_min) / fwd_span).clamp(0.0, 1.0)
-        # lateral: vertical marches at the already-shrunk apex positions,
-        # batched (front apex up/down + rear apex up/down) in one loop
-        fx_local = fwd_min + s_fwd * fwd_span
-        bwd_local = fwd_min + s_bwd * fwd_span
-        sx_f = bx + fx_local * cos_h
-        sy_f = by + fx_local * sin_h
-        sx_b = bx - bwd_local * cos_h
-        sy_b = by - bwd_local * sin_h
-        start_x = torch.cat([sx_f, sx_f, sx_b, sx_b], dim=1)
-        start_y = torch.cat([sy_f, sy_f, sy_b, sy_b], dim=1)
-        d_lat_x = torch.cat([-sin_h, sin_h, -sin_h, sin_h], dim=1)
-        d_lat_y = torch.cat([cos_h, -cos_h, cos_h, -cos_h], dim=1)
-        y_cross = _axis_march_crossing(
-            sample, start_x, start_y, d_lat_x, d_lat_y, margin, step,
-            axis_max_dist, interp_crossing,
-        )  # (E, 4): [fwd up, fwd dn, bwd up, bwd dn]
-        y_front = torch.minimum(y_cross[:, 0:1], y_cross[:, 1:2])
-        s_fw = ((y_front - lat_min) / lat_span).clamp(0.0, 1.0)
-        y_back = torch.minimum(y_cross[:, 2:3], y_cross[:, 3:4])
-        s_bw = ((y_back - lat_min) / lat_span).clamp(0.0, 1.0)
-        # middle_width uses the same vertical-march semantics at x = 0 (the
-        # D/C vertices are the only middle samples with x == 0), sharing the
-        # exact affine mapping of the other widths instead of the legacy
-        # radial ray-min, which over-allowed by the min_v offset.
-        y_up_m = _axis_march_crossing(
-            sample, bx, by, -sin_h, cos_h, margin, step, axis_max_dist, interp_crossing
-        )
-        y_dn_m = _axis_march_crossing(
-            sample, bx, by, sin_h, -cos_h, margin, step, axis_max_dist, interp_crossing
-        )
-        y_mid = torch.minimum(y_up_m, y_dn_m)
-        lat_min_mw = float(low[1])  # middle_width's own floor (== low[0] in the
-        mw_span = float(high[1] - low[1])  # current contract, but not by necessity)
-        s_mw = ((y_mid - lat_min_mw) / mw_span).clamp(0.0, 1.0)
-        return torch.cat(
-            [
-                s_fw.clamp(0.0, 1.0),
-                s_mw.clamp(0.0, 1.0),
-                s_bw.clamp(0.0, 1.0),
-                s_fwd,
-                s_bwd,
-            ],
-            dim=1,
         )
 
     scales = []

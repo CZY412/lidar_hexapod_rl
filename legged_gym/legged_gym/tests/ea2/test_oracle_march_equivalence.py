@@ -238,14 +238,9 @@ def test_coupled_mode_still_matches_its_own_semantics(field):
         assert bool(((out >= 0.0) & (out <= 1.0)).all())
 
 
-@pytest.mark.xfail(
-    reason="group_mode validation is added with the axis dead-code removal; "
-           "until then an unknown mode silently falls through to coupled",
-    strict=True,
-)
 def test_unknown_group_mode_is_rejected(field):
-    """An unknown group_mode must raise rather than silently return a coupled
-    result.  Remove the xfail mark once the axis branch validates its input."""
+    """An unknown group_mode must raise rather than silently fall through to
+    the coupled result (the most dangerous failure mode: max|diff| ~0.95)."""
     head, pos = _poses(8, seed=43)
     with pytest.raises(ValueError):
         eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
