@@ -363,8 +363,9 @@ def _compute_raw_scales(
             sample, bx, by, sin_h, -cos_h, margin, step, axis_max_dist, interp_crossing
         )
         y_mid = torch.minimum(y_up_m, y_dn_m)
-        mw_span = float(high[1] - low[1])
-        s_mw = ((y_mid - lat_min) / mw_span).clamp(0.0, 1.0)
+        lat_min_mw = float(low[1])  # middle_width's own floor (== low[0] in the
+        mw_span = float(high[1] - low[1])  # current contract, but not by necessity)
+        s_mw = ((y_mid - lat_min_mw) / mw_span).clamp(0.0, 1.0)
         return torch.cat(
             [
                 s_fw.clamp(0.0, 1.0),

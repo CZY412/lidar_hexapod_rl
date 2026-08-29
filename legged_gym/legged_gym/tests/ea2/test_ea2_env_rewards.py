@@ -218,7 +218,6 @@ def test_compute_rewards_consumes_smoother_candidate_when_enabled():
     class _Stub:
         snapped = torch.zeros(env.num_envs, dtype=torch.bool)
 
-
         def update(self, raw):
             return shifted.clone()
 

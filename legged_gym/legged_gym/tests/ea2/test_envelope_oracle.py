@@ -424,8 +424,10 @@ def test_axis_mode_corridor_constrains_widths_not_forward():
     s_ax = _compute_raw_scales(
         head, pos, df, _LOW, _HIGH, 0.10, 0.05, 5.0, True, "axis"
     )
-    # lateral axes hit the walls
+    # lateral axes hit the walls; mw is exact at the vertical march
     assert float(s_ax[0, 0]) < 1.0 and float(s_ax[0, 1]) < 1.0 and float(s_ax[0, 2]) < 1.0
+    # margin contour: mw_max = wall(0.65) - margin(0.10) = 0.55
+    assert s_ax[0, 1].item() == pytest.approx((0.65 - 0.10 - 0.3) / 0.4, abs=1e-3)
     # nothing ahead of the robot along +x within 5 m
     assert float(s_ax[0, 3]) == pytest.approx(1.0, abs=1e-6)
     assert float(s_ax[0, 4]) == pytest.approx(1.0, abs=1e-6)
