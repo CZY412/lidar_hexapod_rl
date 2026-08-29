@@ -378,7 +378,7 @@ class policy:
 class runner:
     policy_class_name = "ActorCriticRecurrent"
     algorithm_class_name = "PPO"
-    num_steps_per_env = 50      # 50 步=1s≈10 帧 LiDAR；24 步只有约 4 帧，偏短
+    num_steps_per_env = 100     # 100 步=2s≈20 帧 LiDAR；24 步只有约 4 帧，偏短
 ```
 
 - 本仓库 rsl_rl 已完整支持 recurrent PPO：`RolloutStorage.recurrent_mini_batch_generator` 负责轨迹切分，`PPO.process_env_step` 每步调用 `policy.reset(dones)` 清零 GRU hidden，环境侧无需手动清 hidden；

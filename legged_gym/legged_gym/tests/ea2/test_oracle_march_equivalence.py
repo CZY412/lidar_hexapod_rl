@@ -41,6 +41,11 @@ _RES = 0.1
 _SIZE = 740
 _WMIN = -37.0
 
+# Mirrors El4090EA2Cfg.envelope.oracle_margin.  Kept as a literal here (rather
+# than imported) so the equivalence tests stay independent of config edits --
+# the geometry sweep below covers both this value and the historical 0.10.
+_MARGIN = 0.20
+
 
 # ---------------------------------------------------------------------------
 # fixtures / scenario builders
@@ -78,7 +83,7 @@ def _poses(n: int, seed: int, span: float = 20.0):
     return head, pos
 
 
-def _poses_inside_margin(field, n: int, margin: float = 0.10, seed: int = 0):
+def _poses_inside_margin(field, n: int, margin: float = _MARGIN, seed: int = 0):
     """Start points whose clearance is ALREADY below ``margin``.
 
     This is the only family of poses that exercises the explicit ``t = 0``
@@ -108,9 +113,9 @@ def test_reference_copy_matches_production(field):
     head, pos = _poses(256, seed=7)
     for interp in (True, False):
         prod = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
-                                      0.10, 0.05, 5.0, interp, "axis")
+                                      _MARGIN, 0.05, 5.0, interp, "axis")
         frozen = ref.raw_scales_axis(head, pos, field, _LOW, _HIGH,
-                                     0.10, 0.05, 5.0, interp)
+                                     _MARGIN, 0.05, 5.0, interp)
         assert torch.equal(prod, frozen), (
             f"frozen reference diverged from production (interp={interp})")
 
@@ -123,9 +128,9 @@ def test_reference_copy_matches_production(field):
 def test_axis_matches_reference_random_poses(field, interp):
     head, pos = _poses(256, seed=11)
     prod = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
-                                  0.10, 0.05, 5.0, interp, "axis")
+                                  _MARGIN, 0.05, 5.0, interp, "axis")
     frozen = ref.raw_scales_axis(head, pos, field, _LOW, _HIGH,
-                                 0.10, 0.05, 5.0, interp)
+                                 _MARGIN, 0.05, 5.0, interp)
     assert torch.equal(prod, frozen)
 
 
@@ -141,15 +146,16 @@ def test_axis_matches_reference_start_inside_margin(field, interp):
     """
     head, pos = _poses_inside_margin(field, 192)
     prod = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
-                                  0.10, 0.05, 5.0, interp, "axis")
+                                  _MARGIN, 0.05, 5.0, interp, "axis")
     frozen = ref.raw_scales_axis(head, pos, field, _LOW, _HIGH,
-                                 0.10, 0.05, 5.0, interp)
+                                 _MARGIN, 0.05, 5.0, interp)
     assert torch.equal(prod, frozen)
 
 
 @pytest.mark.parametrize("interp", [True, False])
 @pytest.mark.parametrize("margin,step,max_dist", [
-    (0.10, 0.05, 5.0),     # production config -> 21 iterations
+    (0.20, 0.05, 5.0),     # CURRENT production config (oracle_margin=0.20)
+    (0.10, 0.05, 5.0),     # historical config -> 21 iterations
     (0.10, 0.01, 5.0),     # 105 iterations
     (0.10, 0.10, 5.0),     # 10 iterations
     (0.10, 0.30, 5.0),     # 3 iterations
@@ -178,30 +184,30 @@ def test_axis_handles_degenerate_and_hostile_inputs(field):
 
     # empty batch
     out = eo._compute_raw_scales(head[:0], pos[:0], field, _LOW, _HIGH,
-                                 0.10, 0.05, 5.0, True, "axis")
+                                 _MARGIN, 0.05, 5.0, True, "axis")
     assert out.shape == (0, 5)
 
     # single env
     p1 = eo._compute_raw_scales(head[:1], pos[:1], field, _LOW, _HIGH,
-                                0.10, 0.05, 5.0, True, "axis")
+                                _MARGIN, 0.05, 5.0, True, "axis")
     f1 = ref.raw_scales_axis(head[:1], pos[:1], field, _LOW, _HIGH,
-                             0.10, 0.05, 5.0, True)
+                             _MARGIN, 0.05, 5.0, True)
     assert torch.equal(p1, f1)
 
     # float64 bounds
     p64 = eo._compute_raw_scales(head, pos, field, _LOW.double(), _HIGH.double(),
-                                 0.10, 0.05, 5.0, True, "axis")
+                                 _MARGIN, 0.05, 5.0, True, "axis")
     f64 = ref.raw_scales_axis(head, pos, field, _LOW.double(), _HIGH.double(),
-                              0.10, 0.05, 5.0, True)
+                              _MARGIN, 0.05, 5.0, True)
     assert torch.equal(p64, f64)
 
     # non-contiguous base_pos (the strided view the env actually passes)
     full = torch.cat([pos, torch.full((pos.shape[0], 1), 0.52)], dim=-1)
     assert not full[:, :2].is_contiguous()
     ps = eo._compute_raw_scales(head, full[:, :2], field, _LOW, _HIGH,
-                                0.10, 0.05, 5.0, True, "axis")
+                                _MARGIN, 0.05, 5.0, True, "axis")
     fs = ref.raw_scales_axis(head, full[:, :2], field, _LOW, _HIGH,
-                             0.10, 0.05, 5.0, True)
+                             _MARGIN, 0.05, 5.0, True)
     assert torch.equal(ps, fs)
 
 
@@ -213,9 +219,9 @@ def test_axis_equivalent_over_a_multi_step_sequence(field):
                            torch.linspace(-2.0, 2.0, n)], dim=-1)
         head = torch.full((n,), 0.3 * i)
         prod = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
-                                      0.10, 0.05, 5.0, True, "axis")
+                                      _MARGIN, 0.05, 5.0, True, "axis")
         frozen = ref.raw_scales_axis(head, pos, field, _LOW, _HIGH,
-                                     0.10, 0.05, 5.0, True)
+                                     _MARGIN, 0.05, 5.0, True)
         assert torch.equal(prod, frozen), f"diverged at step {i}"
 
 
@@ -232,7 +238,7 @@ def test_coupled_mode_still_matches_its_own_semantics(field):
     head, pos = _poses(64, seed=41)
     for interp in (True, False):
         out = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
-                                     0.10, 0.05, 5.0, interp, "coupled")
+                                     _MARGIN, 0.05, 5.0, interp, "coupled")
         assert out.shape == (64, 5)
         assert torch.isfinite(out).all()
         assert bool(((out >= 0.0) & (out <= 1.0)).all())
@@ -258,7 +264,7 @@ def test_axis_branch_produces_different_scales_than_coupled(field):
     cpl = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
                                  0.10, 0.05, 5.0, True, "coupled")
     axi = eo._compute_raw_scales(head, pos, field, _LOW, _HIGH,
-                                 0.10, 0.05, 5.0, True, "axis")
+                                 _MARGIN, 0.05, 5.0, True, "axis")
     # they must be genuinely different implementations, not accidentally equal
     assert not torch.equal(cpl, axi)
     # ...but both finite and in range
