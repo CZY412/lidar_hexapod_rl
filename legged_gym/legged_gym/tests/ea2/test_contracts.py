@@ -12,7 +12,7 @@ def test_env_cfg_contract():
     assert cfg.env.num_observations == 190
     assert cfg.env.num_actions == 5
     assert cfg.env.num_privileged_obs is None
-    assert cfg.env.episode_length_s == 30.0
+    assert cfg.env.episode_length_s == 45.0
     assert cfg.sim.dt == 0.02
     assert cfg.height.min_m == 0.52
     assert cfg.height.max_m == 0.52
@@ -67,7 +67,7 @@ def test_ppo_cfg_contract():
     cfg = El4090EA2CfgPPO()
     assert cfg.runner.policy_class_name == "ActorCriticRecurrent"
     assert cfg.runner.algorithm_class_name == "PPO"
-    assert cfg.runner.num_steps_per_env == 24
+    assert cfg.runner.num_steps_per_env == 50
     assert cfg.policy.rnn_type == "gru"
     assert cfg.policy.rnn_hidden_dim == 187
     assert cfg.policy.actor_hidden_dims == [256, 128]
