@@ -229,92 +229,17 @@ def feasible_mask(seq, head, pos, dft, low=LOW, high=HIGH, tol: float = 1e-3):
     min_env = min_envelope(low, high).to(seq.device)
     clr = sample_clearances(min_env.expand(seq.shape[0], -1), head, pos, dft)
     return clr[:, :24].min(-1).values >= MARGIN - tol
-
-
 # ---------------------------------------------------------------------------
-# rate-limited oracle target smoother
+# rate-limited oracle target smoother (production implementation)
 # ---------------------------------------------------------------------------
 
-class RateLimitedOracle:
-    """Shrink-fast / grow-slow / cooldown post-filter on the oracle target.
-
-    Mirrors the legacy rule computer's hysteresis but in normalised extent
-    space, applied as post-processing to the stateless grid oracle.  An
-    optional ``safety_check(candidate) -> bool`` snaps the frame straight to
-    the raw (safety-verified) oracle when the rate-limited candidate would
-    itself be unsafe.
-    """
-
-    def __init__(
-        self,
-        low: torch.Tensor = LOW,
-        high: torch.Tensor = HIGH,
-        shrink_step: float = 0.03,
-        grow_step: float = 0.03,
-        cooldown: int = 5,
-        grow_tol_frac: float = 0.5,
-        safety_check=None,
-    ):
-        from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_oracle import _physical_min_max
-
-        self.min_v, self.max_v = _physical_min_max(low, high)
-        # Signed span: backward_limit is physically reversed (more negative =
-        # larger rear extent), so its span is negative.  Division by the
-        # signed span makes s=0 fully shrunk and s=1 fully extended for ALL
-        # five parameters; rate steps divide by |span|.
-        self.span = self.max_v - self.min_v
-        abs_span = self.span.abs().clamp_min(1e-6)
-        self.shrink_n = shrink_step / abs_span
-        self.grow_n = grow_step / abs_span
-        self.grow_tol = grow_tol_frac * self.grow_n
-        self.cooldown = cooldown
-        self.safety_check = safety_check
-        self.last_snapped = False
-        self.prev_s: torch.Tensor | None = None
-        self.counter: torch.Tensor | None = None
-
-    def reset(self) -> None:
-        self.prev_s = None
-        self.counter = None
-
-    def _to_s(self, params: torch.Tensor) -> torch.Tensor:
-        return ((params - self.min_v) / self.span).clamp(0.0, 1.0)
-
-    def _from_s(self, s: torch.Tensor) -> torch.Tensor:
-        return self.min_v + s * self.span
-
-    def __call__(self, params: torch.Tensor) -> torch.Tensor:
-        raw_s = self._to_s(params)
-        if self.prev_s is None:
-            self.prev_s = torch.ones_like(raw_s)  # start fully open
-            self.counter = torch.zeros_like(raw_s)
-        needs_shrink = raw_s < self.prev_s - 1e-6
-        clear = raw_s > self.prev_s + self.grow_tol
-        self.counter = torch.where(
-            needs_shrink,
-            torch.zeros_like(self.counter),
-            torch.where(clear, self.counter + 1, self.counter),
-        )
-        shrink_target = (self.prev_s - self.shrink_n).clamp(0.0, 1.0)
-        grow_target = (self.prev_s + self.grow_n).clamp(0.0, 1.0)
-        can_grow = clear & (self.counter >= self.cooldown)
-        new_s = torch.where(
-            needs_shrink,
-            torch.maximum(raw_s, shrink_target),
-            torch.where(can_grow, torch.minimum(raw_s, grow_target), self.prev_s),
-        )
-        self.prev_s = new_s
-        candidate = self._from_s(new_s)
-        self.last_snapped = False
-        if self.safety_check is not None and bool(self.safety_check(candidate)):
-            self.last_snapped = True
-            self.prev_s = raw_s
-            return params
-        return candidate
+from legged_gym.envs.el_4090.envelope_adaptive_2.target_smoother import (
+    RateLimitedOracle,
+)
 
 
-def apply_rate_limit(raw_seq: torch.Tensor, rl: "RateLimitedOracle") -> torch.Tensor:
+def apply_rate_limit(raw_seq: torch.Tensor, rl: RateLimitedOracle) -> torch.Tensor:
     """Apply a RateLimitedOracle frame by frame over a (T, 5) sequence."""
     return torch.stack(
-        [rl(raw_seq[i : i + 1])[0] for i in range(raw_seq.shape[0])], dim=0
+        [rl.update(raw_seq[i : i + 1])[0] for i in range(raw_seq.shape[0])], dim=0
     )

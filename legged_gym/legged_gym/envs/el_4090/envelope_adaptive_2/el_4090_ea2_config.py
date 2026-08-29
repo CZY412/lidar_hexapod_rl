@@ -154,6 +154,13 @@ class El4090EA2Cfg(LeggedRobotCfg):
         # the oracle ray march (removes the quantisation staircase; verified
         # by tests/ea2/validate_oracle_smoothness.py).
         oracle_interp_crossing = True
+        # Rate-limited smoothing of the supervised oracle target (per-second
+        # physical rates; see target_smoother.RateLimitedOracle).  Disable to
+        # supervise against the raw oracle.
+        target_rate_limit = True
+        target_shrink_rate = 2.0
+        target_grow_rate = 0.1
+        target_cooldown_seconds = 0.5
         # 5 params + 3 priors are loaded from the frozen contract path
         # (_contracts.ENVELOPE_SPEC_CONFIG_PATH).
         # spider_envelop_2-style bold footprint drawing

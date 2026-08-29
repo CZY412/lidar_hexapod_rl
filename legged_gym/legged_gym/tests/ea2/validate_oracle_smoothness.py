@@ -102,23 +102,28 @@ def _run_methods(df: np.ndarray, poses):
     raw = tl.oracle_batch(head, pos, dft, interp=False)
     itp = tl.oracle_batch(head, pos, dft, interp=True)
 
-    rl = tl.RateLimitedOracle(shrink_step=_RL_SHRINK, grow_step=_RL_GROW)
+    # _RL_SHRINK/_RL_GROW are extent/call at 10 Hz -> per-second rates
+    rl = tl.RateLimitedOracle(
+        num_envs=1, dt=_DT, device="cpu", low=tl.LOW, high=tl.HIGH,
+        shrink_rate=_RL_SHRINK / _DT, grow_rate=_RL_GROW / _DT,
+        cooldown_seconds=0.5,
+    )
     seq_frames = []
     snap_frames = []
     for i in range(len(poses)):
         head_i = head[i : i + 1]
         pos_i = pos[i : i + 1]
 
-        def check(cand: torch.Tensor, _h=head_i, _p=pos_i) -> bool:
+        def check(cand: torch.Tensor, _h=head_i, _p=pos_i) -> torch.Tensor:
             viol = _hex_sample_violations(
                 cand, _h, _p, dft, margin=tl.MARGIN, soft_margin=tl.SOFT_MARGIN
             )
-            return float(viol.max()) > 0.05
+            return torch.tensor([float(viol.max()) > 0.05], dtype=torch.bool)
 
         rl.safety_check = check
-        out = rl(itp[i : i + 1])[0]
+        out = rl.update(itp[i : i + 1])[0]
         seq_frames.append(out)
-        snap_frames.append(rl.last_snapped)
+        snap_frames.append(bool(rl.snapped[0]))
     rl_seq = torch.stack(seq_frames, dim=0)
     return {"raw": raw, "interp": itp, "interp+rl": rl_seq}, torch.tensor(snap_frames)
 

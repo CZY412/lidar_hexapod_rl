@@ -25,6 +25,7 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_config import (
     El4090EA2Cfg,
 )
 from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
+    _hex_sample_violations,
     compute_hex_vertices,
     hex_collision_terms,
 )
@@ -595,7 +596,37 @@ class EL_4090_EA2(BaseTask):
          'oracle_mse_forward_limit':torch.zeros(n,
            dtype=(torch.float32), device=device),
          'oracle_mse_backward_limit':torch.zeros(n,
+           dtype=(torch.float32), device=device),
+         'oracle_snap_ratio':torch.zeros(n,
            dtype=(torch.float32), device=device)}
+        from legged_gym.envs.el_4090.envelope_adaptive_2.target_smoother import (
+            RateLimitedOracle,
+        )
+        if bool(getattr(self.cfg.envelope, "target_rate_limit", False)):
+            def _target_safety_check(candidate):
+                viol = _hex_sample_violations(
+                    candidate,
+                    self.heading,
+                    self.base_pos[:, :2],
+                    self.distance_field,
+                    margin=float(self.cfg.envelope.margin),
+                    soft_margin=float(self.cfg.envelope.soft_margin),
+                )
+                return viol.max(dim=-1).values > 0.05
+
+            self._oracle_smoother = RateLimitedOracle(
+                num_envs=n,
+                dt=float(self.cfg.sim.dt),
+                device=device,
+                low=self._envelope_low_dev,
+                high=self._envelope_high_dev,
+                shrink_rate=float(self.cfg.envelope.target_shrink_rate),
+                grow_rate=float(self.cfg.envelope.target_grow_rate),
+                cooldown_seconds=float(self.cfg.envelope.target_cooldown_seconds),
+                safety_check=_target_safety_check,
+            )
+        else:
+            self._oracle_smoother = None
         self._rng = np.random.default_rng(int(getattr(self.cfg, "seed", 42)) + 1)
 
     def _init_lidar(self):
@@ -1149,6 +1180,8 @@ class EL_4090_EA2(BaseTask):
         self.last_actions_raw[env_id] = 0.0
         self.range_image_stale[env_id] = True
         self.range_image[env_id] = self.range_max
+        if self._oracle_smoother is not None:
+            self._oracle_smoother.reset_ids([env_id])
 
     def _log_segment(self, env_ids):
         """Log accumulated reward sums for a set of envs and reset the sums.
@@ -1312,6 +1345,12 @@ class EL_4090_EA2(BaseTask):
           max_dist=(float(self.cfg.envelope.oracle_max_dist)),
           soft_dof_pos_limit=(float(self.cfg.envelope.soft_dof_pos_limit)),
           interp_crossing=(bool(getattr(self.cfg.envelope, "oracle_interp_crossing", True))))
+        # Rate-limited smoothing: the supervised target (and the telemetry that
+        # describes it) is the final candidate; the smoother is advanced
+        # exactly once per control step here.  Disabled/absent -> identity.
+        smoother = getattr(self, "_oracle_smoother", None)
+        if smoother is not None:
+            oracle_params = smoother.update(oracle_params)
         oracle_mse = ((normalized_envelope_params(self.actions_mapped, low, high) - normalized_envelope_params(oracle_params, low, high)) ** 2).mean(dim=(-1))
         _, oracle_hard = hex_collision_terms(oracle_params,
           (self.heading),
@@ -1348,6 +1387,10 @@ class EL_4090_EA2(BaseTask):
                 "oracle_mse_backward_limit",
             )):
                 self.episode_metrics[metric_name] += oracle_sq[:, j]
+        if smoother is not None:
+            self.episode_metrics["oracle_snap_ratio"] += smoother.snapped.to(
+                torch.float32
+            )
 
     def _compute_observations(self):
         self.obs_buf[:] = assemble_observation((self.range_image),

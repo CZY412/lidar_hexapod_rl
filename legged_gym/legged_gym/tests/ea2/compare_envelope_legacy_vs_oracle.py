@@ -277,8 +277,13 @@ def scenario_dynamic():
     leg = run_legacy_sequence(poses, heading, mask)
     orc = run_oracle_sequence(poses, heading, df)
     orc_i = run_oracle_sequence(poses, heading, df, interp_crossing=True)
+    # 10 Hz legacy parity: shrink/grow 0.03 extent/call = 0.3 extent/s
     orc_rl = tl.apply_rate_limit(
-        orc_i, tl.RateLimitedOracle(shrink_step=0.03, grow_step=0.03)
+        orc_i,
+        tl.RateLimitedOracle(
+            num_envs=1, dt=0.1, device="cpu", low=tl.LOW, high=tl.HIGH,
+            shrink_rate=0.3, grow_rate=0.3, cooldown_seconds=0.5,
+        ),
     )
 
     leg_unsafe = _hard_collision(leg, heading, poses, df)

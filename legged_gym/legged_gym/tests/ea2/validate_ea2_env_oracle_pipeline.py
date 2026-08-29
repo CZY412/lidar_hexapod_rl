@@ -98,6 +98,10 @@ def main() -> None:
     for t in range(_N_STEPS):
         with torch.no_grad():
             oracle = _oracle(env.heading, env.base_pos[:, :2], dft, low, high, interp=interp)
+            if env._oracle_smoother is not None:
+                # mirror the training-side smoothing so the perfect policy is
+                # judged against the target it is actually trained toward
+                oracle = env._oracle_smoother.update(oracle).detach()
             raw = (oracle - default) / scale
             obs, _, rew, dones, infos = env.step(raw)
 

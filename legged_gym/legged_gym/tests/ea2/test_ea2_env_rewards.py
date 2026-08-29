@@ -71,6 +71,7 @@ def _bare_env(device="cpu"):
                 "forward_limit", "backward_limit",
             )
         },
+        "oracle_snap_ratio": torch.zeros(n, device=device),
     }
     df, _ = tl.corridor_field(1.0)
     env.distance_field = torch.as_tensor(df, dtype=torch.float32, device=device)
@@ -191,3 +192,33 @@ def test_compute_rewards_accumulates_over_steps():
     env._compute_rewards()
     for k, v in env.episode_sums.items():
         assert torch.allclose(v, 2 * first[k])
+
+
+def test_compute_rewards_consumes_smoother_candidate_when_enabled():
+    """With a smoother present, the reward target (and per-param metrics) must
+    be computed against the smoother's candidate, not the raw oracle."""
+    env = _bare_env()
+    shifted = env.actions_mapped * 0.9 + 0.01  # arbitrary distinct candidate
+
+    class _Stub:
+        snapped = torch.zeros(env.num_envs, dtype=torch.bool)
+
+        def update(self, raw):
+            return shifted.clone()
+
+    env._oracle_smoother = _Stub()
+    low, high = env._envelope_low_dev, env._envelope_high_dev
+    env._compute_rewards()
+
+    norm_cand = normalized_envelope_params(shifted, low, high)
+    oracle_sq = (
+        normalized_envelope_params(env.actions_mapped, low, high)
+        - norm_cand
+    ) ** 2
+    for j, part in enumerate((
+        "front_width", "middle_width", "back_width",
+        "forward_limit", "backward_limit",
+    )):
+        assert torch.allclose(
+            env.episode_metrics[f"oracle_mse_{part}"], oracle_sq[:, j]
+        )

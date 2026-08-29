@@ -50,6 +50,12 @@ def test_env_cfg_contract():
     # the env reads this via getattr(..., True); pin it so a rename/delete of
     # the key cannot silently flip the reward oracle back to nearest-cell mode
     assert cfg.envelope.oracle_interp_crossing is True
+    # rate-limited target smoother defaults (per-second physical rates; see
+    # target_smoother.RateLimitedOracle)
+    assert cfg.envelope.target_rate_limit is True
+    assert cfg.envelope.target_shrink_rate == 2.0
+    assert cfg.envelope.target_grow_rate == 0.1
+    assert cfg.envelope.target_cooldown_seconds == 0.5
     assert cfg.envelope.oracle_step == 0.05
     assert cfg.envelope.oracle_max_dist == 5.0
     assert cfg.rewards.scales.collision == 0.0
