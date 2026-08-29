@@ -265,7 +265,7 @@ def hex_body_sample_points(params5: Tensor) -> Tensor:
     return center + (points - center) * (1.0 - 1e-4)
 
 
-def hex_collision_violation(
+def _hex_sample_violations(
     params5: Tensor,
     heading: Tensor,
     base_pos_xy: Tensor,
@@ -273,7 +273,7 @@ def hex_collision_violation(
     margin: float,
     soft_margin: float,
 ) -> Tensor:
-    """Worst-point smooth bounded collision violation from a distance field.
+    """Per-sample smooth bounded collision violations for all hex samples.
 
     Args:
         params5: Envelope parameters, shape ``(..., 5)``.
@@ -285,8 +285,7 @@ def hex_collision_violation(
         soft_margin: Width over which the violation ramps from 0 to 1 (m).
 
     Returns:
-        Violation tensor shape ``(...,)`` in ``[0, 1]``.  It is the maximum
-        per-sample ``clamp((margin - clearance) / soft_margin, 0, 1)``.
+        Violation tensor shape ``(..., 34)``, each value in ``[0, 1]``.
     """
     if soft_margin <= 0.0:
         raise ValueError("soft_margin must be positive")
@@ -319,8 +318,103 @@ def hex_collision_violation(
     dist_flat = dist.reshape(-1)
     clearance = dist_flat[iy * width + ix]
 
-    violation = ((margin - clearance) / soft_margin).clamp(0.0, 1.0)
-    return violation.max(dim=-1).values
+    return ((margin - clearance) / soft_margin).clamp(0.0, 1.0)
+
+
+def hex_collision_violation(
+    params5: Tensor,
+    heading: Tensor,
+    base_pos_xy: Tensor,
+    distance_field,
+    margin: float,
+    soft_margin: float,
+) -> Tensor:
+    """Worst-point smooth bounded collision violation from a distance field.
+
+    Args:
+        params5: Envelope parameters, shape ``(..., 5)``.
+        heading: Body yaw, shape ``(...,)``.
+        base_pos_xy: World ``(x, y)`` position, shape ``(..., 2)``.
+        distance_field: 2D unsigned distance-to-obstacle field, shape
+            ``(H, W)`` in metres.  Accepts ``numpy.ndarray`` or ``torch.Tensor``.
+        margin: Safe distance threshold (m).
+        soft_margin: Width over which the violation ramps from 0 to 1 (m).
+
+    Returns:
+        Violation tensor shape ``(...,)`` in ``[0, 1]``.  It is the maximum
+        per-sample ``clamp((margin - clearance) / soft_margin, 0, 1)``.
+    """
+    _, hard = hex_collision_terms(
+        params5,
+        heading,
+        base_pos_xy,
+        distance_field,
+        margin,
+        soft_margin,
+    )
+    return hard
+
+
+def hex_collision_edge_sum(
+    params5: Tensor,
+    heading: Tensor,
+    base_pos_xy: Tensor,
+    distance_field,
+    margin: float,
+    soft_margin: float,
+) -> Tensor:
+    """Sum of smooth collision violations over the 24 hexagon boundary samples.
+
+    Only the hexagon outline is included (6 vertices + 18 edge interpolation
+    points).  Interior samples are intentionally excluded from the dense
+    reward; they remain available through :func:`hex_collision_violation` for
+    hard-collision monitoring.
+
+    Args:
+        params5: Envelope parameters, shape ``(..., 5)``.
+        heading: Body yaw, shape ``(...,)``.
+        base_pos_xy: World ``(x, y)`` position, shape ``(..., 2)``.
+        distance_field: 2D unsigned distance-to-obstacle field, shape
+            ``(H, W)`` in metres.  Accepts ``numpy.ndarray`` or ``torch.Tensor``.
+        margin: Safe distance threshold (m).
+        soft_margin: Width over which the violation ramps from 0 to 1 (m).
+
+    Returns:
+        Sum tensor shape ``(...,)`` in ``[0, 24]``.
+    """
+    dense, _ = hex_collision_terms(
+        params5,
+        heading,
+        base_pos_xy,
+        distance_field,
+        margin,
+        soft_margin,
+    )
+    return dense
+
+
+def hex_collision_terms(
+    params5: Tensor,
+    heading: Tensor,
+    base_pos_xy: Tensor,
+    distance_field,
+    margin: float,
+    soft_margin: float,
+) -> Tuple[Tensor, Tensor]:
+    """Return ``(dense_edge_sum, hard_max)`` from a single sampling pass.
+
+    ``dense_edge_sum`` matches :func:`hex_collision_edge_sum` and
+    ``hard_max`` matches :func:`hex_collision_violation`.
+    """
+    violation = _hex_sample_violations(
+        params5,
+        heading,
+        base_pos_xy,
+        distance_field,
+        margin,
+        soft_margin,
+    )
+    return violation[..., :24].sum(dim=-1), violation.max(dim=-1).values
 
 
 def envelope_params_to_condition(

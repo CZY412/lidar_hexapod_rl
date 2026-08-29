@@ -20,10 +20,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
-import torch
 
 # ---------------------------------------------------------------------------
 # Paths / constants (single source of truth)

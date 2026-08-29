@@ -22,10 +22,9 @@ class El4090EA2Cfg(LeggedRobotCfg):
         num_envs = 1024  # start small; benchmark A*/raycast before scaling
         num_observations = 190          # 187 selected channels + 3 ego-motion
         num_privileged_obs = None       # no asymmetric critic
-        num_actions = 5                 # raw envelope params (sigmoid-affine in env)
+        num_actions = 5                 # raw envelope params (linear map + soft limit in env)
         env_spacing = 0.                # all envs share the single global map origin
-        episode_length_s = 40.          # timeout timer for probabilistic GRU reset
-        memory_reset_prob = 0.15        # probability to clear GRU at each timeout
+        episode_length_s = 30.          # full reset interval: GRU + robot/path
         send_timeouts = True
 
     class sim(LeggedRobotCfg.sim):
@@ -55,8 +54,8 @@ class El4090EA2Cfg(LeggedRobotCfg):
         # grid border is blocked so A* keeps the robot inside the map.
         boundary_occupied = True
         ground_margin_m = 2.0            # warp ground plane extends past map edges
-        inflation_m = 0.6               # A* lateral safety (3.5 cells -> 4)
-        inflation_cells = 6
+        inflation_m = 0.4               # A* lateral safety (3.5 cells -> 4)
+        inflation_cells = 4
         n_tiles = 4                      # 4 x 4 pillar-field plots
         tile_size_m = 16.0               # pd_gru terrain_length / terrain_width
         border_size_m = 5.0              # pd_gru border_size
@@ -96,6 +95,9 @@ class El4090EA2Cfg(LeggedRobotCfg):
         noise_amp_range = [0.0, 0.0]     # stage 1: no lateral path noise
         noise_fc_hz = 1.0
         noise_retries = 8
+        # Parallel A* workers (fork-based, CPU only; never touch CUDA/Isaac).
+        path_plan_workers = 8
+        path_plan_batch_threshold = 4
 
     class sway:
         pos_amp_range = [0.0, 0.0]       # stage 1: no lateral sway
@@ -139,6 +141,19 @@ class El4090EA2Cfg(LeggedRobotCfg):
     class envelope:
         margin = 0.10                    # safe-distance threshold for clearance penalty (m)
         soft_margin = 0.10               # width over which the violation ramps to 1 (m)
+        # Standard-legged_gym-style action-space soft limits.  action_max is
+        # the raw-action radius reaching the soft bounds; soft_dof_pos_limit
+        # reserves a small band before the true hard clamp.
+        action_max = 4.0
+        soft_dof_pos_limit = 0.9
+        # Grid oracle parameters (per-parameter independent scale target).
+        oracle_margin = 0.10
+        oracle_step = 0.05
+        oracle_max_dist = 5.0
+        # Bilinear distance-field sampling + interpolated margin crossing in
+        # the oracle ray march (removes the quantisation staircase; verified
+        # by tests/ea2/validate_oracle_smoothness.py).
+        oracle_interp_crossing = True
         # 5 params + 3 priors are loaded from the frozen contract path
         # (_contracts.ENVELOPE_SPEC_CONFIG_PATH).
         # spider_envelop_2-style bold footprint drawing
@@ -150,9 +165,11 @@ class El4090EA2Cfg(LeggedRobotCfg):
     class rewards:
         # BaseTask does not auto-scale reward terms; env multiplies directly.
         class scales:
-            potential = 1.0
-            collision = -1.0
+            potential = 0.0
+            collision = 0.0
             action_rate = -0.01
+            envelope_limits = -0.8
+            oracle_mse = -3.0
 
     class normalization:
         clip_observations = 100.
@@ -164,7 +181,7 @@ class El4090EA2CfgPPO(LeggedRobotCfgPPO):
     runner_class_name = "OnPolicyRunner"
 
     class policy(LeggedRobotCfgPPO.policy):
-        init_noise_std = 0.3
+        init_noise_std = 1.0
         actor_hidden_dims = [256, 128]
         critic_hidden_dims = [256, 128]
         activation = "elu"
@@ -175,6 +192,8 @@ class El4090EA2CfgPPO(LeggedRobotCfgPPO):
         rnn_num_layers = 1
 
     class algorithm(LeggedRobotCfgPPO.algorithm):
+        entropy_coef = 0.01
+
         class symmetry_cfg:
             # M1 default: symmetry off.  Optional T8 symmetry module can enable:
             # data_augmentation_func =

@@ -854,81 +854,11 @@ def plan_path(
     return data
 
 
-def heading_update(
-    heading: float,
-    tangent: float,
-    tangent_rate: float,
-    delta_target: float,
-    v: float,
-    dt: float,
-    k_p: float,
-    omega_max: float,
-) -> Tuple[float, float, float]:
-    """Advance heading one control step under tangent-relative tracking.
-
-    Computes the current relative yaw error, applies a proportional controller
-    on top of the reference tangent rate, clips angular velocity, integrates
-    the heading and returns the updated heading/omega/delta_actual.
-
-    Args:
-        heading: Current body yaw (rad).
-        tangent: Current reference-path tangent yaw (rad).
-        tangent_rate: Reference curvature rate ``kappa * v`` (rad/s).
-        delta_target: Desired body yaw offset from tangent (rad).
-        v: Forward speed (m/s, unused except for API symmetry with README).
-        dt: Control timestep (s).
-        k_p: Proportional gain (1/s).
-        omega_max: Angular-velocity clip bound (rad/s).
-
-    Returns:
-        ``(heading_new, omega, delta_actual_new)``.
-    """
-    # The controller error uses the current relative yaw.
-    heading_arr = np.asarray(heading, dtype=np.float64)
-    tangent_arr = np.asarray(tangent, dtype=np.float64)
-    delta_actual = wrap_to_pi(heading_arr - tangent_arr)
-    omega_cmd = tangent_rate + k_p * wrap_to_pi(delta_target - delta_actual)
-    omega = np.clip(omega_cmd, -omega_max, omega_max)
-    heading_new = wrap_to_pi(heading_arr + omega * dt)
-    delta_actual_new = wrap_to_pi(heading_new - tangent_arr)
-    if np.ndim(heading_arr) == 0:
-        return float(heading_new), float(omega), float(delta_actual_new)
-    return heading_new, omega, delta_actual_new
-
-
-def ego_motion(
-    v: float,
-    heading: float,
-    tangent: float,
-    omega: float,
-) -> Tuple[float, float, float]:
-    """Compute body-frame ego-motion ``(vx, vy, omega)`` from path tracking.
-
-    The M1 kinematic surrogate moves along the reference tangent while the
-    body yaw may be biased; this yields the crab-walk decomposition.
-
-    Args:
-        v: Forward speed along the tangent direction (m/s).
-        heading: Current body yaw (rad).
-        tangent: Current reference tangent yaw (rad).
-        omega: Current angular velocity (rad/s).
-
-    Returns:
-        ``(vx, vy, omega)`` in the robot/body frame.
-    """
-    delta_actual = wrap_to_pi(heading - tangent)
-    vx = v * np.cos(delta_actual)
-    vy = v * np.sin(delta_actual)
-    if np.ndim(delta_actual) == 0:
-        return float(vx), float(vy), float(omega)
-    return vx, vy, np.asarray(omega, dtype=np.float64)
 
 
 __all__ = [
     "PathData",
     "PathCfg",
     "plan_path",
-    "heading_update",
-    "ego_motion",
     "wrap_to_pi",
 ]

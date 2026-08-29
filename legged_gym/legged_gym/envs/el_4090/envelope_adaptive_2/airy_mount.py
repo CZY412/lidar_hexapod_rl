@@ -25,7 +25,6 @@ import torch
 from ._contracts import (
     EA2_AIRY_N_AZIMUTH_FULL,
     EA2_AIRY_N_ELEVATION,
-    EA2_AIRY_HORIZONTAL_RES_DEG,
     EA2_BASE_HEIGHT_M,
     EA2_FULL_N_RAYS,
     EA2_GRID_COLS,
@@ -287,39 +286,3 @@ def self_check_selected_channels(data: Dict[str, object]) -> Dict[str, object]:
     }
 
 
-def save_body_ray_projection(path: PathLike) -> Optional[Path]:
-    """Save a 2D azimuth/elevation projection of the selected body-frame rays.
-
-    Optional debug aid; returns ``None`` if matplotlib is unavailable.
-    """
-    path = Path(path)
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception:  # pragma: no cover - environment-specific
-        return None
-
-    data = load_selected_channels()
-    dirs = data["ray_directions"]
-    # Convert sensor-frame selected directions to body frame for plotting.
-    offset_q = _quat_from_euler_xyz(*EA2_SENSOR_OFFSET_RPY)
-    body_dirs = _quat_apply(
-        offset_q.view(1, 4).expand(dirs.shape[0], 4), dirs.to(dtype=torch.float64)
-    )
-    azimuth_deg = torch.atan2(body_dirs[:, 1], body_dirs[:, 0]) / _DEG2RAD
-    elevation_deg = torch.asin(
-        body_dirs[:, 2] / torch.norm(body_dirs, dim=1).clamp_min(1e-6)
-    ) / _DEG2RAD
-
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.scatter(azimuth_deg.numpy(), elevation_deg.numpy(), s=6)
-    ax.set_xlabel("body azimuth (deg)")
-    ax.set_ylabel("body elevation (deg)")
-    ax.set_title("EA2 selected 187 Airy rays in body frame")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    return path

@@ -103,8 +103,6 @@ def _generate_pillar_field_tile(
             continue
         hx = sx / 2.0
         hy = sy / 2.0
-        occ_hx = hx + margin
-        occ_hy = hy + margin
         for _ in range(max_attempts_per):
             r = float(rng.uniform(clear_radius, spawn_radius))
             theta = float(rng.uniform(0.0, 2.0 * math.pi))
