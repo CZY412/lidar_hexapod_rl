@@ -114,17 +114,32 @@ class SLConfig:
         return asdict(self)
 
 
-#: Action-space constants, derived from the environment mapping.
-#:
-#: ``target = default + a * scale`` with ``default = 0.5*(low+high)`` and
-#: ``scale = (high-low) * soft_dof_pos_limit / (2*action_max)``.  With
-#: ``soft_dof_pos_limit = 0.9`` and ``action_max = 4`` that is ``0.1125 * span``.
-#: Normalising gives ``s = 0.5 + 0.1125*a`` -- except for ``backward_limit``
-#: whose ``low = -0.9 > high = -1.0`` ordering flips the sign.
-ACTION_SCALE: float = 0.1125
-
 #: Per-dimension sign of ``s -> a``.  Index 4 is ``backward_limit``.
+#: (The scalar scale of the mapping is derived from the live env config by
+#: :func:`env_action_scale`; the historical constant 0.1125 for
+#: ``soft_dof_pos_limit=0.9`` was removed as dead code once every consumer
+#: switched to the derived value.)
 ACTION_SIGN: List[float] = [1.0, 1.0, 1.0, 1.0, -1.0]
+
+
+def env_action_scale() -> float:
+    """Span-normalised raw-action scale of the *live* env mapping.
+
+    The environment realises ``s = 0.5 + env_action_scale() * ACTION_SIGN * a``
+    through ``target = default + a * scale`` with
+    ``scale = span * soft_dof_pos_limit / (2 * action_max)``.  It is derived
+    lazily from :class:`El4090EA2Cfg` so the export-time action fold and
+    ``evaluate.s_to_action`` can never drift from the mapping the running env
+    actually applies (``soft_dof_pos_limit`` 0.9 -> 0.95 moved the scale from
+    0.1125 to 0.11875; a stale fold silently pins the deployed envelope near
+    its midpoint).
+    """
+    from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_config import (
+        El4090EA2Cfg,
+    )
+
+    env_cls = El4090EA2Cfg.envelope
+    return float(env_cls.soft_dof_pos_limit) / (2.0 * float(env_cls.action_max))
 
 #: Envelope parameter names, ordered as the environment packs them.
 PARAM_NAMES: List[str] = [

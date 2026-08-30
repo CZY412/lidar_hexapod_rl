@@ -16,6 +16,24 @@ transplant is a straight key-by-key copy of ten tensors:
 
 plus ``std``, which has no counterpart in the SL net and is set explicitly.
 
+The action-convention fold
+--------------------------
+``EnvelopeNet`` is trained to regress the *normalised* envelope ``s in [0,
+1]``, but the env consumes *raw* actions through ``target = default + a *``
+``scale`` and therefore realises ``s = 0.5 + k * sign * a`` with
+``k = soft_dof_pos_limit / (2 * action_max)`` and ``sign = +1`` except
+``backward_limit`` (``-1``).  A verbatim copy would feed ``s`` where the env
+expects ``a`` and pin the deployed envelope near its midpoint (the realised
+range collapses to ``[0.5, 0.5 + k]``).  ``export`` therefore folds the affine
+map into the final actor layer (``a = sign * (s - 0.5) / k``):
+
+    actor.4.weight' = (sign / k) * mlp.4.weight      (row scaling)
+    actor.4.bias'   = (sign / k) * (mlp.4.bias - 0.5)
+
+This is exact for a linear head, so ``play_ea2`` / PPO consume the exported
+policy without any wrapper.  Pass ``fold_action_mapping=False`` for the raw
+verbatim transplant (kept only for debugging the transplant itself).
+
 What is *not* transferred
 -------------------------
 The critic side (``memory_c`` + ``critic``) stays randomly initialised -- the SL
@@ -32,7 +50,27 @@ from typing import Dict, Optional
 import torch
 
 from .model import EnvelopeNet
-from .sl_config import SLConfig
+from .sl_config import ACTION_SIGN, SLConfig, env_action_scale
+
+#: Index of the final actor layer inside rsl_rl's ``actor`` Sequential
+#: (``[Linear, act, Linear, act, Linear]`` -> indices 0/2/4).
+_FINAL_LAYER = "4"
+
+
+def _action_fold(device=None) -> torch.Tensor:
+    """Per-dimension fold factor ``(sign / k)`` for the final actor layer."""
+    k = env_action_scale()
+    return torch.tensor(ACTION_SIGN, dtype=torch.float32, device=device) / k
+
+
+def fold_final_layer(weight: torch.Tensor, bias: torch.Tensor):
+    """Apply the ``s -> raw-action`` affine to a final-layer (weight, bias).
+
+    ``a = d * (s - 0.5)`` with ``d = sign / k`` row-scales the weight matrix
+    and shifts+scales the bias: ``a = (d * W) h + d * (b - 0.5)``.
+    """
+    d = _action_fold(weight.device)  # (5,)
+    return weight * d.unsqueeze(-1), d * (bias - 0.5)
 
 
 def build_ppo_policy(cfg: SLConfig, device: str = "cpu", init_noise_std: Optional[float] = None):
@@ -62,6 +100,7 @@ def export(
     init_critic: bool = False,
     device: str = "cpu",
     policy=None,
+    fold_action_mapping: bool = True,
 ):
     """Transplant ``net``'s weights into a PPO policy.
 
@@ -69,6 +108,12 @@ def export(
         policy: an existing ``ActorCriticRecurrent`` to fill **in place**.  When
             omitted a fresh one is created.  Passing one in lets callers (and
             tests) verify that untouched parameters really are untouched.
+        fold_action_mapping: fold the ``s -> raw-action`` affine into the final
+            actor layer (default).  The SL net regresses normalised envelope
+            params ``s in [0, 1]`` while the env consumes raw actions via
+            ``s = 0.5 + k * sign * a``; a verbatim copy pins the deployed
+            envelope near its midpoint.  ``False`` restores the raw copy
+            (debugging only -- such a policy must not be deployed).
 
     Returns the policy; raises on any shape mismatch so that a silent partial
     transfer is impossible.
@@ -88,6 +133,13 @@ def export(
             )
         dst[dst_key].copy_(src[src_key].to(dst[dst_key].device))
 
+    if fold_action_mapping:
+        w_src = src[f"mlp.{_FINAL_LAYER}.weight"].to(dst[f"actor.{_FINAL_LAYER}.weight"].device)
+        b_src = src[f"mlp.{_FINAL_LAYER}.bias"].to(dst[f"actor.{_FINAL_LAYER}.bias"].device)
+        w_fold, b_fold = fold_final_layer(w_src, b_src)
+        dst[f"actor.{_FINAL_LAYER}.weight"].copy_(w_fold)
+        dst[f"actor.{_FINAL_LAYER}.bias"].copy_(b_fold)
+
     std_val = float(init_noise_std if init_noise_std is not None else cfg.train.export_std)
     dst["std"].copy_(torch.full_like(dst["std"], std_val))
 
@@ -106,7 +158,13 @@ def export(
 def verify_export(
     net: EnvelopeNet, policy, atol: float = 1e-6, reference_state: Optional[Dict] = None
 ) -> Dict[str, bool]:
-    """Assert the transplanted policy reproduces the net's predictions.
+    """Assert the transplanted policy reproduces the net's deployed behaviour.
+
+    The deployment contract is *not* "policy output == net output": the env
+    realises ``s = 0.5 + k * sign * a`` from the policy's raw action, so the
+    folded policy is correct iff that reconstruction equals the net's ``s``
+    (see the module docstring).  GRU and the two hidden layers must still match
+    verbatim; the final layer is checked against the folded affine.
 
     rsl_rl's ``Memory`` takes a 2-D ``(batch, obs)`` in inference mode and adds
     the time axis itself, whereas ``EnvelopeNet`` expects ``(seq, batch, obs)``.
@@ -123,10 +181,31 @@ def verify_export(
 
     src = net.state_dict()
     dst = policy.state_dict()
+    d = _action_fold()
+
+    # verbatim keys: GRU + both hidden layers
     for src_key, dst_key in net.actor_state_dict_keys().items():
+        if dst_key.startswith(f"actor.{_FINAL_LAYER}."):
+            continue
         checks[f"equal::{dst_key}"] = bool(
             torch.allclose(src[src_key].cpu(), dst[dst_key].cpu(), atol=atol)
         )
+
+    # final layer must equal the folded affine of the net's final layer
+    for suffix in ("weight", "bias"):
+        src_t = src[f"mlp.{_FINAL_LAYER}.{suffix}"].cpu()
+        if suffix == "weight":
+            expect = src_t * d.unsqueeze(-1)
+        else:
+            expect = d * (src_t - 0.5)
+        checks[f"fold::actor.{_FINAL_LAYER}.{suffix}"] = bool(
+            torch.allclose(expect, dst[f"actor.{_FINAL_LAYER}.{suffix}"].cpu(), atol=atol)
+        )
+
+    def _realised_s(action: torch.Tensor) -> torch.Tensor:
+        # env convention: s = 0.5 + k * sign * a  (elementwise sign, then k)
+        sign = torch.tensor(ACTION_SIGN, dtype=action.dtype, device=action.device)
+        return 0.5 + env_action_scale() * sign * action
 
     batch = 7
     obs2d = torch.randn(batch, net.cfg.obs_dim)
@@ -134,7 +213,7 @@ def verify_export(
         net_out = net(obs2d.unsqueeze(0))  # (1, batch, 5)
         pol_out = policy.actor(policy.memory_a(obs2d))  # (1, batch, 5)
     checks["behaviour::single_frame"] = bool(
-        torch.allclose(net_out.cpu(), pol_out.cpu(), atol=1e-5)
+        torch.allclose(_realised_s(pol_out).cpu(), net_out.cpu(), atol=1e-5)
     )
 
     # multi-step: hidden state must be carried identically
@@ -152,7 +231,9 @@ def verify_export(
             pol_outs.append(policy.actor(policy.memory_a(obs_seq[t]))[0])
     checks["behaviour::multi_step"] = bool(
         torch.allclose(
-            torch.stack(net_outs).cpu(), torch.stack(pol_outs).cpu(), atol=1e-5
+            _realised_s(torch.stack(pol_outs)).cpu(),
+            torch.stack(net_outs).cpu(),
+            atol=1e-5,
         )
     )
 
@@ -168,7 +249,7 @@ def verify_export(
         # the actor side must, by contrast, have changed
         checks["actor_written"] = not all(
             bool(torch.allclose(current[k].cpu(), reference_state[k].cpu()))
-            for k in ("memory_a.rnn.weight_ih_l0", "actor.4.weight")
+            for k in ("memory_a.rnn.weight_ih_l0", f"actor.{_FINAL_LAYER}.weight")
         )
     return checks
 

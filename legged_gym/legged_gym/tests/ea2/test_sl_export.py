@@ -38,8 +38,8 @@ def test_export_copies_all_actor_weights():
     policy = sexp.export(net, cfg, device="cpu")
     checks = sexp.verify_export(net, policy)
     for key, ok in checks.items():
-        if key.startswith("equal::"):
-            assert ok, f"weight not copied: {key}"
+        if key.startswith("equal::") or key.startswith("fold::"):
+            assert ok, f"weight not transplanted correctly: {key}"
 
 
 def test_export_sets_std():
@@ -62,6 +62,55 @@ def test_export_reproduces_behaviour_single_frame():
     policy = sexp.export(net, cfg, device="cpu")
     checks = sexp.verify_export(net, policy)
     assert checks["behaviour::single_frame"]
+
+
+def test_export_folds_env_action_mapping_into_final_layer():
+    """The deployed policy must realise the net's s through the env mapping.
+
+    ``EnvelopeNet`` outputs normalised params ``s in [0, 1]`` but the env
+    consumes raw actions via ``s = 0.5 + k * sign * a``.  A verbatim copy
+    feeds ``s`` where ``a`` is expected and pins the envelope near its
+    midpoint (realised range ``[0.5, 0.5 + k]``) -- the export therefore folds
+    ``a = sign * (s - 0.5) / k`` into the final actor layer.
+    """
+    from legged_gym.envs.el_4090.envelope_adaptive_2.sl.sl_config import (
+        ACTION_SIGN,
+        env_action_scale,
+    )
+
+    cfg, net, _ = _net_and_policy()
+    policy = sexp.export(net, cfg, device="cpu")
+    k = env_action_scale()
+    sign = torch.tensor(ACTION_SIGN)
+    d = sign / k
+
+    src = net.state_dict()
+    dst = policy.state_dict()
+    torch.testing.assert_close(
+        dst["actor.4.weight"], src["mlp.4.weight"] * d.unsqueeze(-1)
+    )
+    torch.testing.assert_close(dst["actor.4.bias"], d * (src["mlp.4.bias"] - 0.5))
+
+    # end-to-end: env-realised s equals the net output, including the endpoints
+    s_vals = torch.tensor([[0.0] * 5, [0.5] * 5, [1.0] * 5, [0.2, 0.9, 0.4, 0.75, 0.6]])
+    a = sign * (s_vals - 0.5) / k
+    low = torch.tensor([0.3, 0.3, 0.3, 0.6, -0.9])
+    high = torch.tensor([0.6, 0.7, 0.6, 0.9, -0.6])
+    default = 0.5 * (low + high)
+    params = torch.clamp(default + a * (high - low) * k, low, high)
+    min_v = torch.stack([low[0], low[1], low[2], low[3], high[4]])
+    span = torch.stack([high[0], high[1], high[2], high[3], low[4]]) - min_v
+    torch.testing.assert_close((params - min_v) / span, s_vals, atol=1e-5, rtol=0)
+
+
+def test_export_fold_disabled_is_verbatim_copy():
+    """``fold_action_mapping=False`` restores the raw transplant (debug only)."""
+    cfg, net, _ = _net_and_policy()
+    policy = sexp.export(net, cfg, device="cpu", fold_action_mapping=False)
+    src = net.state_dict()
+    dst = policy.state_dict()
+    torch.testing.assert_close(dst["actor.4.weight"], src["mlp.4.weight"])
+    torch.testing.assert_close(dst["actor.4.bias"], src["mlp.4.bias"])
 
 
 def test_export_reproduces_behaviour_multi_step():

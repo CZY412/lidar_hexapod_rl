@@ -8,17 +8,22 @@ the reward the environment hands out and the physical quantities behind it
 Action mapping
 --------------
 The environment maps raw actions to envelope parameters via
-``target = default + a * scale`` with ``scale = (high-low) * 0.9 / (2*4)``.
-Normalising gives ``s = 0.5 + 0.1125*a`` for the four "larger is wider"
-dimensions, but ``backward_limit`` has ``low = -0.9 > high = -0.6``, which
-flips the sign.  Hence::
+``target = default + a * scale`` with ``scale = (high-low) * k`` and
+``k = soft_dof_pos_limit / (2*action_max)`` taken from the *live* config
+(:func:`sl.sl_config.env_action_scale`).  Normalising gives
+``s = 0.5 + k*a`` for the four "larger is wider" dimensions, but
+``backward_limit`` has ``low = -0.9 > high = -0.6``, which flips the sign.
+Hence::
 
-    a = ACTION_SIGN * (s - 0.5) / 0.1125      # ACTION_SIGN = [1,1,1,1,-1]
+    a = ACTION_SIGN * (s - 0.5) / k          # ACTION_SIGN = [1,1,1,1,-1]
 
-Deliberately **not** clipped to ``action_max = 4``: ``s`` in {0, 1} maps to
-``a = +/-4.444``, and letting it through places the envelope exactly on its
-hard bound, matching what the oracle produced.  The residual
-``envelope_limit_violation`` is ~1e-3 * 0.8, i.e. negligible.
+Deliberately **not** clipped to ``action_max``: ``s`` in {0, 1} maps slightly
+past the soft bound, and letting it through places the envelope on its hard
+bound, matching what the oracle produced.  The residual
+``envelope_limit_violation`` is ~1e-3 * 0.8, i.e. negligible.  The same fold is
+baked into the final actor layer by ``export.export``, which is why
+``play_ea2`` needs no conversion while this module (which drives the raw
+``EnvelopeNet``) does.
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 import torch
 
-from .sl_config import ACTION_SCALE, ACTION_SIGN, SLConfig
+from .sl_config import ACTION_SIGN, SLConfig, env_action_scale
 
 
 def load_checkpoint(path: str, device: str = "cpu"):
@@ -52,7 +57,7 @@ def load_checkpoint(path: str, device: str = "cpu"):
 def s_to_action(s: torch.Tensor, device=None) -> torch.Tensor:
     """Normalised params -> raw actions (inverse of the env mapping)."""
     sign = torch.tensor(ACTION_SIGN, dtype=s.dtype, device=s.device)
-    return sign * (s - 0.5) / ACTION_SCALE
+    return sign * (s - 0.5) / env_action_scale()
 
 
 @dataclass

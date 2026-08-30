@@ -13,7 +13,10 @@ import pytest
 import torch
 
 from legged_gym.envs.el_4090.envelope_adaptive_2.sl.evaluate import s_to_action, load_checkpoint
-from legged_gym.envs.el_4090.envelope_adaptive_2.sl.sl_config import ACTION_SCALE, SLConfig
+from legged_gym.envs.el_4090.envelope_adaptive_2.sl.sl_config import (
+    SLConfig,
+    env_action_scale,
+)
 
 EVAL_JSON = os.environ.get("EA2_SL_EVAL", "")
 
@@ -36,14 +39,16 @@ def test_s_to_action_roundtrip_through_env_convention():
     ``MIN_V = [low[0..3], high[4]]`` and ``MAX_V = [high[0..3], low[4]]``,
     because ``backward_limit``'s admissible range runs from -0.9 (most rear
     extent, s=1) up to -0.6 (least, s=0).  So s=0 maps to ``MIN_V``, not to
-    ``low``.
+    ``low``.  The action scale must come from the *live* env config
+    (``env_action_scale``), not a hardcoded 0.9-based constant -- the fold and
+    the env mapping drifted apart once ``soft_dof_pos_limit`` changed.
     """
     low = torch.tensor([0.3, 0.3, 0.3, 0.6, -0.9])
     high = torch.tensor([0.6, 0.7, 0.6, 0.9, -0.6])
     min_v = torch.stack([low[0], low[1], low[2], low[3], high[4]])
     max_v = torch.stack([high[0], high[1], high[2], high[3], low[4]])
     default = 0.5 * (low + high)
-    scale = (high - low) * 0.9 / (2 * 4.0)
+    scale = (high - low) * env_action_scale()
 
     for s_val, expect in ((0.0, min_v), (1.0, max_v)):
         s = torch.full((1, 5), s_val)
