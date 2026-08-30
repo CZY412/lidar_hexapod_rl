@@ -72,6 +72,17 @@ class SLModelConfig:
     actor_hidden_dims: List[int] = field(default_factory=lambda: [256, 128])
     activation: str = "elu"
 
+    #: Training-only auxiliary memory heads (a single Linear(hidden, action)
+    #: probe per k, attached to the GRU output).  Empty list = disabled; the
+    #: heads exist only during SL training and are never exported.
+    #: ``aux_mode="recall"`` asks h_t to reconstruct s_{t-k} (pure memory
+    #: demand, cannot be satisfied by spatial extrapolation of the current
+    #: view); ``"forward"`` asks h_t to predict s_{t+k} (mixed extrapolation
+    #: + retention, gradient lands at the write moment).  k is in frames at
+    #: the control rate (75 = 1.5 s at 50 Hz ~= the pass-by invisible tail).
+    aux_ks: List[int] = field(default_factory=list)
+    aux_mode: str = "recall"
+
 
 @dataclass
 class SLTrainConfig:
@@ -109,6 +120,19 @@ class SLTrainConfig:
 
     #: ``std`` written into the exported ActorCriticRecurrent.
     export_std: float = 0.5
+
+    #: Weight of the auxiliary memory loss (see ``SLModelConfig.aux_ks``).
+    #: 0 disables the loss even when heads exist.  Monitor the main val MSE:
+    #: if it degrades, lower this.
+    aux_beta: float = 0.5
+
+    #: Weight of the differentiable safety (collision) loss on the policy's own
+    #: prediction: mean bilinear-sampled violation over the 24 boundary hex
+    #: samples, with floor-pinned frames masked out.  0 disables it.  The loss
+    #: is zero-gradient on safe frames, so it only acts where the prediction
+    #: actually violates geometry.  Requires >=1 for effect; watch the main val
+    #: MSE and the policy clearance (collapse guard).
+    safe_lambda: float = 0.0
 
 
 @dataclass

@@ -76,6 +76,20 @@ class EnvelopeNet(nn.Module):
                 layers.append(_make_activation(cfg.activation))
         self.mlp = nn.Sequential(*layers)
 
+        # Training-only auxiliary memory probes (single Linear per k, attached
+        # to the GRU output h_t).  Deliberately linear: the probe must push the
+        # memory burden onto h, not absorb it with decoder capacity.  These
+        # heads are never exported (export transplants only the 10 known keys).
+        self.aux_ks: List[int] = sorted(int(k) for k in (cfg.aux_ks or []))
+        if self.aux_ks:
+            if cfg.aux_mode not in ("recall", "forward"):
+                raise ValueError(f"unknown aux_mode: {cfg.aux_mode!r}")
+            self.aux_heads = nn.ModuleDict(
+                {str(k): nn.Linear(cfg.rnn_hidden_dim, cfg.action_dim) for k in self.aux_ks}
+            )
+        else:
+            self.aux_heads = None
+
     # -- forward -----------------------------------------------------------
     def forward(self, obs: torch.Tensor, hidden=None) -> torch.Tensor:
         """Full-sequence forward.
@@ -87,6 +101,17 @@ class EnvelopeNet(nn.Module):
         """
         out, _ = self.gru(obs, hidden)
         return self.mlp(out)
+
+    def forward_with_aux(self, obs: torch.Tensor, hidden=None):
+        """Sequence forward that also returns the GRU hidden states.
+
+        Training-only helper for the auxiliary memory loss.  Args and the main
+        output match :meth:`forward`; additionally returns the pre-MLP hidden
+        sequence ``(seq, batch, rnn_hidden_dim)`` so the aux probes read the
+        GRU memory directly (never the MLP features).
+        """
+        out, _ = self.gru(obs, hidden)
+        return self.mlp(out), out
 
     def step(self, obs: torch.Tensor, hidden=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """Single-frame forward used for deployment.
