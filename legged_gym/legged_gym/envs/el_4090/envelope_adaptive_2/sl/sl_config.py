@@ -1,0 +1,182 @@
+"""Configuration for the offline supervised-learning pipeline.
+
+Deliberately *separate* from :class:`El4090EA2Cfg` / :class:`El4090EA2CfgPPO`.
+
+The most important consequence of this separation: the SL sequence length is
+NOT bounded by ``runner.num_steps_per_env``.  PPO's BPTT horizon equals its
+rollout length (100 steps == 2 s), whereas SL can train on any window it likes
+(40 LiDAR frames == 4 s), which is where a large part of its advantage comes
+from.
+"""
+
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional
+
+
+@dataclass
+class SLDataConfig:
+    """Data-collection options."""
+
+    #: Map seeds to collect, each paired with an obstacle-count override in
+    #: ``pillar_counts``.  ``env.py`` reads ``cfg.seed`` as ``map_seed``, so each
+    #: seed yields a different obstacle layout.  ``1`` is the production value
+    #: (``task_registry`` copies ``train_cfg.seed`` into ``env_cfg.seed``).
+    #:
+    #: Include at least one dense map -- dense scenes are the measured weak spot
+    #: (R2 0.72 vs 0.83, collision 25% vs 18%).
+    seeds: List[int] = field(default_factory=lambda: [1, 7, 13, 21])
+
+    #: Obstacle-count overrides, positionally paired with ``seeds``.  ``None``
+    #: keeps the config default (18).  Use :meth:`seed_specs` to iterate the two
+    #: lists together safely.
+    pillar_counts: List[Optional[int]] = field(
+        default_factory=lambda: [None, None, None, 28]
+    )
+
+    def seed_specs(self) -> List["tuple[int, Optional[int]]"]:
+        """Zip ``seeds`` with ``pillar_counts``, padding with ``None``."""
+        counts = list(self.pillar_counts) + [None] * (
+            len(self.seeds) - len(self.pillar_counts)
+        )
+        return list(zip(self.seeds, counts[: len(self.seeds)]))
+
+    #: Parallel environments used during collection.
+    num_envs: int = 96
+
+    #: Control steps per collection episode.
+    num_steps: int = 1400
+
+    #: LiDAR refresh decimation.  The sensor runs at 10 Hz while control runs at
+    #: 50 Hz, so only every 5th step carries a fresh frame.
+    lidar_decimation: int = 5
+
+    #: Steps discarded at the start of every episode.  On reset the rate limiter
+    #: seeds ``prev_s = 1`` (fully open) and shrinks at ``shrink_rate = 2.0 m/s``;
+    #: with a max span of 0.4 m that settles in ~10 steps.  30 keeps a 3x margin.
+    warmup_steps: int = 30
+
+
+@dataclass
+class SLModelConfig:
+    """Model architecture.  Must stay isomorphic to rsl_rl's actor."""
+
+    obs_dim: int = 190  # 187 range channels + 3 ego motion
+    action_dim: int = 5  # normalised envelope params [0, 1]
+    rnn_hidden_dim: int = 187
+    rnn_num_layers: int = 1
+    rnn_type: str = "gru"
+    actor_hidden_dims: List[int] = field(default_factory=lambda: [256, 128])
+    activation: str = "elu"
+
+
+@dataclass
+class SLTrainConfig:
+    """Optimisation options."""
+
+    #: Frames per training sequence.  40 frames @ 10 Hz == 4 s of memory, which
+    #: is where the offline observability scan saturates (R2 = 1.0).
+    seq_len: int = 40
+
+    #: Stride (in frames) between consecutive window start positions.
+    window_stride: int = 2
+
+    #: Store windows as ``uint8``-quantised observations to cut memory ~4x.
+    #:
+    #: Windowing expands the source data by roughly ``seq_len / stride`` (about
+    #: 15x at seq_len=40, stride=2): four maps worth 90 MiB become ~1.4 GiB of
+    #: float32 tensors.  Quantising the range image to 8 bits trades a
+    #: quantisation error of ~3.2/255 m for a 4x memory reduction, which keeps
+    #: larger corpora feasible.
+    quantise_obs: bool = False
+
+    epochs: int = 50
+    batch_size: int = 64
+    learning_rate: float = 1e-3
+    grad_clip: float = 1.0
+
+    #: Fraction of environments held out for validation.  Splitting is done by
+    #: environment (never by timestep) so no trajectory straddles the split.
+    val_fraction: float = 0.2
+
+    split_seed: int = 1
+
+    #: ``std`` written into the exported ActorCriticRecurrent.
+    export_std: float = 0.5
+
+
+@dataclass
+class SLConfig:
+    data: SLDataConfig = field(default_factory=SLDataConfig)
+    model: SLModelConfig = field(default_factory=SLModelConfig)
+    train: SLTrainConfig = field(default_factory=SLTrainConfig)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+#: Action-space constants, derived from the environment mapping.
+#:
+#: ``target = default + a * scale`` with ``default = 0.5*(low+high)`` and
+#: ``scale = (high-low) * soft_dof_pos_limit / (2*action_max)``.  With
+#: ``soft_dof_pos_limit = 0.9`` and ``action_max = 4`` that is ``0.1125 * span``.
+#: Normalising gives ``s = 0.5 + 0.1125*a`` -- except for ``backward_limit``
+#: whose ``low = -0.9 > high = -1.0`` ordering flips the sign.
+ACTION_SCALE: float = 0.1125
+
+#: Per-dimension sign of ``s -> a``.  Index 4 is ``backward_limit``.
+ACTION_SIGN: List[float] = [1.0, 1.0, 1.0, 1.0, -1.0]
+
+#: Envelope parameter names, ordered as the environment packs them.
+PARAM_NAMES: List[str] = [
+    "front_width",
+    "middle_width",
+    "back_width",
+    "forward_limit",
+    "backward_limit",
+]
+
+
+# ---------------------------------------------------------------------------
+# Default artifact locations
+#
+# Everything lives under ``sl/logs/`` so that experiments stay with the project
+# instead of in /tmp (which, while not auto-cleaned on this machine, is
+# semantically disposable and lives on the root partition).
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+#: ``.../envelope_adaptive_2/sl``
+SL_ROOT: str = _os.path.dirname(_os.path.abspath(__file__))
+
+#: ``.../envelope_adaptive_2/sl/logs``
+SL_LOGS: str = _os.path.join(SL_ROOT, "logs")
+
+#: Collected rollouts: ``logs/data/map_seed<N>.pt``
+SL_DATA_DIR: str = _os.path.join(SL_LOGS, "data")
+
+#: Per-experiment outputs: ``logs/runs/<run_name>/``
+SL_RUNS_DIR: str = _os.path.join(SL_LOGS, "runs")
+
+
+def data_path(seed: int) -> str:
+    return _os.path.join(SL_DATA_DIR, f"map_seed{int(seed)}.pt")
+
+
+def run_dir(run_name: str) -> str:
+    return _os.path.join(SL_RUNS_DIR, run_name)
+
+
+def available_seeds(data_dir: str = None) -> List[int]:
+    """Map seeds that have already been collected, sorted ascending."""
+    directory = data_dir or SL_DATA_DIR
+    if not _os.path.isdir(directory):
+        return []
+    out = []
+    for name in _os.listdir(directory):
+        if name.startswith("map_seed") and name.endswith(".pt"):
+            try:
+                out.append(int(name[len("map_seed") : -len(".pt")]))
+            except ValueError:
+                continue
+    return sorted(out)
