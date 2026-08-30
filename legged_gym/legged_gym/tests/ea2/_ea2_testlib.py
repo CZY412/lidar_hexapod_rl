@@ -169,6 +169,12 @@ def second_difference(seq: torch.Tensor) -> float:
 # oracle invocation + independent safety evaluation
 # ---------------------------------------------------------------------------
 
+#: Production group mode.  ``envelope.oracle_group_mode`` in
+#: ``el_4090_ea2_config``; kept in sync so shared helpers and diagnostic
+#: scripts exercise the same path the trainer actually uses.
+DEFAULT_GROUP_MODE = "axis"
+
+
 def oracle_batch(
     head: torch.Tensor,
     pos: torch.Tensor,
@@ -180,8 +186,14 @@ def oracle_batch(
     chunk: int = 64,
     max_dist: float = 5.0,
     from_numpy: bool = False,
+    group_mode: str = DEFAULT_GROUP_MODE,
 ):
-    """Chunked ``compute_direct_oracle_params_with_stats`` over many poses."""
+    """Chunked ``compute_direct_oracle_params_with_stats`` over many poses.
+
+    Defaults to the production ``group_mode`` (``axis``) so diagnostic scripts
+    measure the behaviour the trainer actually sees.  Pass
+    ``group_mode="coupled"`` to exercise the legacy shared-boundary-group path.
+    """
     from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_oracle import compute_direct_oracle_params_with_stats
 
     if from_numpy:
@@ -199,6 +211,7 @@ def oracle_batch(
             step=0.05,
             max_dist=max_dist,
             interp_crossing=interp,
+            group_mode=group_mode,
         )
         out.append(params)
     return torch.cat(out, dim=0)

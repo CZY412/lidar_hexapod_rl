@@ -103,14 +103,20 @@ def test_oracle_stays_in_bounds():
     assert bool((oracle[:, 4] <= _HIGH[4].unsqueeze(0) + 1e-6).all())
 
 
-def test_direct_oracle_open_field_soft_max():
-    """Direct oracle on open field should stay at the soft maximum."""
+@pytest.mark.parametrize("group_mode", ["coupled", "axis"])
+def test_direct_oracle_open_field_soft_max(group_mode):
+    """Direct oracle on open field should stay at the soft maximum.
+
+    Both group modes must agree here: with no obstacle there is nothing to
+    decouple, so the envelope sits at the soft maximum in every dimension.
+    """
     direct, _ = compute_direct_oracle_params_with_stats(
         torch.zeros(1),
         torch.zeros(1, 2),
         _open_field(),
         _LOW,
         _HIGH,
+        group_mode=group_mode,
     )
     margin = (1.0 - 0.9) * (_HIGH - _LOW) / 2.0
     soft_high = _HIGH - margin
@@ -121,24 +127,57 @@ def test_direct_oracle_open_field_soft_max():
     assert direct[0, 4].item() == pytest.approx(soft_low[4].item(), abs=1e-4)
 
 
-def test_direct_oracle_front_obstacle_only_shrinks_forward():
-    """With a front obstacle, direct oracle should not globally shrink widths."""
+@pytest.mark.parametrize("group_mode", ["coupled", "axis"])
+def test_direct_oracle_front_obstacle_only_shrinks_forward(group_mode):
+    """With a front obstacle the envelope must shrink forward and stay safe.
+
+    ``coupled`` additionally guarantees that widths are not dragged down by a
+    shared radial multiplier -- that was the historical "global multiplier"
+    bug this test guards.  ``axis`` decouples the parameters, so with
+    ``interp_crossing=False`` it may legitimately shrink ``front_width``
+    further (its vertical march sees the obstacle at the forward apex).  What
+    both modes must guarantee is that the result is collision free.
+
+    Note the front obstacle sits *inside* the unconstrained hexagon, so the
+    boundary-only collision check is what the oracle is defined against.
+    """
+    from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
+        hex_collision_terms,
+    )
+
     df = _open_field()
     df[370, 377] = 0.0
+    head = torch.zeros(1)
+    pos = torch.zeros(1, 2)
     direct, _ = compute_direct_oracle_params_with_stats(
-        torch.zeros(1),
-        torch.zeros(1, 2),
+        head,
+        pos,
         df,
         _LOW,
         _HIGH,
+        group_mode=group_mode,
     )
     margin = (1.0 - 0.9) * (_HIGH - _LOW) / 2.0
     soft_high = _HIGH - margin
     assert direct[0, 3].item() < soft_high[3].item() - 1e-4
-    # widths should stay near soft max (no global multiplier dragging them down)
-    assert direct[0, 0].item() == pytest.approx(soft_high[0].item(), abs=1e-4)
-    assert direct[0, 1].item() == pytest.approx(soft_high[1].item(), abs=1e-4)
-    assert direct[0, 2].item() == pytest.approx(soft_high[2].item(), abs=1e-4)
+
+    # Safety is mode independent: the returned envelope must be collision free.
+    _, hard = hex_collision_terms(
+        direct, head, pos, torch.as_tensor(df), margin=0.10, soft_margin=0.10
+    )
+    assert float(hard.max()) <= 0.06
+
+    if group_mode == "coupled":
+        # widths stay near soft max (no global multiplier dragging them down)
+        assert direct[0, 0].item() == pytest.approx(soft_high[0].item(), abs=1e-4)
+        assert direct[0, 1].item() == pytest.approx(soft_high[1].item(), abs=1e-4)
+        assert direct[0, 2].item() == pytest.approx(soft_high[2].item(), abs=1e-4)
+    else:
+        # axis: middle/back widths are unconstrained by a front obstacle, only
+        # front_width may follow the shrinking forward apex.
+        assert direct[0, 1].item() == pytest.approx(soft_high[1].item(), abs=1e-4)
+        assert direct[0, 2].item() == pytest.approx(soft_high[2].item(), abs=1e-4)
+        assert direct[0, 0].item() <= soft_high[0].item() + 1e-4
 
 
 def test_param_names_order():
@@ -175,16 +214,27 @@ def _extent(params: torch.Tensor) -> torch.Tensor:
     return ((params - _MIN_V) / span).clamp(0.0, 1.0)
 
 
-def test_interp_open_field_matches_nearest_and_soft_max():
+def _area(params: torch.Tensor) -> float:
+    """Hexagon area (m^2): two congruent triangles sharing the lateral axis.
+
+    front triangle  = front_width * forward_limit
+    rear triangle   = back_width * |backward_limit|
+    ``backward_limit`` is negative, hence the minus sign.
+    """
+    return float(params[0] * params[3] - params[4] * params[2])
+
+
+@pytest.mark.parametrize("group_mode", ["coupled", "axis"])
+def test_interp_open_field_matches_nearest_and_soft_max(group_mode):
     """In open space both crossing modes must agree and stay at soft max."""
     head = torch.zeros(1)
     pos = torch.zeros(1, 2)
     df = _open_field()
     near, _ = compute_direct_oracle_params_with_stats(
-        head, pos, df, _LOW, _HIGH, interp_crossing=False
+        head, pos, df, _LOW, _HIGH, interp_crossing=False, group_mode=group_mode
     )
     itp, _ = compute_direct_oracle_params_with_stats(
-        head, pos, df, _LOW, _HIGH, interp_crossing=True
+        head, pos, df, _LOW, _HIGH, interp_crossing=True, group_mode=group_mode
     )
     torch.testing.assert_close(near, itp)
     margin = (1.0 - 0.9) * (_HIGH - _LOW) / 2.0
@@ -192,21 +242,30 @@ def test_interp_open_field_matches_nearest_and_soft_max():
     assert itp[0, 4].item() == pytest.approx((_LOW + margin)[4].item(), abs=1e-4)
 
 
-def test_interp_never_tightens_and_stays_safe_on_corridor():
+@pytest.mark.parametrize("group_mode", ["coupled", "axis"])
+def test_interp_never_tightens_and_stays_safe_on_corridor(group_mode):
     """Removing the one-step back-off may only relax the envelope, and both
     modes must satisfy the active-set safety post-condition."""
     head = torch.zeros(1)
     pos = torch.zeros(1, 2)
     df = _corridor_field(0.65)
     near, _ = compute_direct_oracle_params_with_stats(
-        head, pos, df, _LOW, _HIGH, interp_crossing=False
+        head, pos, df, _LOW, _HIGH, interp_crossing=False, group_mode=group_mode
     )
     itp, _ = compute_direct_oracle_params_with_stats(
-        head, pos, df, _LOW, _HIGH, interp_crossing=True
+        head, pos, df, _LOW, _HIGH, interp_crossing=True, group_mode=group_mode
     )
-    # relaxation only: interp extents >= nearest extents (backward_limit's
-    # signed span makes the comparison direction-agnostic)
-    assert bool((_extent(itp) >= _extent(near) - 1e-5).all())
+    # Relaxation only: the interpolated crossing must not yield a smaller
+    # envelope overall.  Total hexagon area is the mode-independent measure --
+    # ``coupled`` additionally satisfies per-dimension monotonicity, but
+    # ``axis`` solves the parameters sequentially, so relaxing
+    # ``forward_limit`` moves the forward apex outward and can therefore
+    # tighten ``middle_width`` at the new apex.  The net area still grows.
+    assert _area(itp[0]) >= _area(near[0]) - 1e-5
+    if group_mode == "coupled":
+        # per-dimension: interp extents >= nearest extents (backward_limit's
+        # signed span makes the comparison direction-agnostic)
+        assert bool((_extent(itp) >= _extent(near) - 1e-5).all())
     # safety post-condition: active-set keeps worst boundary violation <=
     # its 0.05 threshold (plus eps)
     from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_geometry import (
@@ -259,7 +318,8 @@ def test_interp_crossing_exact_on_linear_ramp():
     assert 0.84 <= s_near[0, 0].item() <= 0.9539
 
 
-def test_soft_floor_yields_to_safety_in_infeasible_corridor():
+@pytest.mark.parametrize("group_mode", ["coupled", "axis"])
+def test_soft_floor_yields_to_safety_in_infeasible_corridor(group_mode):
     """REGRESSION (soft-cap ordering): when the active-set shrink must go
     below a per-parameter soft floor for safety, safety wins.
 
@@ -267,12 +327,16 @@ def test_soft_floor_yields_to_safety_in_infeasible_corridor():
     every parameter must collapse to its HARD bound (middle_width -> 0.3,
     below its 0.32 soft floor).  The old ordering (full soft clamp applied
     AFTER the shrink) raised the widths back to their soft floors.
+
+    Both group modes are exercised: ``axis`` decouples the parameters, so the
+    lengths could in principle stay open, but an *infeasible* corridor must
+    still collapse everything to the hard bound.
     """
     head = torch.zeros(1)
     pos = torch.zeros(1, 2)
     df = _corridor_field(0.25)
     direct, _ = compute_direct_oracle_params_with_stats(
-        head, pos, df, _LOW, _HIGH, interp_crossing=True
+        head, pos, df, _LOW, _HIGH, interp_crossing=True, group_mode=group_mode
     )
     torch.testing.assert_close(direct[0], _MIN_V, atol=1e-5, rtol=0)
     # the discriminating assertion: below the soft floor
@@ -280,14 +344,15 @@ def test_soft_floor_yields_to_safety_in_infeasible_corridor():
     assert bool((direct[0, :3] < (_LOW + soft_margin)[:3] - 1e-4).all())
 
 
-def test_direct_output_within_hard_bounds_under_aggressive_shrink():
+@pytest.mark.parametrize("group_mode", ["coupled", "axis"])
+def test_direct_output_within_hard_bounds_under_aggressive_shrink(group_mode):
     """Even when the active-set saturates, outputs stay within the hard
     physical bounds."""
     head = torch.zeros(2)
     pos = torch.tensor([[0.0, 0.0], [3.0, 0.0]])
     df = _corridor_field(0.25)
     direct, raw_hard = compute_direct_oracle_params_with_stats(
-        head, pos, df, _LOW, _HIGH, interp_crossing=True
+        head, pos, df, _LOW, _HIGH, interp_crossing=True, group_mode=group_mode
     )
     assert bool((direct[:, :4] >= _LOW[:4].unsqueeze(0) - 1e-5).all())
     assert bool((direct[:, :4] <= _HIGH[:4].unsqueeze(0) + 1e-5).all())
