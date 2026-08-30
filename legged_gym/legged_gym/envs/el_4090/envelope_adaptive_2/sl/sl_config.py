@@ -47,8 +47,12 @@ class SLDataConfig:
     num_steps: int = 1400
 
     #: LiDAR refresh decimation.  The sensor runs at 10 Hz while control runs at
-    #: 50 Hz, so only every 5th step carries a fresh frame.
-    lidar_decimation: int = 5
+    #: 50 Hz, so with ``1`` every control step is stored and the SL cadence
+    #: matches PPO/play exactly (both act on every 50 Hz observation).  The
+    #: historical ``5`` (10 Hz frames) trained the GRU on a 5x sparser cadence
+    #: than deployment and cost ~6x oracle-MSE when the same weights acted at
+    #: 50 Hz (measured: 0.011 -> 0.067 on the baseline weights).
+    lidar_decimation: int = 1
 
     #: Steps discarded at the start of every episode.  On reset the rate limiter
     #: seeds ``prev_s = 1`` (fully open) and shrinks at ``shrink_rate = 2.0 m/s``;
@@ -73,17 +77,20 @@ class SLModelConfig:
 class SLTrainConfig:
     """Optimisation options."""
 
-    #: Frames per training sequence.  40 frames @ 10 Hz == 4 s of memory, which
-    #: is where the offline observability scan saturates (R2 = 1.0).
-    seq_len: int = 40
+    #: Frames per training sequence.  200 frames @ 50 Hz == 4 s of memory,
+    #: the horizon where the offline observability scan saturated (R2 = 1.0)
+    #: when it was expressed as 40 frames @ 10 Hz.
+    seq_len: int = 200
 
     #: Stride (in frames) between consecutive window start positions.
-    window_stride: int = 2
+    #: 10 frames @ 50 Hz == 0.2 s, the overlap semantics of the historical
+    #: stride 2 @ 10 Hz.
+    window_stride: int = 10
 
     #: Store windows as ``uint8``-quantised observations to cut memory ~4x.
     #:
-    #: Windowing expands the source data by roughly ``seq_len / stride`` (about
-    #: 15x at seq_len=40, stride=2): four maps worth 90 MiB become ~1.4 GiB of
+    #: Windowing expands the source data by roughly ``seq_len / stride`` (20x
+    #: at seq_len=200, stride=10): four maps worth ~0.4 GiB become ~8 GiB of
     #: float32 tensors.  Quantising the range image to 8 bits trades a
     #: quantisation error of ~3.2/255 m for a 4x memory reduction, which keeps
     #: larger corpora feasible.

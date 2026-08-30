@@ -121,13 +121,21 @@ def collect_map(
     seed: int,
     num_envs: int = 96,
     num_steps: int = 1400,
-    lidar_decimation: int = 5,
+    lidar_decimation: Optional[int] = None,
     pillar_count: Optional[int] = None,
     device: str = "cuda:0",
 ) -> MapData:
-    """Run one zero-action rollout and return the collected tensors."""
+    """Run one zero-action rollout and return the collected tensors.
+
+    ``lidar_decimation`` defaults to ``SLConfig().data.lidar_decimation`` so
+    every collection path shares one cadence source of truth (a stale 10 Hz
+    default here silently reintroduced the cadence mismatch for callers that
+    do not pass the value explicitly).
+    """
     import torch as _torch
 
+    if lidar_decimation is None:
+        lidar_decimation = SLConfig().data.lidar_decimation
     env = build_env(seed, num_envs, pillar_count)
     try:
         env.reset()
@@ -164,6 +172,8 @@ def collect_map(
             "pillar_count": pillar_count,
             "oracle_margin": float(env.cfg.envelope.oracle_margin),
             "oracle_group_mode": str(env.cfg.envelope.oracle_group_mode),
+            "soft_dof_pos_limit": float(env.cfg.envelope.soft_dof_pos_limit),
+            "warmup_steps": int(SLConfig().data.warmup_steps),
             "reward_scales": dict(env.reward_scales),
             "n_frames": int(k),
         }

@@ -71,6 +71,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     counts = _parse_counts(args.pillar_counts, len(seeds))
+    cfg = SLConfig()
 
     import os
 
@@ -83,7 +84,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             seed=seed,
             num_envs=args.num_envs,
             num_steps=args.num_steps,
-            lidar_decimation=5,
+            lidar_decimation=cfg.data.lidar_decimation,
             pillar_count=count,
         )
         ds.save_map(data, path)

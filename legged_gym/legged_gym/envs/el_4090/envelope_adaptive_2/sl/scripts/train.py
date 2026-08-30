@@ -32,8 +32,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default=None, help=f"default: {SL_DATA_DIR}")
     ap.add_argument("--seeds", default=None, help="subset of available map seeds (default: all)")
-    ap.add_argument("--seq-len", type=int, default=40)
-    ap.add_argument("--window-stride", type=int, default=2)
+    ap.add_argument("--seq-len", type=int, default=None,
+                    help="override cfg.train.seq_len (default: config value, 200 = 4 s at 50 Hz)")
+    ap.add_argument("--window-stride", type=int, default=None,
+                    help="override cfg.train.window_stride (default: config value, 10 = 0.2 s)")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -49,8 +51,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     os.makedirs(out_dir, exist_ok=True)
 
     cfg = SLConfig()
-    cfg.train.seq_len = args.seq_len
-    cfg.train.window_stride = args.window_stride
+    if args.seq_len is not None:
+        cfg.train.seq_len = args.seq_len
+    if args.window_stride is not None:
+        cfg.train.window_stride = args.window_stride
     cfg.train.epochs = args.epochs
     cfg.train.batch_size = args.batch_size
     cfg.train.learning_rate = args.lr
