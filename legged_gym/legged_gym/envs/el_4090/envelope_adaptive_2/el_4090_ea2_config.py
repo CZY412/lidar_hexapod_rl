@@ -24,7 +24,7 @@ class El4090EA2Cfg(LeggedRobotCfg):
         num_privileged_obs = None       # no asymmetric critic
         num_actions = 5                 # raw envelope params (linear map + soft limit in env)
         env_spacing = 0.                # all envs share the single global map origin
-        episode_length_s = 30.          # full reset interval: GRU + robot/path
+        episode_length_s = 45.          # full reset interval: GRU + robot/path
         send_timeouts = True
 
     class sim(LeggedRobotCfg.sim):
@@ -145,9 +145,9 @@ class El4090EA2Cfg(LeggedRobotCfg):
         # the raw-action radius reaching the soft bounds; soft_dof_pos_limit
         # reserves a small band before the true hard clamp.
         action_max = 4.0
-        soft_dof_pos_limit = 0.9
+        soft_dof_pos_limit = 0.95
         # Grid oracle parameters (per-parameter independent scale target).
-        oracle_margin = 0.10
+        oracle_margin = 0.20
         oracle_step = 0.05
         oracle_max_dist = 5.0
         # Bilinear distance-field sampling + interpolated margin crossing in
@@ -167,7 +167,7 @@ class El4090EA2Cfg(LeggedRobotCfg):
         # Parameter-group decoupling for the oracle raw scales: "coupled"
         # (historical shared-sample minimum) or "axis" (per-axis marches at
         # the A-B / F-E edge lines, decoupling the width/limit pairs).
-        oracle_group_mode = "coupled"
+        oracle_group_mode = "axis"
         # 5 params + 3 priors are loaded from the frozen contract path
         # (_contracts.ENVELOPE_SPEC_CONFIG_PATH).
         # spider_envelop_2-style bold footprint drawing
@@ -220,7 +220,7 @@ class El4090EA2CfgPPO(LeggedRobotCfgPPO):
     class runner(LeggedRobotCfgPPO.runner):
         policy_class_name = "ActorCriticRecurrent"
         algorithm_class_name = "PPO"
-        num_steps_per_env = 24          # 1 s ~= 10 LiDAR frames per segment
+        num_steps_per_env = 100          # 1 s ~= 10 LiDAR frames per segment
         max_iterations = 3000
         save_interval = 50
         experiment_name = "el4090_ea2"

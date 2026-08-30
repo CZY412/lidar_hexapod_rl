@@ -48,7 +48,9 @@ def test_env_cfg_contract():
     assert cfg.envelope.margin == 0.10
     assert cfg.envelope.soft_margin == 0.10
     assert cfg.envelope.action_max == 4.0
-    assert cfg.envelope.soft_dof_pos_limit == 0.9
+    # Working-config value; the SL action fold derives its scale from this via
+    # sl.sl_config.env_action_scale(), so a change here must be deliberate.
+    assert cfg.envelope.soft_dof_pos_limit == 0.95
     # Safe-distance margin for the oracle march.  Assert a sane range rather
     # than a literal: this is a tuning knob (currently 0.20) and pinning it
     # only makes the contract test break on every retune.
