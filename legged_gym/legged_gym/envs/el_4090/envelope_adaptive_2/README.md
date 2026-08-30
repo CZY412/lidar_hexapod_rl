@@ -1,554 +1,245 @@
-# 第二阶段任务书（v2）：基于激光雷达点云记忆网络的六边包络参数预测模块
+# EA2：基于激光雷达点云记忆网络的六边包络参数预测（v3）
 
-> v2 依据代码核对结果与最新讨论修订。与 v1 的主要差异：
->
-> - 地图改为**全局一张、训练开始时生成后固定**；每 env 的差异只有随机起点/终点；
-> - 地形改为 **4×4 地块布局**：每块 16m×16m（总地图 74m×74m，含 5m 外边界），每块地按 **pd_gru_lidar 的随机长方体障碍**参数独立生成，**无实体围墙**，所有长方体轴对齐（不倾斜）；
-> - Airy 水平映射修正：**逻辑方位角 0° ↔ Airy 物理通道 30**，分桶选中物理通道 **18~42**（θ=108°~252°），并强制 `airy_mount.py` 自检；
-> - LiDAR 噪声改走 `LidarConfig` 的传感器噪声字段，**作用于所有点**（沿用相机传感器原加噪语义，无“仅有效点”分支）；不再使用 `pd_gru_lidar` 手写 domain-rand（注意：当前仓库 LiDAR 路径尚无 `apply_noise()`，需补上，见 §2.2.8 与 §三）；
-> - 分桶前**不再做地面过滤**，因此也不存在“干净点云/加噪点云”两份数据；
-> - 朝向控制为**切线相对跟踪控制**（位置沿参考路径推进、朝向跟随切线）；
-> - 第一阶段**移除所有运动随机量**：速度固定 `1.0 m/s`、`δ_target=0`、无路径横向噪声、无位置/航向晃动、高度固定 `0.52m`；仅保留 LiDAR 点云噪声与地图/起终点随机；
-> - 明确 **0.35m 膨胀只保证横向通过**，转弯/端墙处允许最小包络偶发碰撞，由碰撞惩罚给训练信号；
-> - 修正 rsl_rl/runner 配置字段归属、BaseTask 必填接口（`max_episode_length`、`infos["time_outs"]`）等与代码冲突的细节。
+> 本文档取代旧版 v2 任务书，与当前代码一一对应。核心目标不变：训练一个 GRU
+> 感知网络，输入机器人前方 LiDAR 点云序列，输出"恰到好处"的六边包络参数——
+> 在障碍约束下尽量展开。仓库内有两套训练框架：**监督学习（`sl/`，主线）** 与
+> **PPO（rsl_rl，微调阶段）**，共用同一个简化环境底座。
 
 ---
 
-## 一、任务背景与目标
+## 1. 任务定义
 
-### 1.1 学长已有工作（`spider_envelop_2`）
+- **观测（190 维）**：187 通道固定地面网格 range image（11 行 × 17 列，覆盖
+  体坐标前方 x∈[0.65, 3.65] m、y∈[-1, 1] m，除以 max_range=3.2 归一化，无命中
+  置 1.0）+ 3 维 ego-motion `[vx/1.5, vy/1.0, ω/1.5]`。
+- **动作（5 维）**：六边包络参数 `[front_width, middle_width, back_width,
+  forward_limit, backward_limit]`，合同边界
+  `low=[0.3,0.3,0.3,0.6,-0.9]`、`high=[0.6,0.7,0.6,0.9,-0.6]`（边界由
+  spider_envelop 配置冻结，`test_contracts.py` 钉死）。
+- **归一化约定**：内部统一使用归一化 extent `s ∈ [0,1]`（0=最小包络 1.2×0.6 m，
+  1=最大包络 1.8×1.4 m；`backward_limit` 因物理方向相反，符号取反）。
+- **动作映射（全仓库唯一真相）**：env 把原始动作 a 映射为
+  `params = clamp(mid + a·scale, low, high)`，即
+  `s = 0.5 + k·sign·a`，其中 `k = soft_dof_pos_limit/(2·action_max)`
+  （0.95/8 = 0.11875），`sign = [1,1,1,1,-1]`。
+  **k 由 `sl/sl_config.env_action_scale()` 从活配置惰性派生**——导出折叠与
+  评估逆映射都消费它，禁止再硬编码 0.1125。
 
-学长在 `spider_envelop_2` 任务中实现了“用六边包络约束机器人形态”的训练范式：
+## 2. 共享环境底座（`el_4090_ea2_env.py`）
 
-- **六边包络定义**：由 5 个自由参数描述——`front_width / middle_width / back_width / forward_limit / backward_limit`，经 `apply_env_morphology_priors` 派生为 8 维 condition。
-- **包络 → 肢体范围**：condition 经 `HaaRangeNetwork` 蒸馏出 6 条腿的 HAA swing range，机器人腿的摆动被限制在该范围内。
-- **Locomotion 训练**：policy observation 为固定 83 维，condition 通过 `_get_structure_condition()` 注入，与 locomotion command `[vx, vy, yaw_rate]` 解耦。
-- **奖励侧**：已有 `_reward_haa_range_violation`、`_reward_haa_phase_tracking` 等。
+两套框架共用同一个简化 `BaseTask`（无机器人实体），其最关键的特性是
+**动作不影响状态转移**——运动纯脚本化，这使离线监督在数学上等于部署行为：
 
-### 1.2 学长预留的接口（含代码核对的精确契约）
+- **地图**：74 m×74 m 全局一张（4×4 块 16 m 柱状障碍地块 + 5 m 边界，0.1 m
+  栅格），由 `cfg.seed` 决定布局；Warp mesh 为 raycast 权威几何；距离场一次
+  预计算。无实体围墙，仅规划栅格边界阻塞。
+- **路径**：A*（0.4 m 膨胀栅格）→ LOS 简化 → 0.2 m 重采样 → 切线平滑；到点
+  soft-replan、转角 turn-in-place；速度 1 m/s，`ω_max=1.5`，episode 45 s。
+- **LiDAR**：完整 Airy（900 方位 × 96 俯仰）中预选 187 通道
+  （`selected_airy_channels.pt`，训练/部署共用）；10 Hz 刷新，50 Hz 控制每步
+  消费；乘性高斯 2% + dropout 2% 噪声作用于全部射线。
+- **Oracle（监督目标）**：`envelope_oracle.py` 从全局距离场直接计算理论目标
+  包络——axis 模式轴向 march（margin 0.20）→ 扩展侧软上限 → active-set 联合
+  收缩（保证 24 个边界采样点无违约）→ `RateLimitedOracle` 快收慢放平滑
+  （收 2.0 m/s、放 0.5 m/s、冷却 0.2 s）。平滑输出 `prev_s` 即 SL 回归目标与
+  PPO 奖励参考。
+- **碰撞语义**：违规 = 34 个采样点对距离场的 clearance < margin(0.10 m)
+  （软坡宽 0.10 m）。**floor-pinned 帧**（最小包络也放不下，约为帧数的 1.8%）
+  几何不可行，README v2 即豁免，所有归因以此为底线。
 
-- `EnvelopeConditionState.set(values, env_ids, derive_priors=True)`：**当前是 8 维契约**。`condition_names` 含 3 个 prior，`set()` 先对 8 维 clip（prior 范围 `[0,1]`），`derive_priors=True` 时再用前 5 维重算后 3 维。
-- `EL_4090_ENVELOP_2.set_envelope_condition(...)`：环境层封装，内部调用 `set()` 并触发 `_refresh_haa_swing_ranges`；**同时还会更新 `embedded_state_default_dof_pos`**（形态目标姿态），M2/M3 接入时必须知道这一行为。
-- 5 参数范围与 `apply_env_morphology_priors` 公式的唯一来源是 `spider_envelop/el4090_spider_config.py`；无 Isaac Gym 环境下可用 `legged_gym.utils.envelop.network.haa_swing_range.load_envelope_condition_spec()`（AST 解析）构造 `EnvelopeConditionSpec`，不要手抄数值。
-- 解耦保证：condition 由 `EnvelopeConditionState` 独立持有，不读 locomotion commands。
-
-> 本任务要做的，就是**每步用一个感知网络算出 5 维 condition，并转换为 8 维后经 `set()` 喂给下游**；M1 简化环境内部直接使用映射后的 5 维参数计算奖励/可视化，5→8 转换函数保留给 M2 接入。
-
-### 1.3 本任务要解决的问题（`envelope_adaptive_2`）
-
-学长的范式缺少一个闭合环节：**包络参数目前靠随机采样或人工给定，无法根据实际环境自动调整**。本任务训练一个独立的感知网络（GRU），接收机器人坐标系下的前方激光雷达点云序列，直接预测理想的 5 维包络参数。
-
-**总体定位**：
-
-- 与现有 locomotion policy **解耦独立训练**；
-- M1 不加载机器人实体，仅移动雷达 + 解析包络；
-- 不干预 locomotion 的 PPO 梯度回路。
-
-**本任务不负责的部分**：
-
-- 不重新训练/改动 locomotion policy；
-- 不直接控制机器人关节；
-- M1 不处理机器人本体与障碍的实际碰撞动力学（碰撞判定针对六边包络 vs 障碍）。
-
----
-
-## 二、关键技术决策
-
-### 2.1 学习方式：legged_gym PPO
-
-- 使用现有 `OnPolicyRunner` + PPO 框架，policy 类为本仓库 rsl_rl 的 `ActorCriticRecurrent`。
-- M1 环境为 **简化 BaseTask**：
-  - 无机器人实体；
-  - **全局一张** 2D 占据栅格地图（墙体、立柱、窄通道、单侧墙等），**训练开始时生成一次并固定**，不周期重建；
-  - 生成后验证地图连通性，避免 A* 无解；
-  - 每个 env 每个 episode 只采样自己的起点、终点与 A* 路径（运动参数固定）；
-  - 雷达沿该 env 的 A* 参考路径按弧长移动；
-  - `step(actions)` 中只更新雷达位姿、生成 LiDAR range image、计算包络奖励。
-- 后续 M2/M3 再接已训 locomotion policy 做联合评估。
-
-### 2.2 地图、A* 路径与随机化
-
-#### 2.2.1 地图表示与尺寸
+## 3. 文件结构
 
 ```text
-map_size      = 74m × 74m（4×4 块，每块 16m×16m + 5m 外边界；世界坐标 x, y ∈ [-37, 37]）
-resolution    = 0.1m
-grid_shape    = 740 × 740
-occupied      = 1（障碍）
-free          = 0（可通行）
-world → grid  ix = floor((x + 37.0) / 0.1), iy = floor((y + 37.0) / 0.1)
+envelope_adaptive_2/
+├── el_4090_ea2_env.py        # EL_4090_EA2 简化 BaseTask（两框架共用底座）
+├── el_4090_ea2_config.py     # env cfg + PPO cfg（LeggedRobotCfg 血统）
+├── _contracts.py             # 冻结契约：常数/数据类/函数签名（勿改）
+├── map_generator.py          # 柱状场地形 → occupancy → Warp mesh + 距离场
+├── path_planner.py           # A* / LOS / 重采样 / 路径噪声 / 切线平滑
+├── path_batch.py             # 路径的 GPU padded 镜像 + 批量插值查询
+├── path_parallel.py          # fork 多进程批量规划 worker
+├── envelope_geometry.py      # 六边形构造 / 精确 margin offset / 栅格碰撞
+├── envelope_oracle.py        # 几何 oracle（axis march + active-set 收缩）
+├── target_smoother.py        # RateLimitedOracle 快收慢放目标平滑
+├── range_image.py            # 187 通道 range image 构建/归一化
+├── airy_mount.py             # Airy 方向生成 + 187 通道选择 + 自检
+├── selected_airy_channels.pt # 固定 187 通道表（训练/部署共用）
+├── README.md                 # 本文档
+├── __init__.py               # 任务注册 el4090_ea2
+└── sl/                       # ── 监督学习框架（主线）──
+    ├── __init__.py           # 管线概览 + G0-G5 门的环境变量约定
+    ├── sl_config.py          # SL 全部配置 + env_action_scale() 动作标度派生
+    ├── dataset.py            # 采集（零动作 rollout）/ 数据类 / 滑窗数据集
+    ├── model.py              # EnvelopeNet（与 rsl_rl actor 半边逐键同构）
+    ├── train.py              # 训练循环：MSE + 回忆辅助头 + 可微安全损失
+    ├── evaluate.py           # 闭环评估（stateful/window + 基线对照）
+    ├── export.py             # 权重移植 + 动作折叠 + rsl_rl checkpoint 打包
+    ├── scripts/
+    │   ├── collect.py        # 采集 CLI（每 seed 一个进程）
+    │   ├── train.py          # 训练 CLI（config 为默认，CLI 仅覆盖）
+    │   ├── eval.py           # 闭环评估 CLI（每 seed 一个子进程）
+    │   ├── export.py         # 导出 CLI（校验 14 项 + 写 PPO 可达副本）
+    │   ├── pipeline.py       # 一键串联五阶段（每阶段独立进程）
+    │   └── ppo_continue.py   # PPO 三臂对照（scratch/sl_init/sl_init_cross）
+    └── logs/
+        ├── data/             # map_seed<N>.pt 采集数据（gitignored）
+        └── runs/<name>/      # model.pt + model_metrics.json + sl_config.json
+                              # + closed_loop*.json + ppo_*.json + policy_init.pt
 ```
 
-该栅格同时用于：
+PPO 侧共享：`rsl_rl/`（ActorCriticRecurrent 等）、`legged_gym/scripts/train.py`
+（PPO 训练入口）、`legged_gym/scripts/play_ea2.py`（点云可视化 play）。
 
-- A* 路径规划；
-- 碰撞惩罚（六边形 vs 占据栅格）；
-- 生成 **Warp raycast 网格**（地面平面 + 长方体障碍 box；Isaac 侧静态 actor 仅用于可视化，不是 raycast 几何）。
+## 4. 监督学习框架（主线）
 
-实现约定：
+### 4.1 原理
 
-- **4×4 地块布局**：总地图 74m×74m，均分为 4×4 块（每块 16m×16m），四周 5m 平整边界；
-- **每块地独立运行 pd_gru_lidar 的 `pillar_field_terrain`**：随机长/短边长方体、环带放置、AABB + `min_separation` 排斥，参数见 §2.2.2；不同地块随机难度自然形成疏密不同的环境；
-- **无实体围墙**：仅把**膨胀后（planning）栅格**的边界标为 blocked，保证 A* 不规划出图，occupancy 与 mesh 边界保持 free；
-- **所有长方体轴对齐**（yaw=0），不接受任意倾斜障碍；
-- **栅格是权威几何**：先由障碍 footprint 栅格化得到 occupancy，再由同一套参数生成 Warp box 网格，两者必须一致；
-- **Warp mesh 必须包含 z=0 地面平面**（建议覆盖地图并外扩 2m）；地面只参与射线，不写入 occupancy、不参与碰撞惩罚——这是“不做地面过滤、地面距离是合法观测”的前提；
-- **膨胀自由空间连通性**：最大 8 连通分量须占全部安全格 ≥95%；每 env 的起点/终点只在最大连通分量内采样，保证 A* 有解；
-- **地图为全局一张**：所有 env 共享同一 warp mesh，`reset_idx()` 不重建地图，只重采样该 env 的起点/终点/路径状态；
-- 生成 Warp mesh 时直接使用长方体基元参数创建水密 box 网格，不要按每个 occupied 栅格生成大量 box，避免 mesh 面数过大。
+EA2 的状态转移与动作无关，因此**零动作 rollout 采集的数据就是部署时的状态
+分布**，离线指标即部署真值。奖励 `r = -3·MSE(a, oracle)` 即时、确定、无跨步
+credit assignment，直接监督严格优于用 PPO 采样同一信号，且秒级 vs 小时级。
 
-#### 2.2.2 障碍物参数（完全沿用 pd_gru_lidar）
+### 4.2 管线五阶段
 
-| 参数 | 值 |
-|---|---|
-| 每块地数量 | `pillar_count_min=0, pillar_count_max=12`，难度 ∈ {0.5, 0.75, 0.9} |
-| 长/宽 | `pillar_size_x = 0.5~4.0m`，`pillar_size_y = 0.5~4.0m`（长边/短边 split 算法） |
-| 高度 | `pillar_height = 1.0~2.0m`；`allow_height_variation=True`（最终高度 60%~100%） |
-| 间距/放置 | `min_separation=2.2m`，中心净空 `center_clear_radius=3.0m`，放置半径 `spawn_radius=7.5m` |
-| 方向 | 全部轴对齐（yaw=0） |
+```text
+collect → train → eval → export → ppo_continue(可选)
+```
 
-- 碰撞判定只看 2D 投影，不看高度；
-- 地图生成验收（不满足则重生成，设最大尝试次数）：
-  1. 4×4=16 块地全部为随机长方体地块；
-  2. 无实体围墙、全部矩形轴对齐；
-  3. 膨胀自由空间最大连通分量 ≥ 95%；
-  4. 预采样 8~16 对起点/终点跑 A*，要求全部（或 ≥80%）有解；
-  5. 在这些验证路径上，至少 30% 的路径点到最近障碍距离 ∈ `[0.7, 1.5]m`。
+1. **collect**：零动作 rollout，每控制步存一帧
+   `(obs, target=smoother.prev_s, done, heading, pos)`，每 seed 一个
+   `map_seed<N>.pt`（meta 记录 oracle 配置/soft 上限/warmup 供审计溯源）。
+   ⚠ Isaac 单进程单环境约束：每 seed 必须独立进程。
+2. **train**：滑窗（seq_len=200 帧=4s，stride=10，跨 done 丢弃，按 env 划分
+   train/val 防泄漏），MSE + 两个辅助项（见 4.3），val-R² 早停。
+3. **eval**：闭环回灌 env，对照 zero-action / 最优常数包络 / stateful /
+   window 四种策略的 reward、MSE、碰撞率、面积。**stateful（逐帧带隐状态）
+   为推荐部署模式**，实测远优于复现训练窗口的 window 模式。
+4. **export**：10 个张量按键移植进 `ActorCriticRecurrent`，并**把 s→a 仿射折
+   叠进 actor 末层**（`a = sign·(s-0.5)/k`）——没有这一步，play 的包络会被
+   压死在中点附近。critic 保持随机初始化；14 项校验全过才落盘。
+5. **ppo_continue**：PPO 微调三臂对照，验证 SL 权重起点价值（G5）。
 
-#### 2.2.3 六边形包络尺寸与边界
+### 4.3 定版训练配方（C 方案，`sl/logs/runs/baseline_50hz_recall75_safe`）
 
-六边形 5 个自由参数的上下界与学长 `spider_envelop` / `spider_envelop_2` 的设计一致：
+```python
+cfg.model.aux_ks    = [75]      # 回忆辅助头：h_t 重建 s_{t-75}（1.5s ≈ 通过障碍的不可见尾巴）
+cfg.model.aux_mode  = "recall"  # 纯记忆压力，无法被当前视野外推满足
+cfg.train.aux_beta  = 0.5
+cfg.train.safe_lambda = 1.0     # 可微碰撞损失：双线性距离场采样、floor-pinned 掩零
+```
 
-| 参数 | 下界 | 上界 |
+```text
+L = MSE(ŝ_t, s_t) + 0.5·recall_loss + 1.0·safe_loss
+```
+
+设计要点（均为实验结论）：
+
+- **回忆头**在 h 中显式建立"记住滑过视野的障碍"的压力（探针误差 0.039→0.023）；
+  正向预测头（A 组）因含不可约的猜测成分而全面劣于回忆（B 组），已否决。
+- **安全损失**在策略自身预测真实几何违规时给出直接梯度；**必须用双线性距离场
+  采样**（env 奖励的最近邻查表对参数梯度恒为零，不可作 SL 损失）。
+- **MSE 锚必须保留**：防止安全损失把包络压向最小（clearance 塌缩）。
+
+### 4.4 当前结果（4 图池化，部署节奏 50Hz）
+
+| 指标 | 对照（纯 MSE） | **定版 C** |
 |---|---|---|
-| `front_width` | 0.3 | 0.6 |
-| `middle_width` | 0.3 | 0.7 |
-| `back_width` | 0.3 | 0.6 |
-| `forward_limit` | 0.6 | 0.9 |
-| `backward_limit` | -0.9 | -0.6 |
+| val R² | 0.807 | 0.798 |
+| policy 不安全帧率（含 1.8% floor-pinned） | 5.10% | **3.64%** |
+| pass-by 尾部越界事件率 | 7.5% | 6.4% |
+| policy 平均最小 clearance | 0.0949 m | 0.0964 m（oracle 0.0982，无塌缩） |
 
-几何定义（body 系：+x 向前、+y 向左）：
+归因结论：oracle 目标在几何可行帧上零碰撞（其不安全率 ≡ floor-pinned 率），
+平滑器零额外碰撞；全部残余来自网络。**残余的 ~6.4% 通过事件受制于观测边界**
+——187 通道只看前方，侧后方依赖 GRU 记忆；结构性解法是 187 通道重分配
+（前方网格 + 两侧条带，obs 维度不变），见 §8。
 
-- 三个 width 是**半宽**，左右对称，完整宽度为其 2 倍；
-- 6 个顶点（与 legacy `_build_hex_edges` 一致）：
+## 5. PPO 框架（微调阶段）
 
-```text
-B=( forward_limit,  front_width)   D=(0,  middle_width)   F=(backward_limit,  back_width)
-A=( forward_limit, -front_width)   C=(0, -middle_width)   E=(backward_limit, -back_width)
+- **网络**：rsl_rl `ActorCriticRecurrent`，单层 GRU(187) + actor/critic 各
+  [256,128] MLP，`num_observations=190`，`num_actions=5`。SL 导出的权重即其
+  初始化（`play_ea2` / `train.py --resume` 直接加载）。
+- **奖励**（`El4090EA2Cfg.rewards.scales`）：`oracle_mse=-3.0`（主导）、
+  `envelope_limits=-0.8`（软限位）、`action_rate=-0.01`；
+  `potential=0`、`collision=0`（当前作为遥测，供后续启用真实碰撞惩罚）。
+- **PPO 超参**（LeggedRobotCfgPPO 默认 + EA2 覆盖）：lr 1e-3 adaptive、
+  γ 0.99、λ 0.95、clip 0.2、entropy 0.01、`num_steps_per_env=100`、
+  `max_iterations=3000`。
+- **已知风险**：从 SL 初始化起步的 PPO 前 60 轮会出现策略退化（随机 critic +
+  std=0.5 探索），但起点显著优于 scratch（-0.14 vs -0.69）。微调时建议低
+  std / 低 lr 起步。
+- **入口**：`legged_gym/scripts/train.py --task=el4090_ea2`；可视化
+  `legged_gym/scripts/play_ea2.py`（1 env、关噪声、红/绿点云 + 青色包络）。
+
+## 6. 常用命令速查
+
+环境：`conda activate el4090`；gymtorch JIT 需要 ninja 在 PATH
+（`PATH=/home/t3chichi/anaconda3/envs/el4090/bin:$PATH`）。
+
+```bash
+PKG=legged_gym.envs.el_4090.envelope_adaptive_2.sl.scripts
+
+# 1. 采集（每 seed 独立进程！Isaac 单进程单环境）
+python -m $PKG.collect --seeds 1 --num-envs 96 --num-steps 1400
+python -m $PKG.collect --seeds 21 --pillar-counts 28 ...   # 稠密图
+
+# 2. 训练（配置即默认；CLI 仅显式覆盖）
+python -m $PKG.train --run-name <name> --epochs 50 --patience 10
+
+# 3. 闭环评估
+python -m $PKG.eval --ckpt sl/logs/runs/<name>/model.pt
+
+# 4. 导出为 rsl_rl 策略（--run-name 同步写 logs/el4090_ea2/<name>/model_0.pt）
+python -m $PKG.export --ckpt sl/logs/runs/<name>/model.pt \
+    --out sl/logs/runs/<name>/policy_init.pt --run-name <name>
+
+# 5. 可视化
+python legged_gym/legged_gym/scripts/play_ea2.py \
+    --task=el4090_ea2 --load_run <name> --checkpoint 0 --num_envs 1
+
+# 6. PPO 微调（从导出起点 resume）与三臂对照
+python legged_gym/scripts/train.py --task=el4090_ea2 --resume --load_run <name> --checkpoint 0
+python -m $PKG.ppo_continue --arm sl_init --ckpt <model.pt> --seed 1 --iterations 60 --out p.json
+
+# 一键管线（可 --skip-collect / --stages eval,export）
+python -m $PKG.pipeline --run-name <name>
 ```
 
-- **最大包络**：长约 `1.8m`（x：`-0.9 ~ 0.9`），宽约 `1.4m`（y：`-0.7 ~ 0.7`）；
-- **最小包络**：长约 `1.2m`（x：`-0.6 ~ 0.6`），宽约 `0.6m`（y：`-0.3 ~ 0.3`）。
+## 7. 测试与诊断
 
-**碰撞安全口径（v2 明确）**：
-
-- A* 的 0.35m 膨胀只保证**横向通道可通过**（最小半宽 0.3m + 0.05m 余量）；
-- 最小包络的**前半长是 0.6m**，因此转弯内角/端墙处最小包络**可能偶发碰撞**，这是有意允许的：碰撞惩罚负责提供“需要收缩”的训练信号；
-- 文档不再承诺“最小包络 + 0.05m 永不碰撞”。实现时统计并记录 `min_envelope_collision_free_ratio`（最小包络在 margin=0 下沿路径无碰撞的路径点占比），作为地图生成质量监控，建议目标值 > 90%，实现时调。
-
-#### 2.2.4 A* 路径规划
-
-- 使用 **8 邻接 A\***；
-- 代价 = 欧氏距离；启发式 = 欧氏距离；
-- **A\* 前先将障碍物按最小包络半宽 + margin 膨胀**：
-  - 最小包络半宽 `0.3m` + `0.05m` margin = 膨胀 `0.35m`（3.5 格，实现取 4 格）；
-  - 膨胀只做一次（地图固定），并缓存；
-- **起点**：仅在 **4×4 地块区域内**（排除 5m 外边界）的膨胀后安全栅格中随机采样，出生朝向对齐路径切线；
-- **终点**：同样仅在 **4×4 地块区域内**（排除 5m 外边界）随机选取可行 free 点，要求：
-  - 在膨胀后的安全栅格中为 free；
-  - 距离最近障碍至少 `0.5m`（按未膨胀的原始 occupancy 计算）；
-  - 与起点的 A* 路径长度 ≥ 3m（配置化），保证路径有内容；
-- episode 内**不重规划、不换终点**；地图全局固定，因此“当前位置”就是该 env 沿自己路径推进到的位置；
-- **到达终点后不触发 hard reset**：以当前位置作为新起点，随机选择一个新终点并继续前进（soft replan），机器人保留当前 heading 自然转向；
-- 生成后处理顺序：A* → line-of-sight 简化 → 按固定间距重采样（`0.2m`）→（路径噪声第一阶段关闭）→ **切线 yaw 按 R_min 平滑** → 输出 `(x, y, yaw)`；
-- 最小转弯半径 `R_min ≥ 1.0m`（可配置）：A* 网格的 90° 直角保留在位置几何上（位置仍在膨胀安全栅格内），但**切线 yaw 按 `abs(wrap_to_pi(Δyaw))/Δs ≤ 1/R_min` 平滑**；实际航向角速度由 §2.2.5 的 `ω_max=1.5 rad/s` 限幅，不会因网格直角出现阶跃转向；
-- 路径点输出 `(x, y, yaw)`；
-- 地图固定后，A* 仍按 env 逐个计算；初始 `num_envs` 建议 `1024~2048`，实现时先 benchmark A* 与 Warp raycast 吞吐再放大；
-- 若 Python A* 成为瓶颈：地图固定，可**预计算 K 条候选路径**（或批量/GPU 并行规划），env reset 时采样候选路径，起点改为候选路径起点。
-
-#### 2.2.5 路径速度与朝向（第一阶段：确定性运动）
-
-- 路径速度固定 **`v = 1.0 m/s`**；
-- 控制频率 50Hz，每个控制 step 的弧长增量 = `v * dt`；
-- **机器人位置**沿 A* 参考路径按弧长推进，保证始终在可行路径上；
-- **目标朝向偏置固定 `δ_target = 0`**：heading 始终跟随路径切线；
-- **朝向控制**为切线相对跟踪：
-
-```text
-s(t+dt)   = s(t) + v·dt
-heading(t+dt) = heading(t) + ω·dt
-tangent_rate = κ(s)·v
-ω_cmd = tangent_rate + k_p · wrap_to_pi(0 − δ_actual)
-ω     = clip(ω_cmd, −ω_max, +ω_max)
-δ_actual = wrap_to_pi(heading − tangent)
-vx = v·cos(δ_actual),  vy = v·sin(δ_actual),  omega = ω
+```bash
+python -m pytest legged_gym/tests/ea2 -q     # 单测全量（无外部依赖）
+# G0-G5 验收门（指向真实产物时自动启用）：
+export EA2_SL_DATA_DIR=<...>/sl/logs/data          # G0 数据契约
+export EA2_SL_METRICS=<...>/runs/<name>/model_metrics.json   # G2 训练指标
+export EA2_SL_CKPT=<...>/runs/<name>/model.pt      # G4 导出移植
+export EA2_SL_EVAL=<...>/runs/<name>/closed_loop.json        # G3 闭环行为
+export EA2_SL_PPO_DIR=<...>/runs/<name>            # G5 PPO 三臂
 ```
 
-- `ω_max = 1.5 rad/s`（可配置）；`k_p = 5.0 1/s`；
-- `R_min ≥ 1.0m` 约束参考切线曲率；实际航向角速度由 `ω_max` 限幅；
-- 走到路径终点或达到 episode 上限即结束。
-
-#### 2.2.6 路径噪声（第一阶段：关闭）
-
-- `path_noise_amp = 0`：A* → LOS 简化 → 0.2m 重采样后直接作为参考路径，不做横向偏移；
-- 路径位置仍全部位于膨胀安全栅格内；
-- 后续阶段需要时再开启有界噪声 + 拒绝采样。
-
-#### 2.2.7 运动随机量（第一阶段：全部关闭）
-
-- **位置/航向晃动**：关闭（幅度 0）；
-- **高度**：固定 `h = 0.52m`（无目标切换、无过渡、无上下波动）；
-- **速度/δ_target**：固定 `1.0 m/s` 与 `0°`；
-- 第一阶段仅保留：LiDAR 点云噪声、地图随机长方体、每 env 每 episode 随机起点/终点。
-
-#### 2.2.8 LiDAR 噪声（v2：LidarSensor 噪声字段，作用于所有点）
-
-- M1 开启 LiDAR 噪声，使用 `LidarConfig` 的传感器噪声字段：
-
-```python
-enable_sensor_noise      = True
-pixel_std_dev_multiplier = 0.02   # 乘性高斯：dist ~ N(dist, 0.02·dist)，作用于所有射线
-pixel_dropout_prob       = 0.02   # dropout 概率，作用于所有射线
-random_distance_noise    = 0.0    # M1 关闭（原模块不消费该字段）
-random_angle_noise       = 0.0    # M1 关闭；M3 若要角度噪声，需新定义语义
-```
-
-- **作用范围为所有点（含 no-hit 点），不支持“只对有效点加噪”**：LiDAR 版 `apply_noise()` 按相机传感器原 `apply_noise()` 的语义实现——
-  - 乘性高斯：对每条射线的 dist 做 `dist = N(dist, multiplier·dist)`，并令 `points = dir · dist`；
-  - dropout：Bernoulli 命中的射线置 `dist = far_plane`、`points = far_plane · dir`（等价“该桶无效”）；
-- 为什么“所有点”在这里是安全的：no-hit 点本来就是 `far_plane`（60m），乘性 2% 噪声后仍远大于有效通道范围；dropout 也只会把点置回“无效”，**不会像 `pd_gru_lidar` 旧实现那样制造 0~0.3m 幽灵点**。187 通道最终只保留真实斜距，no-hit/超出区域置为 `max_range`；
-- **实现方式（禁止照搬相机模块到 xyz 坐标）**：LiDAR 噪声在 **range 域**施加、按原射线方向重建点坐标。相机模块的 `pixels` 是深度标量，直接对 `(x,y,z)` 做独立高斯会引入方向失真、近点符号翻转，且其 dropout 哨兵值（`near_out_of_range_value`）与 LiDAR 的 `far_plane` 无效约定不一致。参考实现如下（torch 侧、raycast 之后调用，不进 Warp graph）：
-
-```python
-@torch.no_grad()
-def apply_noise(self, pixels: torch.Tensor, dists: torch.Tensor):
-    """pixels: (E,1,N,1,3), dists: (E,1,N,1)；返回与输入同形状的加噪结果。
-    以传入的 tensor 为权威数据，不依赖 wp.to_torch 是否零拷贝。"""
-    if not getattr(self.sensor_cfg, "enable_sensor_noise", False):
-        return pixels, dists
-
-    norm = torch.norm(pixels, dim=-1, keepdim=True).clamp_min(1e-6)
-    direction = pixels / norm                      # hit 与 no-hit 都是 d·dir，方向可安全复原
-
-    std = float(self.sensor_cfg.pixel_std_dev_multiplier) * dists
-    noisy_dists = torch.normal(mean=dists, std=std).clamp_min(0.0)
-
-    p = float(self.sensor_cfg.pixel_dropout_prob)
-    if p > 0.0:
-        drop = torch.bernoulli(torch.full_like(dists, p)).bool()
-        noisy_dists[drop] = self.far_plane          # LiDAR 无效约定，不用相机的 near 哨兵
-
-    noisy_pixels = direction * noisy_dists.unsqueeze(-1)
-    pixels.copy_(noisy_pixels)                      # 若为零拷贝视图，同时写回 warp buffer
-    dists.copy_(noisy_dists)
-    return pixels, dists
-```
-
-```python
-# LidarSensor.update() 在 raycast 分支（wp.capture_launch 或 wp.launch）结束后：
-self.lidar_pixels_tensor = wp.to_torch(self.lidar_warp_tensor)
-self.lidar_dist_tensor = wp.to_torch(self.local_dist)
-self.lidar_pixels_tensor, self.lidar_dist_tensor = self.apply_noise(
-    self.lidar_pixels_tensor, self.lidar_dist_tensor
-)
-return self.lidar_pixels_tensor, self.lidar_dist_tensor
-```
-
-- 训练时 `enable_sensor_noise=True`；play/真机评估用 config 开关显式关闭（建议默认关），避免推理多一个随机源；
-- 因为 M1 **不做地面过滤**，也就不需要区分干净点云/加噪点云；碰撞奖励走栅格，不消费点云；
-- **代码现状与前置改动**：当前仓库 `LidarSensor.update()` 只执行 raycast，**LiDAR 路径没有任何 `apply_noise()` 实现**；`LidarConfig` 的 4 个噪声字段是“死配置”（git 历史与同源 `Lidar_legged_gym` 包中，唯一成型的 `apply_noise()` 属于相机传感器 `isaacgym_camera_sensor`，其语义就是“对所有 pixel 加噪”）。M1 需按上面契约在 `LidarSensor` 中补一个 LiDAR 版 `apply_noise()`（或在 M1 wrapper 中实现同一函数），并用单测覆盖“no-hit 噪声不进入 187 有效通道、dropout 置 far_plane、不产生幽灵点”。
-
-
-### 2.3 雷达安装与固定 187 通道选择
-
-#### 2.3.1 Airy 完整参数与安装
-
-- 完整 Airy：水平分辨率 **0.4°**（900 个方位通道）× 垂直 **96** 个通道 = **86,400** 条射线；
-- 传感器坐标系：
-  ```text
-  x = cosφ·cosθ,  y = cosφ·sinθ,  z = sinφ
-  φ = 0°~90°（96 线等间隔）,  θ = 0°~360°（900 通道）
-  boresight = 传感器 +z；θ=0° 对应传感器 +x
-  ```
-- 当前安装参数：
-  ```python
-  offset_pos      = [0.7, 0.0, -0.05]
-  sensor_offset_rpy = [0.0, π/2 + 0.1, 0.0]
-  ```
-- 雷达载体高度固定：body 原点 `z=0.52m`，地面在 body 系为 `z=-0.52m`；雷达世界 `z=0.47m`。
-
-#### 2.3.2 固定 187 通道选择
-
-- 目标区域（body 系地面投影）：
-  ```text
-  x ∈ [0.65, 3.65]
-  y ∈ [-1.0, 1.0]
-  ```
-- 划分为 **11 行（x 方向）× 17 列（y 方向）= 187 格**；
-- 在平地（body 系 `z=-0.52m`）上计算 86,400 条射线的地面命中点；
-- 每个格子中心选择“地面命中点最近”的射线；
-- 得到 **187 个固定通道**，顺序为 row-major（11×17）；
-- 保存到 `selected_airy_channels.pt`，训练与部署共用。
-
-#### 2.3.3 归一化分母
-
-- 187 个通道的最远斜距**向上取整到 0.1m**，当前为 `3.2m`；
-- 观测**不做斜距裁切**，真实斜距是多少就是多少；
-- no-hit / 超出区域的值用 `3.2m` 作为空值哨兵，归一化后为 `1.0`。
-
-#### 2.3.4 `airy_mount.py` 自检
-
-- 187 个通道唯一；
-- 地面命中点位于目标区域附近（允许边界离散容差）；
-- `max_range` 等于最远斜距向上取整 0.1m；
-- 可保存方向投影图供 debug 检查。
-
-### 2.4 Observation
-
-每个控制 step 的输入为：
-
-```text
-[range_image_187 / max_range, ego_motion_3]
-```
-
-- `range_image`：**187 维**，每个通道对应一个固定地面格子，取该通道的真实斜距；
-- 归一化分母 `max_range`：187 个通道的最远斜距向上取整到 0.1m，当前为 `3.2m`；
-- **不做斜距裁切**：有效命中保留真实斜距；no-hit / 超出区域的值置为 `max_range`，归一化后为 `1.0`；
-- 不再使用 `r_min` / 旧 `5.0m` 有效距离筛选，也不做多射线取最小聚合；
-- 通道顺序固定为 11×17 row-major，训练与部署保持一致；
-- `ego_motion`：`[vx, vy, omega]`，按 M1 运动范围归一化：
-  - `vx / 1.5`（最大前进速度 1.5 m/s）；
-  - `vy / 1.0`（横向速度范围保守取 ±1.0 m/s）；
-  - `omega / 1.5`（最大角速度 1.5 rad/s）；
-- ego-motion 拼在 GRU **输入**中，GRU 之后不再重复拼接。
-
-**频率与数据复用**：
-
-- 控制/PPO step 为 **50Hz**；
-- LiDAR 工作频率为 **10Hz**；
-- 因此 LiDAR 点云每 **5 个 step** 更新一次，中间 4 个 step 复用同一帧 range image；
-- ego-motion 每 step 都更新；
-- **`use_reduced_raycast=True` 时，train 和 play 都只对 187 个固定通道做 Warp raycast**，不生成完整 86,400 条射线；play 仍会显示 187 个红色采样点 + 包络；
-- **debug/viewer 使用完整 Airy**：生成 86,400 条射线用于全量点云对照，并从完整点云中提取 187 通道；
-- **env reset 的空帧过渡**：某 env 在 reset 之后、下一次全局扫描之前，其 range image 置为全 `max_range`（空帧），直到下一次全局扫描刷新；空帧最多持续 4 步；
-- 传感器位姿在每次 LiDAR 更新时取当时 body 位姿；M1 射线是**瞬时扫描**，不模拟帧内运动畸变（M3 再加）；
-- 输入 ego-motion 是 **base 系**运动；传感器安装在 body 系 `[0.7, 0.0, -0.05]`，其线速度与 base 线速度一致，网络输入 base 量。
-
-### 2.5 网络结构（v2：修正 rsl_rl 字段归属）
-
-```text
-输入 [187 + 3 = 190]
-        ↓
-单层 GRU（hidden=187）
-        ↓
-actor: 187 -> 256 -> 128 -> 5
-critic: 187 -> 256 -> 128 -> 1
-```
-
-- M1 使用 **单层 GRU**；多层 GRU 作为后续消融变体；
-- actor/critic MLP head 之间使用 ELU；GRU 内部激活为 PyTorch GRU 默认（tanh/sigmoid）；
-- 最终 5 维输出使用 Sigmoid 映射到包络参数合法范围：
-
-```python
-norm   = torch.sigmoid(raw_action)
-action = low + norm * (high - low)
-```
-
-- **Sigmoid/affine 映射在环境侧执行，不放进 actor 网络最后一层**（避免破坏 rsl_rl 高斯 log-prob）；
-- 直接复用 rsl_rl `ActorCriticRecurrent`，但**注意 runner 的传参方式**（`on_policy_runner.py::_initialize_policy` 以位置参数传 `num_obs, critic_obs_dim, num_actions`），因此：
-
-```python
-# env cfg（观测维度唯一来源）
-class env:
-    num_observations = 190        # 187 range + 3 ego-motion
-    num_actions = 5
-    num_privileged_obs = None    # 不用 asymmetric critic；碰撞栅格只进 reward
-    episode_length_s = 45.       # 超时即全量 reset（位置/路径/GRU 同步重置）
-
-# PPO cfg（policy_cfg 里绝对不能再写 num_actor_obs / num_critic_obs）
-class policy:
-    actor_hidden_dims = [256, 128]
-    critic_hidden_dims = [256, 128]
-    activation = "elu"
-    rnn_type = "gru"
-    rnn_hidden_dim = 187
-    rnn_num_layers = 1
-    init_noise_std = 0.3
-
-class runner:
-    policy_class_name = "ActorCriticRecurrent"
-    algorithm_class_name = "PPO"
-    num_steps_per_env = 100     # 100 步=2s≈20 帧 LiDAR；24 步只有约 4 帧，偏短
-```
-
-- 本仓库 rsl_rl 已完整支持 recurrent PPO：`RolloutStorage.recurrent_mini_batch_generator` 负责轨迹切分，`PPO.process_env_step` 每步调用 `policy.reset(dones)` 清零 GRU hidden，环境侧无需手动清 hidden；
-- `num_steps_per_env` 建议 ≥ 50（实现时可按显存调整，但不建议低于 40）。
-
-### 2.6 Action 与下游接口
-
-- 策略只输出 5 个自由包络参数；
-- M1 内部 5→8 转换必须复用下游同一 prior 逻辑：`load_envelope_condition_spec()` + `apply_env_morphology_priors()`（或已验证等价的 legacy `envelope_params_to_condition`），先拼 3 个占位 0，再 derive；
-- M1 简化环境内部直接使用映射后的 5 维参数计算碰撞/势能奖励与可视化；5→8 转换由 `envelope_geometry.envelope_params_to_condition()` 提供，M2 接入 locomotion 时再调用；
-- M2/M3 接入 locomotion 后，才真正调用 `EL_4090_ENVELOP_2.set_envelope_condition()`：
-
-```python
-action_8 = torch.cat([action_5, torch.zeros_like(action_5[:, :3])], dim=-1)
-env.set_envelope_condition(action_8, derive_priors=True)
-```
-
-- `set()` 的 8 维契约：先对 8 维 clip（拼 0 落在 prior 范围 `[0,1]` 内，安全），`derive_priors=True` 时后 3 维被重算，因此拼 0 不会真正传入“全 0 先验”；
-- 注意 `set_envelope_condition()` 还会更新 `embedded_state_default_dof_pos` 并刷新 HAA swing ranges，M2 联合评估时要考虑形态切换的过渡行为；
-- 后续可考虑 refactor `EnvelopeConditionState.set()`，让它原生接受 5 维输入。
-
-### 2.7 LiDAR 生成与可视化
-
-- M1 使用 **Isaac Gym 仿真环境 + `LidarSensor` 的 Airy 模式**生成点云（raycast 几何为自建 Warp mesh，不是 Isaac 地形高度场）；
-- 地图固定：训练开始时由基元参数生成一次 occupancy → 一次三角网格 → 一次 `wp.Mesh`；
-- **Warp 执行路径**：当前仓库没有任何调用方使用 `LidarSensor.capture()`，所有 env 均走 `graph=None` 的直启 kernel；M1 沿用直启即可，地图固定也不存在“换 mesh 后重捕 graph”问题（若未来启用 graph capture，换 mesh 时必须重捕）；
-- 环境内部使用固定 187 通道映射表生成 range image；
-- M1 无机器人实体，因此不模拟腿/身自遮挡；M3 接入机器人后再处理；
-- 可视化规则：
-  - **红色小球**：完整 Airy 点云中，属于固定 187 通道且有效命中的点；
-  - **绿色小球**：完整 Airy 点云中，其他有效命中点，仅作对照；
-  - no-hit、被 dropout 的射线不画；
-  - 仅对 `debug_env_ids` 绘制（默认 `[0]`），避免逐 env 画 86,400 个球；
-  - **六边形包络**：完全复刻 `spider_envelop_2` 的绘制方式——6 条外轮廓 + 1 条中线的**加粗管状线**（`line_radius=0.012, line_samples=8`，青色 `(0,0.85,1)`，`z=0.02`），与点云同一 body 参考系；
-  - M1 在每次扫描时把 LiDAR 点云从 sensor 系变换到 **body 系**缓存；绘制时与包络共用**当前**机器人位姿（`base_pos + heading`）变换到世界，因此点云与包络始终保持固定的 body 系几何关系。
-
-### 2.8 Reward
-
-M1 奖励设计：
-
-- **势能项**：鼓励包络展开/变大。M1 默认取归一化参数均值：
-
-  ```text
-  potential = (norm(front_width) + norm(middle_width) + norm(back_width)
-               + norm(forward_limit) + norm(backward_limit)) / 5
-  ```
-
-  其中 `norm` 将参数线性映射到 `[0,1]`；`backward_limit` 先取反再归一化（与 `apply_env_morphology_priors` 物理方向一致）。
-
-- **碰撞惩罚**：六边形与**完整 2D 占据栅格**的侵入，负奖励；不使用点云做碰撞判定；
-  - 判定几何为“六边形按每条边外法向平移 `margin=0.05m`”后的扩展轮廓（用 half-plane 外推做精确 offset，不用 legacy 的径向顶点缩放近似）；
-  - 碰撞量 = 扩展轮廓覆盖的 occupied 格数与扩展轮廓覆盖格数之比（分母加 `eps` 防除零；配置化可换侵入深度）；
-  - 建议默认 `collision = -2.0 · ratio`（可调）；
-  - **碰撞栅格只用于 reward，不进 critic/privileged obs**（否则 `num_steps_per_env × num_envs × 14400` 的存储不可行，以 50×2048 为例约 5.9GB）；
-  - 碰撞不触发 episode 终止，episode 继续。
-- **action rate（小权重）**：惩罚**映射后的 5 维包络参数**逐帧变化：
-
-  ```text
-  action_rate = -0.01 · mean((mapped_t − mapped_{t−1})²)     # 建议值，实现时调
-  ```
-
-- episode reset 时将 `last_actions` 重置为映射后的 reset 中点（`sigmoid(0)` 对应的包络参数），避免跨 episode 误罚；
-- 建议默认权重：`potential=1.0, collision=-2.0, action_rate=-0.01`，具体值留实现时调；
-- **可学性风险（v2 新增）**：碰撞 reward 依赖真实状态与 action，不直接依赖观测，策略存在退化为“输出折中常数包络”的风险。缓解与监控：地图/通道宽度覆盖足够多样、保留 PPO 熵、在 §2.11 增加 action 方差与 clearance-包络相关度指标；M2 再考虑辅助监督——PPO 已预留 `policy.compute_auxiliary_loss` 调用钩子，但 `ActorCriticRecurrent` **没有**该实现，需在 `policy.py` 自定义带 aux head 的 recurrent policy（用 oracle 5 参数做监督）。
-
-### 2.9 训练节奏与 reset
-
-- M1 默认每个 env step 为 **50Hz**（`sim.dt=0.02`，无 decimation）；
-- LiDAR 为 **10Hz**，点云/range image 每 5 个 step 更新一次，中间 4 个 step 复用；
-- ego-motion 每个 50Hz step 都更新；
-- 每个 50Hz step `episode_length_buf += 1`，它作为 **30s timeout 计时器**；
-- **到达终点**：不置 done、不 reset 环境；`_replan_from_current()` 以当前位置为新起点，随机选一个新终点并规划新路径，机器人保留当前 heading 自然转向；
-- **timeout（默认 30s，v2 实现为确定性全量 reset）**：
-  - 所有到达 timeout 的 env 调用 `reset_idx()`：重新采样起点/终点/路径、传送位姿，并置 `done=1, time_out=1`（PPO 据此清空 GRU hidden 并做 value bootstrap）；
-  - 实现口径：`_reset_one_env` 是唯一的 episode 边界（软重规划不经过它）；
-  - 历史 v1 曾设计 40s + `memory_reset_prob=0.15` 的概率性 GRU-only 重置，该机制未进入实现，`memory_reset_prob` 字段不存在；
-- **真正 hard reset** 只在初始 reset（或未来显式 full reset）时发生：重新采样出生点并清空 GRU；
-- **BaseTask 接口要求（train.py 固定传 `init_at_random_ep_len=True`，漏掉会崩）**：
-  - env cfg 提供 `episode_length_s`（默认 45s），环境初始化先自建 `self.dt = cfg.sim.dt`，再设 `self.max_episode_length = int(cfg.env.episode_length_s / self.dt)`；
-  - `step()` 返回 5 元组 `(obs, privileged_obs, rew, dones, infos)`，且 `infos` 必须含 `"time_outs": self.time_out_buf`（PPO timeout bootstrap 依赖它）；
-  - **BaseTask 不会自动 clip**：`step()` 入口先按 `cfg.normalization.clip_actions` 截断 raw actions，返回前按 `cfg.normalization.clip_observations` 截断 obs（参照 `LeggedRobot.step` 的两段 clip）；
-  - `infos["episode"]` 里写 §2.11 的指标字典（值必须是 `torch` 标量/0 维 tensor，供 PPO logger 求均值），训练日志直接可见；
-- GRU hidden state 只随 `dones`（即 memory reset 子集）由 `ActorCriticRecurrent`/`policy.reset(dones)` 自动 reset，到达终点不清零。
-
-### 2.10 ego-motion 与运动随机量
-
-- M1 使用**真值 ego-motion**；
-- 第一阶段运动确定：速度 `1.0 m/s`、δ_target `0`、高度 `0.52m`、无晃动/无路径噪声（§2.2.5-§2.2.7）；
-- M3 再对 ego-motion 加入估计误差/噪声做域随机化。
-
-### 2.11 评估
-
-- M1 **不加入 oracle 作为评估指标**；
-- M1 基础量化指标（写入 `extras["episode"]`，tensorboard 可见）：
-  - 平均 reward 是否稳定上升；
-  - 平均碰撞惩罚是否下降；
-  - 平均包络面积/势能是否在开阔地增大、在窄通道收紧；
-  - `min_envelope_collision_free_ratio`（地图生成质量监控）；
-  - **policy action 在“开阔/窄通道/单侧墙”三类场景上的方差**，以及“局部 clearance 与输出包络面积的相关度”（防常数策略退化，M1 至少离线统计）；
-- 可通过 play 可视化观察策略行为；
-- 后续迭代再加入 oracle：当前位姿下最大无碰撞六边形面积，作为 `policy_area / oracle_area`、碰撞率等量化对比。
-
----
-
-## 三、文件结构与前置改动
-
-新代码放在：
-
-```text
-envs/el_4090/envelope_adaptive_2/
-  __init__.py
-  el_4090_ea2_config.py      # env cfg + PPO cfg（继承 LeggedRobotCfg/CfgPPO 以兼容 parse_sim_params）
-  el_4090_ea2_env.py         # BaseTask 子类，M1 无机器人实体
-  map_generator.py           # 障碍基元 -> occupancy -> warp mesh（含 z=0 地面）+ 生成验收
-  path_planner.py            # A* / LOS 平滑 / 0.2m 重采样 / 路径噪声（第一阶段关闭）/ 切线相对跟踪
-  envelope_geometry.py       # 六边形构造、精确 margin offset、栅格碰撞判定
-  range_image.py             # 187 固定通道 range image（无 r_min/斜距裁切）
-  airy_mount.py              # 完整 Airy 生成 + 187 通道选择 + 自检
-  selected_airy_channels.pt  # 固定 187 通道表（训练/部署共用）
-  symmetry.py                # 可选：range image 水平镜像 + vy/ω 取反、action 不变
-  policy.py                  # 默认不需要；M2 加 aux head 时再自定义
-  README.md                  # 本文件（实现时随代码迁入本目录）
-```
-
-前置小改动（对共享代码）：
-
-1. **`utils/LidarSensor`：补 `apply_noise()`**。当前 `LidarConfig` 噪声字段是死配置、LiDAR 路径没有加噪实现；按 §2.2.8 的契约（相机原语义）在 `update()` 后对**所有射线**施加乘性高斯 + dropout，并加单测（no-hit 噪声不进入有效通道、dropout 置 far_plane、不产生幽灵点）。`enable_sensor_noise` 默认 `False`，旧任务（`el4090_ea`、`el4090_lidar` 等）不受影响。
-2. **`envs/__init__.py`：注册新任务**：
-
-```python
-from .el_4090.envelope_adaptive_2.el_4090_ea2_env import EL_4090_EA2
-from .el_4090.envelope_adaptive_2.el_4090_ea2_config import El4090EA2Cfg, El4090EA2CfgPPO
-task_registry.register("el4090_ea2", EL_4090_EA2, El4090EA2Cfg(), El4090EA2CfgPPO())
-```
-
-3. 建议新增最小单测（CPU 可跑）：
-   - `tests/test_airy_mount.py`：187 通道唯一性、区域覆盖、max_range 自检；
-   - `tests/test_range_image.py`：187 维 range image、no-hit 空值、归一化；
-   - `tests/test_envelope_geometry.py`：顶点顺序、半宽语义、margin offset、栅格碰撞；
-   - `tests/test_path_planner.py`：A* 连通性、0.35 膨胀、噪声拒绝采样、δ_actual 跟踪。
-4. **M1 `create_sim()` 约定**（BaseTask 无机器人）：`add_ground` 建 Isaac 地面、按基元创建静态障碍 actor（仅可视化，放 **env 0** 一份即可）；创建 `num_envs` 个 env handle，**所有 env 共用世界原点（`env_origins=0`，不要按常规网格散开）**——单张 74×74 的 warp mesh 在世界原点，散开会导致 env 射线全部出图；`sensor_pos_tensor / sensor_quat_tensor` 直接用载体世界位姿（不叠加 env_origin），`sensor_pos_tensor / sensor_quat_tensor / mesh_ids` 按 legacy `_init_lidar_sensor` 的模式创建，Warp mesh 是 raycast 权威几何。
-
-- 旧的 `envelope_adaptive/` 规则式实现视为 legacy，不参与新任务。
-
----
-
-## 四、环节与里程碑
-
-### M1：最小底座
-
-- 简化 BaseTask + **全局固定地图**（74m×74m = 4×4 块，每块 16m×16m；Warp mesh 含 z=0 地面 + pd_gru 随机长方体障碍）+ 每 env A* 路径；
-- 起点/终点每 episode 采样；**第一阶段运动确定**：速度 1.0m/s、δ_target=0、高度 0.52m、无路径噪声/无晃动；**切线相对跟踪朝向控制**（ω 限幅 ±1.5 rad/s）；
-- 雷达 body 安装 `[0.7,0,-0.05]`，与六边形同参考系；六边形按 `spider_envelop_2` 加粗管状线绘制；
-- Isaac Gym + `LidarSensor` Airy（完整 0.4°×96）生成点云，经 `airy_mount.py` 选择固定 **187 通道**并生成 `selected_airy_channels.pt`；
-- `use_reduced_raycast` 同时控制 train/play：True 时只 raycast 187 通道；False 时使用完整 Airy 86,400 条射线做全量 debug 对照；
-- **LidarSensor `apply_noise()` 补齐**：乘性高斯 2% + dropout 2%，作用于所有射线；187 通道只保留真实斜距，no-hit/超出区域置 `max_range`；
-- 控制 50Hz / LiDAR 10Hz：全局 10Hz 时钟每 5 步扫描全部 env 并刷新 range image，中间 4 步复用；reset 落在两次扫描之间时，该 env 用全 `max_range` 空帧过渡（≤4 步）；
-- 红/绿小球可视化采样点与其余点云（仅 debug env ids）；
-- 单 GRU(187) + MLP，PPO 训练（`num_steps_per_env≥50`，配置按 §2.5 修正）；
-- 奖励：势能 + 碰撞惩罚（完整栅格）+ action rate；补齐 `max_episode_length`/`time_outs` 接口；
-- 验证“点云 → 包络”映射可学，并跑 §2.11 的防退化指标。
-
-### M2：信号密度
-
-- 用更密集的**固定地图**配置（重新起训或换种子）训练，更强路径噪声；
-- 观察碰撞惩罚变密后策略是否学会收紧；
-- 增加 oracle 与 aux head 消融（需在 `policy.py` 自定义 recurrent policy 实现 `compute_auxiliary_loss`，PPO 侧调用钩子已存在）；
-- 可选：接入已训 locomotion policy 做联合评估（注意 `set_envelope_condition` 同时更新 embedded target/HAA range）。
-
-### M3：真实化
-
-- 域随机化增强：角度噪声、点丢失增强、帧内运动畸变、晃动增强、ego-motion 噪声；
-- 真机 Airy 通道角度表校准（映射表重新生成）与 sim-to-real 验证。
+诊断脚本（`tests/ea2/`，非 pytest 收集，直接运行）：
+
+- `validate_sl_vs_oracle_audit.py`：三方归因（raw oracle / 平滑目标 / 策略）
+  的碰撞率、收缩幅度、滞后、可观测性；`--ood-seed N` 现采未见地图做泛化
+  检查。因为动作不影响状态，**离线审计 = 部署精确复现**。
+- `validate_pass_by_expansion.py`：通过障碍场景的对齐事件分析（提前扩张 /
+  尾部越界率），记忆类改进的验收仪器。
+- `validate_sl_vs_oracle_snapshots.py`：按失败类别出俯视 PNG
+  （策略青 / oracle 橙 / 最小包络灰虚线 / 最大包络绿点线）。
+
+## 8. 关键约定、陷阱与路线
+
+- **动作折叠**：SL 网络输出 s∈[0,1]，env 消费 raw action——导出必须折叠
+  （`export.export` 默认开启）；`verify_export` 端到端校验，不可跳过。
+- **标度单一来源**：`env_action_scale()` 从活配置派生；`soft_dof_pos_limit`
+  变更会自动传导，但历史快照数据的 target 上限（0.95=soft 0.9 时代）要与
+  meta 对照。
+- **节奏一致**：采集/训练/评估/部署全部按 50Hz 控制（`lidar_decimation=1`）。
+  历史上 10Hz 训练 + 50Hz 部署造成 6 倍 MSE 失配，勿回退。
+- **Isaac 约束**：单进程只能建一个 `EL_4090_EA2`（第二次构造 segfault）；
+  多 seed/多阶段一律子进程。
+- **oracle 残余边界**：floor-pinned 帧（~1.8%）几何不可行，属设计豁免
+  （README v2 §2.2.3）；残余 pass-by 事件受 187 通道前向视野限制。
+- **后续路线**：① 187 通道重分配（前方 + 两侧条带，obs 维度不变，治侧后
+  不可观测）；② PPO 微调启用真实碰撞惩罚（当前权重为 0）并压探索噪声；
+  ③ map_generator 实现 contracts 中已定义的 corridor/side_walls tile，
+  补长障碍训练分布。
