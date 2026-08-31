@@ -30,8 +30,8 @@ def test_env_cfg_contract():
     assert cfg.map.grid_shape == [740, 740]
     assert cfg.map.n_tiles == 4
     assert cfg.map.tile_size_m == 16.0
-    assert cfg.obstacles.pillar_count_min == 18
-    assert cfg.obstacles.pillar_count_max == 18
+    assert cfg.obstacles.pillar_count_min == 24
+    assert cfg.obstacles.pillar_count_max == 24
     assert cfg.obstacles.pillar_size_x_min == 0.5
     assert cfg.obstacles.pillar_size_x_max == 4.0
     assert cfg.obstacles.pillar_min_separation == 2.6

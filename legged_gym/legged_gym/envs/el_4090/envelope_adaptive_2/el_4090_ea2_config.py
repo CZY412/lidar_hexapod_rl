@@ -69,8 +69,8 @@ class El4090EA2Cfg(LeggedRobotCfg):
 
     class obstacles:
         # pd_gru_lidar pillar_field_terrain parameters (per 16m x 16m tile)
-        pillar_count_min = 18
-        pillar_count_max = 18
+        pillar_count_min = 24
+        pillar_count_max = 24
         pillar_size_x_min = 0.5
         pillar_size_x_max = 4.0
         pillar_size_y_min = 0.5
@@ -79,7 +79,7 @@ class El4090EA2Cfg(LeggedRobotCfg):
         pillar_height_max = 2.0
         pillar_min_separation = 2.6
         pillar_center_clear_radius = 1.0
-        pillar_spawn_radius = 7.5
+        pillar_spawn_radius = 8.5
         pillar_allow_height_variation = True
 
     class path:
@@ -95,6 +95,15 @@ class El4090EA2Cfg(LeggedRobotCfg):
         noise_amp_range = [0.0, 0.0]     # stage 1: no lateral path noise
         noise_fc_hz = 1.0
         noise_retries = 8
+        # Stage 2 speed randomisation: every speed_resample_steps control
+        # steps each env redraws its path speed -- exactly 0 with probability
+        # speed_p_zero (stationary-hold states train memory retention), else
+        # uniform on (0, speed_range[1]].  Turn-in-place phases are
+        # translation-free but in-distribution and unaffected (v is unused
+        # while turning).
+        speed_randomize = True
+        speed_resample_steps = 150
+        speed_p_zero = 0.02
         # Parallel A* workers (fork-based, CPU only; never touch CUDA/Isaac).
         path_plan_workers = 8
         path_plan_batch_threshold = 4

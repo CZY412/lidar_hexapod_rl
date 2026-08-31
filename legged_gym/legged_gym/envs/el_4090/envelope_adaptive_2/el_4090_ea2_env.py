@@ -303,6 +303,23 @@ def raw_action_rate_term(
     return torch.sum((actions - last_actions) ** 2, dim=-1)
 
 
+def speed_mixture_draw(
+    u_mode: torch.Tensor,
+    u_speed: torch.Tensor,
+    p_zero: float,
+    max_speed: float,
+) -> torch.Tensor:
+    """Stage 2 speed schedule: 0 with probability ``p_zero``, else uniform.
+
+    ``u_mode``/``u_speed`` are unit-interval draws.  The zero-speed mode
+    provides stationary-hold states so the GRU learns "ego ~ 0 -> keep the
+    memory", and the uniform part covers slow passes whose invisible tails
+    are longer than the training window.
+    """
+    zero = u_mode < float(p_zero)
+    return torch.where(zero, torch.zeros_like(u_speed), u_speed * float(max_speed))
+
+
 def assemble_observation(
     range_image: torch.Tensor,
     ego: torch.Tensor,
@@ -634,6 +651,8 @@ class EL_4090_EA2(BaseTask):
         _min_v, _ = _physical_min_max(self._envelope_low_dev, self._envelope_high_dev)
         self._oracle_floor_pinned_env = _min_v
         self._rng = np.random.default_rng(int(getattr(self.cfg, "seed", 42)) + 1)
+        self._speed_rng = torch.Generator(device=device)
+        self._speed_rng.manual_seed(int(getattr(self.cfg, "seed", 42)) + 2)
 
     def _init_lidar(self):
         """Initialize the Warp mesh and the shared LidarSensor instance."""
@@ -1176,7 +1195,15 @@ class EL_4090_EA2(BaseTask):
         self.tangent_rate[env_id] = 0.0
         self.delta_actual[env_id] = 0.0
         self.omega[env_id] = 0.0
-        self.v[env_id] = float(self.cfg.path.speed_range[0])
+        if bool(getattr(self.cfg.path, "speed_randomize", False)):
+            p_zero = float(self.cfg.path.speed_p_zero)
+            u_mode, u_speed = self._rng.random(), self._rng.random()
+            self.v[env_id] = float(speed_mixture_draw(
+                torch.tensor(u_mode), torch.tensor(u_speed), p_zero,
+                float(self.cfg.path.speed_range[1]),
+            ))
+        else:
+            self.v[env_id] = float(self.cfg.path.speed_range[0])
         self.delta_target[env_id] = math.radians(float(self.cfg.path.delta_target_deg_range[0]))
         self.height_target[env_id] = float(self.cfg.height.min_m)
         self.height_filter[env_id] = float(self.height_target[env_id])
@@ -1238,6 +1265,28 @@ class EL_4090_EA2(BaseTask):
             self.ego_motion[(i, 2)] = omega_out
         if self.cfg.env.send_timeouts:
             self.extras["time_outs"] = self.time_out_buf
+
+    def _resample_path_speeds(self) -> "None":
+        """Redraw path speeds on their per-env schedule (stage 2).
+
+        Fires on every env whose ``episode_length_buf`` is a multiple of
+        ``speed_resample_steps`` -- per-env phases are staggered naturally and
+        restart at each episode boundary.  No-op unless
+        ``cfg.path.speed_randomize`` is set.
+        """
+        if not bool(getattr(self.cfg.path, "speed_randomize", False)):
+            return
+        due = (self.episode_length_buf % int(self.cfg.path.speed_resample_steps)) == 0
+        n = int(due.sum())
+        if n == 0:
+            return
+        u_mode = torch.rand(n, device=self.device, generator=self._speed_rng)
+        u_speed = torch.rand(n, device=self.device, generator=self._speed_rng)
+        self.v[due] = speed_mixture_draw(
+            u_mode, u_speed,
+            float(self.cfg.path.speed_p_zero),
+            float(self.cfg.path.speed_range[1]),
+        )
 
     def _step_kinematics(self):
         """Advance each env along its reference path (batched backend)."""
@@ -1449,6 +1498,7 @@ class EL_4090_EA2(BaseTask):
         self.render()
         self.common_step_counter += 1
         self.episode_length_buf += 1
+        self._resample_path_speeds()
         self._step_kinematics()
         self._update_lidar()
         self.time_out_buf[:] = False
