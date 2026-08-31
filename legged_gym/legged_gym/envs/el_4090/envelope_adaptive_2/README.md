@@ -197,6 +197,9 @@ hover 在 0.058~0.075）——缓解手段见 §8 路线。
 ```bash
 PKG=legged_gym.envs.el_4090.envelope_adaptive_2.sl.scripts
 
+# 0. 冒烟（约定：train 跑一步即可，不设独立冒烟脚本）
+python legged_gym/scripts/train.py --task=el4090_ea2 --num_envs=4 --max_iterations=1 --headless
+
 # 1. 采集（每 seed 独立进程！Isaac 单进程单环境）
 python -m $PKG.collect --seeds 1 --num-envs 96          # num_steps 默认取配置(2200)
 python -m $PKG.collect --seeds 21 --pillar-counts 28 ...   # 稠密图
@@ -237,6 +240,7 @@ python -m $PKG.pipeline --run-name <name>
 
 ```bash
 python -m pytest legged_gym/tests/ea2 -q     # 单测全量（无外部依赖）
+legged_gym/tests/ea2/run_ea2_tests.sh        # 同上的一键包装（自带 conda/ninja 环境）
 # G0-G5 验收门（指向真实产物时自动启用）：
 export EA2_SL_DATA_DIR=<...>/sl/logs/data          # G0 数据契约
 export EA2_SL_METRICS=<...>/runs/<name>/model_metrics.json   # G2 训练指标

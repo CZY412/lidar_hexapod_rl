@@ -4,7 +4,7 @@ set -euo pipefail
 
 PY="${EA2_PYTHON:-/home/t3chichi/anaconda3/envs/el4090/bin/python}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${HERE}/.."
+cd "${HERE}/../.."
 
 # Isaac Gym's gymtorch JIT build needs ninja; CUDA headers/binaries are in /usr/local/cuda.
 export PATH="/usr/local/cuda-11.7/bin:/home/t3chichi/anaconda3/envs/el4090/bin:${PATH}"
