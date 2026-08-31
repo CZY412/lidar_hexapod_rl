@@ -196,6 +196,12 @@ python -m $PKG.export --ckpt sl/logs/runs/<name>/model.pt \
 python legged_gym/legged_gym/scripts/play_ea2.py \
     --task=el4090_ea2 --load_run <name> --checkpoint 0 --num_envs 1
 
+python legged_gym/legged_gym/scripts/play_ea2.py \
+    --task=el4090_ea2 --load_run recall75_safe --checkpoint 0 --num_envs 1
+
+python legged_gym/legged_gym/scripts/play_ea2.py \
+    --task=el4090_ea2 --load_run v2_multik --checkpoint 0 --num_envs 1
+
 # 6. PPO 微调（从导出起点 resume）与三臂对照
 python legged_gym/scripts/train.py --task=el4090_ea2 --resume --load_run <name> --checkpoint 0
 python -m $PKG.ppo_continue --arm sl_init --ckpt <model.pt> --seed 1 --iterations 60 --out p.json

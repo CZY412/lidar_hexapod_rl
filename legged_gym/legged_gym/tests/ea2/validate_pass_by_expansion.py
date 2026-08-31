@@ -101,9 +101,17 @@ def analyze_map(seed: int, net, device: str, half_win: int = 100):
             end = t  # first non-tight frame
             if end - start < 20 or end >= T:
                 continue
-            # recovery: target reaches > 0.9 within 5 s after the tight period
+            # R4: recovery search horizon adapts to speed -- at 0.1 m/s the
+            # invisible tail (~1.75 m) lasts ~17.5 s, far beyond the old fixed
+            # 250-frame (5 s) window, silently dropping slow-pass events.
+            seg = pos[start:end, n]
+            v_mean = float(
+                (seg[1:] - seg[:-1]).norm(dim=-1).mean().clamp_min(1e-6) / 0.02
+            )
+            search = int(min(1500, max(250, 2.0 / max(v_mean, 0.05) / 0.02)))
+            # recovery: target reaches > 0.9 within the adapted horizon
             rec = None
-            for k in range(end, min(end + 250, T)):
+            for k in range(end, min(end + search, T)):
                 if float(tgt_bw[k, n]) > 0.9:
                     rec = k
                     break
