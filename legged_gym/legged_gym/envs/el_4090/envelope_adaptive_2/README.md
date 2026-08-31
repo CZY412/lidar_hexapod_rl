@@ -31,10 +31,14 @@
 **动作不影响状态转移**——运动纯脚本化，这使离线监督在数学上等于部署行为：
 
 - **地图**：74 m×74 m 全局一张（4×4 块 16 m 柱状障碍地块 + 5 m 边界，0.1 m
-  栅格），由 `cfg.seed` 决定布局；Warp mesh 为 raycast 权威几何；距离场一次
-  预计算。无实体围墙，仅规划栅格边界阻塞。
-- **路径**：A*（0.4 m 膨胀栅格）→ LOS 简化 → 0.2 m 重采样 → 切线平滑；到点
-  soft-replan、转角 turn-in-place；速度 1 m/s，`ω_max=1.5`，episode 45 s。
+  栅格），由 `cfg.seed` 决定布局（v2 起每块 **24** 根障碍、spawn 半径 8.5 m，
+  提升绑定帧密度）；Warp mesh 为 raycast 权威几何；距离场一次预计算。无实体
+  围墙，仅规划栅格边界阻塞。
+- **路径与速度**：A*（0.4 m 膨胀栅格）→ LOS 简化 → 0.2 m 重采样 → 切线平滑；
+  到点 soft-replan、转角 turn-in-place；`ω_max=1.5`，episode 45 s。**速度调度
+  （v2）**：每 150 步（3 s）按混合分布重采样——2% 概率精确 0（静止保持状态，
+  训练"ego≈0 → 记忆保持"），否则 U(0,1)；低速段使通过障碍的不可见尾巴
+  （1.75 m ÷ v）成为监督对象。`speed_randomize=False` 可回退固定 1 m/s。
 - **LiDAR**：完整 Airy（900 方位 × 96 俯仰）中预选 187 通道
   （`selected_airy_channels.pt`，训练/部署共用）；10 Hz 刷新，50 Hz 控制每步
   消费；乘性高斯 2% + dropout 2% 噪声作用于全部射线。
@@ -44,8 +48,9 @@
   （收 2.0 m/s、放 0.5 m/s、冷却 0.2 s）。平滑输出 `prev_s` 即 SL 回归目标与
   PPO 奖励参考。
 - **碰撞语义**：违规 = 34 个采样点对距离场的 clearance < margin(0.10 m)
-  （软坡宽 0.10 m）。**floor-pinned 帧**（最小包络也放不下，约为帧数的 1.8%）
-  几何不可行，README v2 即豁免，所有归因以此为底线。
+  （软坡宽 0.10 m）。**floor-pinned 帧**（最小包络也放不下）几何不可行，
+  README v2 即豁免，所有归因以此为底线——占比随地形密度变化（v2 数据约
+  1.6%），**跨数据版本的指标不可直接对比**。
 
 ## 3. 文件结构
 
@@ -106,10 +111,12 @@ collect → train → eval → export → ppo_continue(可选)
 
 1. **collect**：零动作 rollout，每控制步存一帧
    `(obs, target=smoother.prev_s, done, heading, pos)`，每 seed 一个
-   `map_seed<N>.pt`（meta 记录 oracle 配置/soft 上限/warmup 供审计溯源）。
+   `map_seed<N>.pt`（meta 记录 oracle 配置/soft 上限/warmup/速度调度/地图验收
+   供审计溯源）。默认 2200 步 < 2250 步 episode 上限 → 单 episode 无 done。
    ⚠ Isaac 单进程单环境约束：每 seed 必须独立进程。
-2. **train**：滑窗（seq_len=200 帧=4s，stride=10，跨 done 丢弃，按 env 划分
-   train/val 防泄漏），MSE + 两个辅助项（见 4.3），val-R² 早停。
+2. **train**：滑窗（seq_len=400 帧=8s，stride=15，跨 done 丢弃，按 env 划分
+   train/val 防泄漏），观测 uint8 量化存储（~2.5cm 步长，属训练期噪声，
+   部署消费 float），MSE + 辅助项（见 4.3），val-R² 早停。
 3. **eval**：闭环回灌 env，对照 zero-action / 最优常数包络 / stateful /
    window 四种策略的 reward、MSE、碰撞率、面积。**stateful（逐帧带隐状态）
    为推荐部署模式**，实测远优于复现训练窗口的 window 模式。
@@ -118,40 +125,52 @@ collect → train → eval → export → ppo_continue(可选)
    压死在中点附近。critic 保持随机初始化；14 项校验全过才落盘。
 5. **ppo_continue**：PPO 微调三臂对照，验证 SL 权重起点价值（G5）。
 
-### 4.3 定版训练配方（C 方案，`sl/logs/runs/baseline_50hz_recall75_safe`）
+### 4.3 定版训练配方（v2 多档回忆，`sl/logs/runs/v2_multik`）
 
 ```python
-cfg.model.aux_ks    = [75]      # 回忆辅助头：h_t 重建 s_{t-75}（1.5s ≈ 通过障碍的不可见尾巴）
+cfg.model.aux_ks    = [25, 50, 100, 200, 300]  # 回忆探针：h_t 重建 s_{t-k}（0.5~6 s）
 cfg.model.aux_mode  = "recall"  # 纯记忆压力，无法被当前视野外推满足
-cfg.train.aux_beta  = 0.5
+cfg.train.aux_beta  = 0.5       # 辅助总预算；按档等总归一：
 cfg.train.safe_lambda = 1.0     # 可微碰撞损失：双线性距离场采样、floor-pinned 掩零
 ```
 
 ```text
-L = MSE(ŝ_t, s_t) + 0.5·recall_loss + 1.0·safe_loss
+L = MSE(ŝ_t, s_t) + Σ_k β_k·recall_k + 1.0·safe_loss
+β_k = 0.5 × (L-k)/L ÷ Σ_j (L-k_j)/L     # 长档样本少、不可约底高 → 权重低
 ```
 
 设计要点（均为实验结论）：
 
-- **回忆头**在 h 中显式建立"记住滑过视野的障碍"的压力（探针误差 0.039→0.023）；
-  正向预测头（A 组）因含不可约的猜测成分而全面劣于回忆（B 组），已否决。
+- **回忆头**在 h 中显式建立"记住滑过视野的障碍"的压力；**多档**把保持曲线
+  上的多个年龄点同时变成监督（per-k `aux_val_mse` 即实测保持曲线）。
+  单档 k=75 版本（`recall75_safe`）为 A′ 对照；正向预测头已否决（含不可约
+  猜测成分，全面劣于回忆）。
 - **安全损失**在策略自身预测真实几何违规时给出直接梯度；**必须用双线性距离场
   采样**（env 奖励的最近邻查表对参数梯度恒为零，不可作 SL 损失）。
 - **MSE 锚必须保留**：防止安全损失把包络压向最小（clearance 塌缩）。
+- **梯度射程 = seq_len**：违规帧经 BPTT 只能回传到 4s（现 8s）内的记忆写入
+  点；超过窗口的尾巴要靠学到的保持先验 + 部署护栏，这是 seq_len 是第一杠杆
+  的原因。
 
-### 4.4 当前结果（4 图池化，部署节奏 50Hz）
+### 4.4 当前结果（v2 语料：增密地形 + 速度混合，4 图池化）
 
-| 指标 | 对照（纯 MSE） | **定版 C** |
+⚠️ 地形/速度变化会移动所有基线（含 floor-pinned 占比），**v1 数据上的历史
+数字不可与 v2 直接对比**；同数据内的对比才有意义。
+
+| 指标 | A′：C 单档配方 | **B′：多档回忆（定版）** |
 |---|---|---|
-| val R² | 0.807 | 0.798 |
-| policy 不安全帧率（含 1.8% floor-pinned） | 5.10% | **3.64%** |
-| pass-by 尾部越界事件率 | 7.5% | 6.4% |
-| policy 平均最小 clearance | 0.0949 m | 0.0964 m（oracle 0.0982，无塌缩） |
+| val R² | 0.754 | 0.753（多档零主任务代价） |
+| policy 不安全帧率（floor 基线 1.59%） | 5.29% | **4.68%** |
+| pass-by 尾部越界事件率 | 8.5% | **6.3%** |
+| 贴障静止 36s（stop 探针） | —（见下） | 张开速率降 ~8 倍、25s 后饱和，碰撞 3/12 |
+| 记忆保持曲线（探针 MSE） | 单点 k75=0.023 | k25→k300 = 0.021→0.043，全部 ≤ 回声下界的 1/4 |
+| OOD 未见图（seed 42） | 7.24% | 6.50% |
 
-归因结论：oracle 目标在几何可行帧上零碰撞（其不安全率 ≡ floor-pinned 率），
-平滑器零额外碰撞；全部残余来自网络。**残余的 ~6.4% 通过事件受制于观测边界**
-——187 通道只看前方，侧后方依赖 GRU 记忆；结构性解法是 187 通道重分配
-（前方网格 + 两侧条带，obs 维度不变），见 §8。
+归因结论（v1/v2 数据上一致）：oracle 目标在几何可行帧上零碰撞（其不安全率
+≡ floor-pinned 率），平滑器零额外碰撞；全部残余来自网络。**残余受两面夹击**：
+187 通道只看前方（侧后依赖记忆），且 >6s 的极低速尾巴超出窗口射程。已知
+残余：贴障长时静止仍会缓慢张开（安全损失形成"越界即回推"极限环，clearance
+hover 在 0.058~0.075）——缓解手段见 §8 路线。
 
 ## 5. PPO 框架（微调阶段）
 
@@ -165,8 +184,8 @@ L = MSE(ŝ_t, s_t) + 0.5·recall_loss + 1.0·safe_loss
   γ 0.99、λ 0.95、clip 0.2、entropy 0.01、`num_steps_per_env=100`、
   `max_iterations=3000`。
 - **已知风险**：从 SL 初始化起步的 PPO 前 60 轮会出现策略退化（随机 critic +
-  std=0.5 探索），但起点显著优于 scratch（-0.14 vs -0.69）。微调时建议低
-  std / 低 lr 起步。
+  std=0.5 探索），但起点显著优于 scratch（v2 语料实测 -0.18 vs -0.73，好
+  76%）。微调时建议低 std / 低 lr 起步。
 - **入口**：`legged_gym/scripts/train.py --task=el4090_ea2`；可视化
   `legged_gym/scripts/play_ea2.py`（1 env、关噪声、红/绿点云 + 青色包络）。
 
@@ -179,11 +198,12 @@ L = MSE(ŝ_t, s_t) + 0.5·recall_loss + 1.0·safe_loss
 PKG=legged_gym.envs.el_4090.envelope_adaptive_2.sl.scripts
 
 # 1. 采集（每 seed 独立进程！Isaac 单进程单环境）
-python -m $PKG.collect --seeds 1 --num-envs 96 --num-steps 1400
+python -m $PKG.collect --seeds 1 --num-envs 96          # num_steps 默认取配置(2200)
 python -m $PKG.collect --seeds 21 --pillar-counts 28 ...   # 稠密图
 
 # 2. 训练（配置即默认；CLI 仅显式覆盖）
 python -m $PKG.train --run-name <name> --epochs 50 --patience 10
+python -m $PKG.train --run-name <name> --aux-ks 25,50,100,200,300   # 多档回忆头
 
 # 3. 闭环评估
 python -m $PKG.eval --ckpt sl/logs/runs/<name>/model.pt
@@ -200,6 +220,9 @@ python legged_gym/legged_gym/scripts/play_ea2.py \
     --task=el4090_ea2 --load_run recall75_safe --checkpoint 0 --num_envs 1
 
 python legged_gym/legged_gym/scripts/play_ea2.py \
+    --task=el4090_ea2 --load_run v2_multik --checkpoint 0 --num_envs 1
+
+python legged_gym/legged_gym/scripts/play_keyboard.py\
     --task=el4090_ea2 --load_run v2_multik --checkpoint 0 --num_envs 1
 
 # 6. PPO 微调（从导出起点 resume）与三臂对照
@@ -228,7 +251,11 @@ export EA2_SL_PPO_DIR=<...>/runs/<name>            # G5 PPO 三臂
   的碰撞率、收缩幅度、滞后、可观测性；`--ood-seed N` 现采未见地图做泛化
   检查。因为动作不影响状态，**离线审计 = 部署精确复现**。
 - `validate_pass_by_expansion.py`：通过障碍场景的对齐事件分析（提前扩张 /
-  尾部越界率），记忆类改进的验收仪器。
+  尾部越界率），记忆类改进的验收仪器；恢复搜索窗按事件内均速自适应
+  （2 m / v̄，250~1500 帧），低速长尾事件不再被静默丢弃。
+- `validate_stop_forgetting.py`：**贴障静止探针**——同时冻结一批贴障 env
+  并保持 36 s，量化"包络因遗忘而张开"的速率与碰撞数；`--in-view` 为视野内
+  对照（区分记忆衰减与静止状态本身）。可用作部署护栏的验收仪器。
 - `validate_sl_vs_oracle_snapshots.py`：按失败类别出俯视 PNG
   （策略青 / oracle 橙 / 最小包络灰虚线 / 最大包络绿点线）。
 
@@ -243,9 +270,16 @@ export EA2_SL_PPO_DIR=<...>/runs/<name>            # G5 PPO 三臂
   历史上 10Hz 训练 + 50Hz 部署造成 6 倍 MSE 失配，勿回退。
 - **Isaac 约束**：单进程只能建一个 `EL_4090_EA2`（第二次构造 segfault）；
   多 seed/多阶段一律子进程。
-- **oracle 残余边界**：floor-pinned 帧（~1.8%）几何不可行，属设计豁免
-  （README v2 §2.2.3）；残余 pass-by 事件受 187 通道前向视野限制。
+- **oracle 残余边界**：floor-pinned 帧几何不可行，属设计豁免（README v2
+  §2.2.3）；占比随地形密度变化（v2 语料约 1.6%），是所有不安全率的地板。
+- **跨版本不可比**：地形密度/速度调度改变会移动全部基线（目标方差、
+  floor-pinned、碰撞率）——指标只在同版本数据内对比；旧语料归档于
+  `sl/logs/data_50hz_1ms/`（`data_*/` 已 gitignore）。
+- **静止贴障残余**：速度混合（2% 零速段）把停障张开压慢约 8 倍并使其饱和，
+  但连续长停（≫3s 训练段长）仍会缓慢越过 margin——训练侧解法是加长部分
+  静止段，部署侧护栏是"ego≈0 时冻结包络/只允许收缩"。
 - **后续路线**：① 187 通道重分配（前方 + 两侧条带，obs 维度不变，治侧后
-  不可观测）；② PPO 微调启用真实碰撞惩罚（当前权重为 0）并压探索噪声；
-  ③ map_generator 实现 contracts 中已定义的 corridor/side_walls tile，
+  不可观测——拖尾与静止残余的共同结构性解）；② PPO 微调启用真实碰撞惩罚
+  （当前权重为 0）并压探索噪声；③ 采集加长静止段（部分段 10~20s）；
+  ④ map_generator 实现 contracts 中已定义的 corridor/side_walls tile，
   补长障碍训练分布。
