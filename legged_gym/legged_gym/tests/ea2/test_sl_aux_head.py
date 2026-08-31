@@ -100,3 +100,22 @@ def test_aux_head_state_dict_keys_do_not_touch_export_map():
     mapping = net.actor_state_dict_keys()
     assert len(mapping) == 10
     assert all(not k.startswith("aux") for k in mapping)
+
+
+def test_aux_head_weights_equal_budget_and_shares():
+    """Equal-budget normalisation: total weight == beta; shares follow (L-k)/L."""
+    from legged_gym.envs.el_4090.envelope_adaptive_2.sl.train import aux_head_weights
+
+    w = aux_head_weights([25, 50, 100, 200, 300], seq_len=400, beta=0.5)
+    assert set(w) == {25, 50, 100, 200, 300}
+    assert abs(sum(w.values()) - 0.5) < 1e-9, "total budget must equal beta"
+    # shares proportional to (L-k)/L
+    shares = {k: (400 - k) / 400 for k in w}
+    for k, wk in w.items():
+        assert abs(wk - 0.5 * shares[k] / sum(shares.values())) < 1e-9
+    # monotone: longer horizon -> smaller weight
+    vals = [w[k] for k in sorted(w)]
+    assert all(a > b for a, b in zip(vals, vals[1:]))
+    # single head degrades to the plain beta (C-recipe comparability)
+    w1 = aux_head_weights([75], seq_len=400, beta=0.5)
+    assert abs(w1[75] - 0.5) < 1e-9

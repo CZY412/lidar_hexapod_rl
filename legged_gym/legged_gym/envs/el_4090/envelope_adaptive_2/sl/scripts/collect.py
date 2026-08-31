@@ -59,7 +59,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--seeds", default="1,7,13", help="comma separated map seeds")
     ap.add_argument("--pillar-counts", default=None, help="comma separated obstacle counts ('-' = config default)")
     ap.add_argument("--num-envs", type=int, default=96)
-    ap.add_argument("--num-steps", type=int, default=1400)
+    ap.add_argument("--num-steps", type=int, default=None,
+                    help="override cfg.data.num_steps (default: config value, 2200)")
     ap.add_argument("--out-dir", default=None, help=f"default: {SL_DATA_DIR}")
     ap.add_argument(
         "--print-summary",

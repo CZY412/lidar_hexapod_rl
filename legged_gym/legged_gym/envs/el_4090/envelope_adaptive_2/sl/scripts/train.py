@@ -39,6 +39,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--aux-ks", default=None,
+                    help="comma separated recall-probe horizons, e.g. 25,50,100,200,300 "
+                         "(default: config value; empty disables the heads)")
     ap.add_argument("--run-name", default="baseline", help="sub-directory of sl/logs/runs/")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--log-every", type=int, default=5)
@@ -55,6 +58,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.train.seq_len = args.seq_len
     if args.window_stride is not None:
         cfg.train.window_stride = args.window_stride
+    if args.aux_ks is not None:
+        cfg.model.aux_ks = [int(k) for k in args.aux_ks.split(",") if k.strip()]
     cfg.train.epochs = args.epochs
     cfg.train.batch_size = args.batch_size
     cfg.train.learning_rate = args.lr

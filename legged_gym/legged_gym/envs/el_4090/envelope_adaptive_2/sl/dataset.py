@@ -120,7 +120,7 @@ def build_env(
 def collect_map(
     seed: int,
     num_envs: int = 96,
-    num_steps: int = 1400,
+    num_steps: Optional[int] = None,
     lidar_decimation: Optional[int] = None,
     pillar_count: Optional[int] = None,
     device: str = "cuda:0",
@@ -136,6 +136,8 @@ def collect_map(
 
     if lidar_decimation is None:
         lidar_decimation = SLConfig().data.lidar_decimation
+    if num_steps is None:
+        num_steps = SLConfig().data.num_steps
     env = build_env(seed, num_envs, pillar_count)
     try:
         env.reset()
@@ -174,6 +176,10 @@ def collect_map(
             "oracle_group_mode": str(env.cfg.envelope.oracle_group_mode),
             "soft_dof_pos_limit": float(env.cfg.envelope.soft_dof_pos_limit),
             "warmup_steps": int(SLConfig().data.warmup_steps),
+            "speed_randomize": bool(getattr(env.cfg.path, "speed_randomize", False)),
+            "speed_resample_steps": int(getattr(env.cfg.path, "speed_resample_steps", 0)),
+            "speed_p_zero": float(getattr(env.cfg.path, "speed_p_zero", 0.0)),
+            "map_acceptance": dict(env.map_data.acceptance),
             "reward_scales": dict(env.reward_scales),
             "n_frames": int(k),
         }

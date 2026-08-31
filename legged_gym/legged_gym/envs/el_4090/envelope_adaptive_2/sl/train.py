@@ -111,6 +111,23 @@ def aux_memory_loss(
     raise ValueError(f"unknown aux_mode: {mode!r}")
 
 
+def aux_head_weights(ks, seq_len: int, beta: float) -> dict:
+    """Equal-budget per-horizon weights for the auxiliary memory probes.
+
+    Each horizon's share follows its valid-sample count ``(L - k) / L`` (a
+    longer horizon provides fewer training pairs and carries a higher
+    irreducible floor), normalised so the *total* auxiliary budget equals
+    ``beta`` regardless of how many heads are enabled -- keeping multi-k runs
+    directly comparable with the single-head C recipe.
+    """
+    ks = sorted(int(k) for k in ks)
+    shares = torch.tensor(
+        [(seq_len - k) / seq_len for k in ks], dtype=torch.float64
+    )
+    total = float(shares.sum())
+    return {k: float(beta) * float(s) / total for k, s in zip(ks, shares)}
+
+
 def s_to_params(s: torch.Tensor) -> torch.Tensor:
     """Normalised extents -> envelope params (the deployment mapping)."""
     from legged_gym.envs.el_4090.envelope_adaptive_2.envelope_oracle import (
@@ -283,9 +300,13 @@ def train(
         net.train()
         perm = torch.randperm(len(tr))
         running = 0.0
-        running_aux = 0.0
+        aux_running = {}      # per-k raw aux loss sums (pre-weight)
         running_safe, safe_frames = 0.0, 0
         aux_beta = float(getattr(cfg.train, "aux_beta", 0.5))
+        aux_w = (
+            aux_head_weights(net.aux_ks, cfg.train.seq_len, 1.0)
+            if net.aux_heads else {}
+        )  # relative shares; beta applied per term below
         for i in range(0, len(tr), bs):
             b = tr[perm[i : i + bs]]
             x = dataset.batch(b).transpose(0, 1).to(dev)
@@ -301,8 +322,8 @@ def train(
             if use_aux:
                 for k_str, head in net.aux_heads.items():
                     aux_l = aux_memory_loss(head(h_seq), y, int(k_str), cfg.model.aux_mode)
-                    loss = loss + aux_beta * aux_l
-                    running_aux += float(aux_l) * len(b)
+                    loss = loss + aux_beta * aux_w[int(k_str)] * aux_l
+                    aux_running[int(k_str)] = aux_running.get(int(k_str), 0.0) + float(aux_l) * len(b)
             if safe_lambda > 0:
                 # flatten the (L, B, ...) window batch into frames: the loss
                 # contract is a flat (N, 5) frame batch with per-frame fields
@@ -323,7 +344,13 @@ def train(
             opt.step()
 
         train_mse = running / len(tr)
-        aux_mse_epoch = running_aux / len(tr) if use_aux else None
+        aux_mse_epoch = (
+            {k: v / len(tr) for k, v in aux_running.items()} if use_aux else None
+        )
+        aux_str = (
+            "[" + " ".join(f"k{k}:{v:.4f}" for k, v in sorted(aux_mse_epoch.items())) + "]"
+            if aux_mse_epoch else ""
+        )
         safe_epoch = running_safe / max(1, safe_frames) if safe_lambda > 0 else None
         is_last = epoch == cfg.train.epochs - 1
         do_val = is_last or ((epoch + 1) % val_every == 0)
@@ -354,7 +381,7 @@ def train(
                 else "val skipped"
             )
             astr = (
-                f"  aux_mse({cfg.model.aux_mode})={aux_mse_epoch:.5f}"
+                f"  aux_mse({cfg.model.aux_mode}){aux_str}"
                 if aux_mse_epoch is not None
                 else ""
             )

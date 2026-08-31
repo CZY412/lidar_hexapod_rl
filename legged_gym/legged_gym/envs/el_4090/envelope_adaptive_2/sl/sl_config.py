@@ -43,8 +43,9 @@ class SLDataConfig:
     #: Parallel environments used during collection.
     num_envs: int = 96
 
-    #: Control steps per collection episode.
-    num_steps: int = 1400
+    #: Control steps per collection episode.  2200 < the 2250-step (45 s)
+    #: episode cap, so every rollout stays a single episode with no done.
+    num_steps: int = 2200
 
     #: LiDAR refresh decimation.  The sensor runs at 10 Hz while control runs at
     #: 50 Hz, so with ``1`` every control step is stored and the SL cadence
@@ -91,21 +92,24 @@ class SLTrainConfig:
     #: Frames per training sequence.  200 frames @ 50 Hz == 4 s of memory,
     #: the horizon where the offline observability scan saturated (R2 = 1.0)
     #: when it was expressed as 40 frames @ 10 Hz.
-    seq_len: int = 200
+    seq_len: int = 400  # 8s memory
 
     #: Stride (in frames) between consecutive window start positions.
     #: 10 frames @ 50 Hz == 0.2 s, the overlap semantics of the historical
     #: stride 2 @ 10 Hz.
-    window_stride: int = 10
+    window_stride: int = 15
 
     #: Store windows as ``uint8``-quantised observations to cut memory ~4x.
     #:
-    #: Windowing expands the source data by roughly ``seq_len / stride`` (20x
-    #: at seq_len=200, stride=10): four maps worth ~0.4 GiB become ~8 GiB of
-    #: float32 tensors.  Quantising the range image to 8 bits trades a
-    #: quantisation error of ~3.2/255 m for a 4x memory reduction, which keeps
-    #: larger corpora feasible.
-    quantise_obs: bool = False
+    #: Windowing expands the source data by roughly ``seq_len / stride`` (~27x
+    #: at seq_len=400, stride=15): the corpus would be ~14 GiB of float32 and
+    #: the build-time concat peak ~28 GiB.  Quantising the range image to 8
+    #: bits keeps the peak ~7 GiB.  NOTE: the range channels span [0, 1] --
+    #: only the upper half of the [-1, 1] uint8 range -- so their effective
+    #: step is ~2.5 cm (not the 1.3 cm a full-scale read would give).  That is
+    #: well inside the 2 % multiplicative sensor noise the net already sees,
+    #: and deployment consumes float observations (strictly finer).
+    quantise_obs: bool = True
 
     epochs: int = 50
     batch_size: int = 64
