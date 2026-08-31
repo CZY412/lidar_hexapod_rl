@@ -75,5 +75,7 @@ legged_gym/envs/el_4090/safe/data/
 !legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/
 !legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/runs/
 legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/data/*.pt
+# Archived corpora (e.g. data_50hz_1ms/) stay out of git as well.
+legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/data_*/
 legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/runs/*/
 legged_gym/scripts/play_datas/
