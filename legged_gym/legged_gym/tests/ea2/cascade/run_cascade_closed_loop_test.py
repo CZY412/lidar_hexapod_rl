@@ -21,7 +21,7 @@ import sys
 import torch
 
 if not any(arg.startswith("--task") for arg in sys.argv):
-    sys.argv += ["--task", "el4090_cascade"]
+    sys.argv += ["--task", "el4090_cascade_83"]
 if "--headless" not in sys.argv:
     sys.argv.append("--headless")
 
@@ -45,7 +45,7 @@ def main() -> int:
         if not cond:
             failures.append(name)
 
-    env_cfg, _ = task_registry.get_cfgs(name="el4090_cascade")
+    env_cfg, _ = task_registry.get_cfgs(name="el4090_cascade_83")
     env_cfg.env.num_envs = 1
     env_cfg.env.episode_length_s = 20.0  # no timeout inside the test window
     env_cfg.terrain.num_rows = 1
@@ -59,7 +59,7 @@ def main() -> int:
     env_cfg.commands.resampling_time = 99999
 
     args = get_args()
-    env, _ = task_registry.make_env(name="el4090_cascade", args=args, env_cfg=env_cfg)
+    env, _ = task_registry.make_env(name="el4090_cascade_83", args=args, env_cfg=env_cfg)
     # 构造期初始姿态与地形穿插（上游既有行为）：先做一次正规 reset。
     env.reset_idx(torch.arange(env.num_envs, device=env.device))
 

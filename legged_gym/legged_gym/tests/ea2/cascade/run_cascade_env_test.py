@@ -1,6 +1,6 @@
 """Isaac-in-the-loop cascade env integration test (headless, no SE2 policy).
 
-Constructs the registered ``el4090_cascade`` env and steps it with small
+Constructs the registered ``el4090_cascade_83`` env and steps it with small
 random locomotion actions (the SE2 checkpoint is NOT required), asserting:
 
 * T0 static contracts: 50 Hz control, 83-dim obs, lidar/heights off,
@@ -32,7 +32,7 @@ import torch
 
 # ── defaults for standalone invocation ──────────────────────────────────
 if not any(arg.startswith("--task") for arg in sys.argv):
-    sys.argv += ["--task", "el4090_cascade"]
+    sys.argv += ["--task", "el4090_cascade_83"]
 if "--headless" not in sys.argv:
     sys.argv.append("--headless")
 
@@ -67,7 +67,7 @@ def build_env(args, env_cfg):
     env_cfg.domain_rand.randomize_friction = False
     env_cfg.domain_rand.push_robots = False
     env_cfg.commands.resampling_time = 99999
-    env, _ = task_registry.make_env(name="el4090_cascade", args=args, env_cfg=env_cfg)
+    env, _ = task_registry.make_env(name="el4090_cascade_83", args=args, env_cfg=env_cfg)
     # 构造期初始姿态与地形穿插（上游既有行为）：先做一次正规 reset。
     env.reset_idx(torch.arange(env.num_envs, device=env.device))
     return env
@@ -226,7 +226,7 @@ def main() -> int:
         {"name": "--birth-condition", "type": str, "default": "max",
          "help": "ea2.reset_condition variant (max | midpoint)"},
     ]
-    env_cfg, _ = task_registry.get_cfgs(name="el4090_cascade")
+    env_cfg, _ = task_registry.get_cfgs(name="el4090_cascade_83")
     env_cfg.ea2.debug_stats = True
     variant = "main"
 

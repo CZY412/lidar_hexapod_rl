@@ -18,11 +18,11 @@
 
 ## 加载路径
 
-- `ea2_envelope.pt`：`El4090CascadeCfg.ea2.checkpoint` → `ea2_policy.Ea2Policy`
+- `ea2_envelope.pt`：`El4090Cascade83Cfg.ea2.checkpoint` → `ea2_policy.Ea2Policy`
   （严格 state_dict 加载；遇 `empirical_normalization` 字段显式报错）。
-- `policy_1.pt`：`El4090CascadeCfg.se2_policy.checkpoint` → `play_cascade.py`
+- `policy_1.pt`：`El4090Cascade83Cfg.se2_policy.checkpoint` → `play_cascade.py`
   / 测试脚本 `torch.jit.load` 直接消费（无 rsl_rl runner 依赖）。
-- `haa_range.pt`：`El4090CascadeCfg.haa_swing_range.network_checkpoint`
+- `haa_range.pt`：`El4090Cascade83Cfg.haa_swing_range.network_checkpoint`
   **覆盖**了继承的 SE2 指针；加载时 `HaaRangeNetwork.from_checkpoint` 会校验
   condition_names 一致性。
 
@@ -30,7 +30,7 @@
 
 1. **EA2 感知**：`sl.scripts.export --run-name <new>` → 拷贝
    `logs/el4090_ea2/<new>/model_0.pt` 到本目录 → 若 soft_dof_pos_limit /
-   action_max 有变，同步 `El4090CascadeCfg.ea2.fold_scale`（env 构造时断言
+   action_max 有变，同步 `El4090Cascade83Cfg.ea2.fold_scale`（env 构造时断言
    `soft/(2*action_max) == fold_scale`，陈旧折叠会直接抛错）→ 更新本表。
 2. **SE2 步态**：训练侧 `export_policy_as_jit` 导出 → 覆盖 `policy_1.pt`
    → 更新本表（来源与日期）。

@@ -1,4 +1,4 @@
-"""el4090_cascade 键盘 play：SE2 步态 + EA2 点云→包络感知全链路演示。
+"""el4090_cascade_83 键盘 play：SE2 步态 + EA2 点云→包络感知全链路演示。
 
 结构来源：
 
@@ -28,13 +28,13 @@ from collections import deque
 import numpy as np
 import torch
 
-import legged_gym.envs.el_4090.envelope_cascade_83  # noqa: F401,E402 -- 注册 el4090_cascade
+import legged_gym.envs.el_4090.envelope_cascade_83  # noqa: F401,E402 -- 注册 el4090_cascade_83
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs.el_4090.envelope_cascade_83.ea2_perception import yaw_quat
 from legged_gym.utils import get_args, task_registry
 from legged_gym.utils.math_utils import quat_apply, quat_apply_yaw
 
-TASK_NAME = "el4090_cascade"
+TASK_NAME = "el4090_cascade_83"
 
 # ── 按键映射（与 play_keyboard.py 一致）────────────────────────────────
 HELD_ACTIONS = {

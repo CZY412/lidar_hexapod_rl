@@ -1,4 +1,4 @@
-"""EL_4090_CASCADE: SE2 locomotion driven by EA2 point-cloud perception.
+"""EL_4090_CASCADE_83: SE2 locomotion driven by EA2 point-cloud perception.
 
 Data flow per control step (50 Hz):
 
@@ -29,7 +29,7 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs.el_4090.envelope_cascade_83.ea2_perception import Ea2Perception
 from legged_gym.envs.el_4090.envelope_cascade_83.ea2_policy import Ea2Policy
 from legged_gym.envs.el_4090.envelope_cascade_83.el4090_cascade_config import (
-    El4090CascadeCfg,
+    El4090Cascade83Cfg,
 )
 from legged_gym.envs.el_4090.envelope_cascade_83.envelope_bridge import EnvelopeBridge
 from legged_gym.envs.el_4090.envelope_cascade_83.se2_frozen.env import EL_4090_SE2_83
@@ -38,19 +38,19 @@ _COMMAND_NAMES = ("lin_vel_x", "lin_vel_y", "ang_vel_yaw")
 _GEOMETRY_NAMES = ("front_width", "middle_width", "back_width", "forward_limit")
 
 
-class EL_4090_CASCADE(EL_4090_SE2_83):
+class EL_4090_CASCADE_83(EL_4090_SE2_83):
     """Envelope-cascade EL4090: EA2 perception replaces sampled envelopes."""
 
-    cfg: El4090CascadeCfg
+    cfg: El4090Cascade83Cfg
 
     def __init__(
         self,
-        cfg: El4090CascadeCfg,
+        cfg: El4090Cascade83Cfg,
         sim_params,
         physics_engine,
         sim_device,
         headless,
-        task_name: str = "el4090_cascade",
+        task_name: str = "el4090_cascade_83",
     ):
         self._cascade_ready = False
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless, task_name)

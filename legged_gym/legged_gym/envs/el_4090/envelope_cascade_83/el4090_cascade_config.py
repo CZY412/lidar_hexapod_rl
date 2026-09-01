@@ -1,4 +1,4 @@
-"""Configuration for the ``el4090_cascade`` demo task.
+"""Configuration for the ``el4090_cascade_83`` demo task.
 
 Inherits the full SE2 locomotion config (83-dim MLP policy, HAA range
 network, P control) and adds an ``ea2`` namespace holding everything the
@@ -19,7 +19,7 @@ from legged_gym.envs.el_4090.envelope_cascade_83.se2_frozen.config import (
 )
 
 
-class El4090CascadeCfg(El4090Se2_83Cfg):
+class El4090Cascade83Cfg(El4090Se2_83Cfg):
     class terrain(El4090Se2_83Cfg.terrain):
         mesh_type = "trimesh"  # warp raycast mesh is built from this terrain
         terrain_length = 16.0
@@ -115,7 +115,7 @@ class El4090CascadeCfg(El4090Se2_83Cfg):
         fold_scale = 0.11875
 
 
-class El4090CascadeCfgPPO(El4090Se2_83CfgPPO):
+class El4090Cascade83CfgPPO(El4090Se2_83CfgPPO):
     """Demo task: training config inherited from the frozen 83-dim SE2 layer.
 
     ``runner.experiment_name`` intentionally diverges from SE2's shared

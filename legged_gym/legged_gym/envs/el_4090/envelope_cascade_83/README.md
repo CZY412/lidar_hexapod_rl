@@ -14,16 +14,16 @@
                                         SE2 步态策略(83→18) ─→ 机器人
 ```
 
-本包**自注册** `el4090_cascade` 任务（导入即注册，未改动 `envs/__init__.py`
+本包**自注册** `el4090_cascade_83` 任务（导入即注册，未改动 `envs/__init__.py`
 等任何包外文件）。`ea2.enable=False` 可一键回退纯 SE2 行为（随机包络）。
 
 ## 文件结构
 
 ```text
-envelope_cascade/
+envelope_cascade_83/
 ├── __init__.py               # 任务注册（幂等）
-├── el4090_cascade_config.py  # El4090CascadeCfg / El4090CascadeCfgPPO
-├── el4090_cascade_env.py     # EL_4090_CASCADE(EL_4090_ENVELOP_2)
+├── el4090_cascade_config.py  # El4090Cascade83Cfg / El4090Cascade83CfgPPO
+├── el4090_cascade_env.py     # EL_4090_CASCADE_83(EL_4090_SE2_83)
 ├── ea2_perception.py         # 187 射线 reduced raycast + 10Hz 时钟 + obs190
 ├── ea2_policy.py             # ActorCriticRecurrent 手工构造 + strict 加载
 ├── envelope_bridge.py        # raw a5 → params5 → condition8
@@ -76,7 +76,7 @@ conda activate el4090; PATH=/home/t3chichi/anaconda3/envs/el4090/bin:$PATH
 cd el4090_legged_gym
 
 # 演示（策略已全部 pin 在 checkpoints/，无外部依赖）
-python legged_gym/legged_gym/scripts/play_cascade.py --task=el4090_cascade --num_envs 1
+python legged_gym/legged_gym/scripts/play_cascade.py --task=el4090_cascade_83 --num_envs 1
 #   w/s/a/d/q/e 移动转向, 1/2/3 档位, x/空格 急停, v 点云/包络可视化, ESC 退出
 #   --max_steps N 限步运行（headless 冒烟用）
 

@@ -17,10 +17,10 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_config import (
 )
 from legged_gym.envs.el_4090.envelope_cascade_83.ea2_policy import Ea2Policy
 from legged_gym.envs.el_4090.envelope_cascade_83.envelope_bridge import EnvelopeBridge
-from legged_gym.envs.el_4090.spider_envelop_2.el4090_spider_config import (
-    El4090Envelop2Cfg,
+from legged_gym.envs.el_4090.envelope_cascade_83.se2_frozen.config import (
+    El4090Se2_83Cfg,
 )
-from legged_gym.envs.el_4090.spider_envelop_2.envelope_condition import (
+from legged_gym.envs.el_4090.envelope_cascade_83.se2_frozen.envelope_condition import (
     EnvelopeConditionState,
 )
 from legged_gym.utils.envelop.network.haa_swing_range import (
@@ -35,7 +35,7 @@ _LOGS_CKPT = Path(__file__).resolve().parents[4] / "logs" / "el4090_ea2" / "v2_m
 
 
 def _make_envelope_state(num_envs: int = 3) -> EnvelopeConditionState:
-    env_cfg = El4090Envelop2Cfg.envelope
+    env_cfg = El4090Se2_83Cfg.envelope
 
     class _Ranges:
         pass

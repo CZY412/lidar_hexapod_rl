@@ -1,20 +1,20 @@
 """envelope_cascade_83: SE2 locomotion + EA2 point-cloud envelope perception.
 
-Importing this package self-registers the ``el4090_cascade`` task with
+Importing this package self-registers the ``el4090_cascade_83`` task with
 ``task_registry`` (same pattern as the tasks in ``legged_gym.envs``, but
 kept inside the cascade package so no file outside it is modified).
 """
 
 from legged_gym.envs.el_4090.envelope_cascade_83.el4090_cascade_config import (
-    El4090CascadeCfg,
-    El4090CascadeCfgPPO,
+    El4090Cascade83Cfg,
+    El4090Cascade83CfgPPO,
 )
 from legged_gym.envs.el_4090.envelope_cascade_83.el4090_cascade_env import (
-    EL_4090_CASCADE,
+    EL_4090_CASCADE_83,
 )
 from legged_gym.utils.task_registry import task_registry
 
-TASK_NAME = "el4090_cascade"
+TASK_NAME = "el4090_cascade_83"
 
 
 def register_cascade() -> None:
@@ -22,18 +22,18 @@ def register_cascade() -> None:
     if TASK_NAME not in task_registry.task_classes:
         task_registry.register(
             TASK_NAME,
-            EL_4090_CASCADE,
-            El4090CascadeCfg(),
-            El4090CascadeCfgPPO(),
+            EL_4090_CASCADE_83,
+            El4090Cascade83Cfg(),
+            El4090Cascade83CfgPPO(),
         )
 
 
 register_cascade()
 
 __all__ = [
-    "EL_4090_CASCADE",
-    "El4090CascadeCfg",
-    "El4090CascadeCfgPPO",
+    "EL_4090_CASCADE_83",
+    "El4090Cascade83Cfg",
+    "El4090Cascade83CfgPPO",
     "TASK_NAME",
     "register_cascade",
 ]
