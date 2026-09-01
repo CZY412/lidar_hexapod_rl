@@ -65,4 +65,17 @@ __pycache__
 # local pictures/assets
 legged_gym/utils/picutres/
 legged_gym/envs/el_4090/safe/data/
+
+# EA2 supervised-learning artifacts.
+# The bare `logs` / `runs` patterns above match at any depth, so they also
+# swallow sl/logs.  Re-include the directory skeleton first (git cannot
+# re-include a file whose parent directory is excluded), then ignore the
+# regenerable contents: collected rollouts (~22 MiB per map) and per-run
+# checkpoints.
+!legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/
+!legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/runs/
+legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/data/*.pt
+# Archived corpora (e.g. data_50hz_1ms/) stay out of git as well.
+legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/data_*/
+legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/runs/*/
 legged_gym/scripts/play_datas/

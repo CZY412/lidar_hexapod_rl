@@ -80,10 +80,13 @@ The usual evaluation loop is `play.py` with `--checkpoint=-1` and either a speci
 python legged_gym/scripts/play.py --task=el4090_spider_normal --num_envs=48 --checkpoint=-1 --resume
 python legged_gym/scripts/play.py --task=el_4090_safe --num_envs=48 --checkpoint=-1 --resume
 ```
+
 ### 使用独显模式
 ```bash
-__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia python legged_gym/legged_gym/scripts/play.py --task=el4090_tripod2_low --num_envs=12 --checkpoint=-1
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json python legged_gym/legged_gym/scripts/play.py --task=el4090_tripod2_low --num_envs=12 --checkpoint=-1
 __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json python legged_gym/legged_gym/scripts/play.py --task=el4090_lidar_tripod2_low --num_envs 16 --checkpoint -1 --load_run 4090-1
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json python legged_gym/legged_gym/scripts/play_ea2.py --task el4090_ea2 --num_envs 1
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json && python legged_gym/legged_gym/scripts/play_ea2.py --task=el4090_ea2 --load_run baseline --checkpoint 0 --num_envs 1
 ```
 
 ### Behavior Policies
@@ -178,6 +181,21 @@ python scripts/data_collection_gym/collect.py \
 3. Inspect the latest checkpoint with `play.py` using `--num_envs=48`.
 4. Once gait quality is acceptable, collect a short `10k` to `50k` zarr first.
 5. Only then start long data-collection jobs.
+
+---
+
+## Envelope Tasks Landscape (post feat/el_4090_2 merge, 2026-09)
+
+| Task | SE2 侧观测 | 状态 |
+|---|---|---|
+| `el4090_envelop_2`（SE2 主线） | **68 维** | 合并后主线：range priors 已从策略观测移除（主分支 `6cb4e49`）。旧 83 维 checkpoint 不可加载；重训出 68 维权重前 `play_envelop_2.py` 无可用 checkpoint |
+| `el4090_ea2` | —（190 维感知） | 活跃主线：SL 数据采集与训练不受合并影响 |
+| `el4090_cascade_83` | **83 维（冻结）** | 遗留合并演示：EA2 感知 → 冻结 SE2 步态（`se2_frozen/` + `policy_1.pt` TorchScript，md5 钉死于契约测试）。`play_cascade.py --task el4090_cascade_83` |
+| `el4090_cascade_68`（规划中） | 68 维 | 未来基于新 SE2 架构 + 新训练 policy 的级联任务；EA2 GRU 权重与 `EnvelopeBridge` 可直接复用（`set_envelope_condition` 接口在 68 维主线保留） |
+
+- envelope 数学库已包化为 `el4090_envelope/`：跑包内测试前 `pip install -e ./el4090_envelope`；旧路径 `legged_gym.utils.envelop.kinematic_envelope` 仍为兼容 facade（注意本仓库的既有导入顺序约定：先 import `legged_gym.envs` 下的模块，再 import `legged_gym.utils.*`）。
+- `el4090_cascade_83` 的 PPO 训练目录独立为 `el4090_cascade_83_p_haa_range`，与 SE2 主线目录 `el_4090_envelop_2_p_haa_range` 隔离，防止 68 维产物被 83 维任务误加载。
+- 细节见 `envs/el_4090/envelope_cascade_83/README.md` 及其 `checkpoints/README.md`。
 
 ---
 
