@@ -147,6 +147,32 @@ class El4090EA2Cfg(LeggedRobotCfg):
         random_distance_noise = 0.0
         random_angle_noise = 0.0
 
+    class attitude:
+        """Continuous body-attitude replay during collection (design v3.1).
+
+        Replays the measured real-robot pitch/roll/height trajectory so the
+        network sees body-tilt-induced ground-return compression paired with
+        open-ground oracle targets (fixes open-field false contraction).
+        Default OFF — old corpora remain exactly reproducible.  See
+        attitude_replay.py for the signal model and the pinned numeric
+        sign convention (pitch > 0 = nose-down, verified against the real
+        robot's recorded ray rows).
+        """
+
+        enable = False
+        source = (
+            "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"
+            "envelope_adaptive_2/attitude_traj_source.npz"
+        )
+        ratio_tau = 0.5              # s, low-pass on the speed->amplitude ratio
+        trim_range = [-2.0, 2.0]     # deg, per-episode pitch trim offset
+        scale_range = [0.85, 1.2]    # oscillation amplitude scale
+        rate_range = [0.9, 1.1]      # playback rate (gait freq is speed-invariant)
+        ar_std = 0.3                 # deg, per-episode AR(1) residual
+        fade_steps = 100             # 2 s cosine crossfade at loop junctions
+        std_law_k = 0.858            # pitch_std(v) ≈ k·v + b (deg), R²=0.93
+        std_law_b = 0.318
+
     class envelope:
         margin = 0.10                    # safe-distance threshold for clearance penalty (m)
         soft_margin = 0.10               # width over which the violation ramps to 1 (m)

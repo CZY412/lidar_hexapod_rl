@@ -62,6 +62,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--num-steps", type=int, default=None,
                     help="override cfg.data.num_steps (default: config value, 2200)")
     ap.add_argument("--out-dir", default=None, help=f"default: {SL_DATA_DIR}")
+    ap.add_argument("--attitude", action="store_true",
+                    help="enable continuous attitude replay (pitch/roll/height) during collection")
     ap.add_argument(
         "--print-summary",
         action="store_true",
@@ -87,13 +89,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             num_steps=args.num_steps,
             lidar_decimation=cfg.data.lidar_decimation,
             pillar_count=count,
+            attitude=args.attitude,
         )
         ds.save_map(data, path)
         meta = data.meta
         print(
             f"[collect] seed={seed} frames={data.obs.shape[0]} envs={data.obs.shape[1]} "
             f"margin={meta['oracle_margin']} group={meta['oracle_group_mode']} "
-            f"pillar_count={count} -> {path} ({time.time() - t0:.0f}s)"
+            f"pillar_count={count} attitude={args.attitude} -> {path} ({time.time() - t0:.0f}s)"
         )
 
     if args.print_summary:

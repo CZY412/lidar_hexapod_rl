@@ -21,6 +21,9 @@ import torch
 
 from legged_gym.envs.base.base_task import BaseTask
 from legged_gym.envs.el_4090.envelope_adaptive_2 import _contracts as ea2c
+from legged_gym.envs.el_4090.envelope_adaptive_2.attitude_replay import (
+    AttitudeReplay,
+)
 from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_config import (
     El4090EA2Cfg,
 )
@@ -653,6 +656,21 @@ class EL_4090_EA2(BaseTask):
         self._rng = np.random.default_rng(int(getattr(self.cfg, "seed", 42)) + 1)
         self._speed_rng = torch.Generator(device=device)
         self._speed_rng.manual_seed(int(getattr(self.cfg, "seed", 42)) + 2)
+        if bool(getattr(self.cfg, "attitude", None) is not None
+                and getattr(self.cfg.attitude, "enable", False)):
+            self._attitude = AttitudeReplay(
+                num_envs=n,
+                device=device,
+                dt=self.dt,
+                max_episode_length=self.max_episode_length,
+                source_path=self.cfg.attitude.source,
+                cfg=self.cfg.attitude,
+                seed=int(getattr(self.cfg, "seed", 42)) + 7,
+            )
+            self.attitude_pitch = torch.zeros(n, dtype=torch.float32, device=device)
+            self.attitude_roll = torch.zeros(n, dtype=torch.float32, device=device)
+        else:
+            self._attitude = None
 
     def _init_lidar(self):
         """Initialize the Warp mesh and the shared LidarSensor instance."""
@@ -775,12 +793,16 @@ class EL_4090_EA2(BaseTask):
             return
 
         import warp as wp
-        from isaacgym.torch_utils import quat_apply, quat_mul
+        from isaacgym.torch_utils import quat_apply, quat_from_euler_xyz, quat_mul
         from legged_gym.utils.LidarSensor.sensor_kernels.lidar_kernels_warp import (
             LidarWarpKernels,
         )
 
         current_q = yaw_quat_from_heading(self.heading)
+        if getattr(self, "_attitude", None) is not None:
+            zeros = torch.zeros_like(self.attitude_roll)
+            tilt = quat_from_euler_xyz(self.attitude_roll, self.attitude_pitch, zeros)
+            current_q = quat_mul(current_q, tilt)
         self.sensor_quat_tensor.copy_(
             quat_mul(current_q, self._sensor_offset_quat)
         )
@@ -945,6 +967,12 @@ class EL_4090_EA2(BaseTask):
             green = green[::stride]
             n = pts_body.shape[0]
             base_q = yaw_quat_from_heading(self.heading[eid:eid + 1]).expand(n, 4)
+            if getattr(self, "_attitude", None) is not None:
+                from isaacgym.torch_utils import quat_from_euler_xyz as _qfe
+                tilt = _qfe(self.attitude_roll[eid:eid + 1],
+                            self.attitude_pitch[eid:eid + 1],
+                            torch.zeros(1, device=self.device))
+                base_q = quat_mul(base_q[0:1], tilt).expand(n, 4)
             pts_world = self.base_pos[eid:eid + 1] + quat_apply(base_q, pts_body)
             pts_world = pts_world.detach().cpu().numpy()
             red_pts = pts_world[red.cpu().numpy()]
@@ -1227,6 +1255,11 @@ class EL_4090_EA2(BaseTask):
         self.range_image[env_id] = self.range_max
         if self._oracle_smoother is not None:
             self._oracle_smoother.reset_ids([env_id])
+        if getattr(self, "_attitude", None) is not None:
+            self._attitude.reset(
+                torch.tensor([env_id], device=self.device),
+                self.v[env_id:env_id + 1].detach(),
+            )
 
     def _log_segment(self, env_ids):
         """Log accumulated reward sums for a set of envs and reset the sums.
@@ -1368,6 +1401,11 @@ class EL_4090_EA2(BaseTask):
         if bool(reached.any()):
             pending = reached.nonzero(as_tuple=False).flatten().tolist()
             self._batch_replan(pending)
+        if getattr(self, "_attitude", None) is not None:
+            pitch, roll, height = self._attitude.step(self.v)
+            self.base_pos[:, 2] = height
+            self.attitude_pitch = pitch
+            self.attitude_roll = roll
 
     def _compute_hex_world(self) -> "torch.Tensor":
         """Return world-frame offset hexagon vertices for all envs (CPU)."""

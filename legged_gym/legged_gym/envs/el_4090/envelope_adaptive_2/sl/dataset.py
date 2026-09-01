@@ -64,6 +64,7 @@ def build_env(
     pillar_count: Optional[int] = None,
     sim_device: str = "cuda:0",
     headless: bool = True,
+    attitude: bool = False,
 ):
     """Construct an ``EL_4090_EA2`` without going through ``task_registry``.
 
@@ -86,6 +87,8 @@ def build_env(
     if pillar_count is not None:
         cfg.obstacles.pillar_count_min = int(pillar_count)
         cfg.obstacles.pillar_count_max = int(pillar_count)
+    if attitude:
+        cfg.attitude.enable = True
 
     sim_params = gymapi.SimParams()
     sim_params.dt = cfg.sim.dt
@@ -124,6 +127,7 @@ def collect_map(
     lidar_decimation: Optional[int] = None,
     pillar_count: Optional[int] = None,
     device: str = "cuda:0",
+    attitude: bool = False,
 ) -> MapData:
     """Run one zero-action rollout and return the collected tensors.
 
@@ -138,7 +142,7 @@ def collect_map(
         lidar_decimation = SLConfig().data.lidar_decimation
     if num_steps is None:
         num_steps = SLConfig().data.num_steps
-    env = build_env(seed, num_envs, pillar_count)
+    env = build_env(seed, num_envs, pillar_count, attitude=attitude)
     try:
         env.reset()
         dev = env.device
@@ -179,6 +183,8 @@ def collect_map(
             "speed_randomize": bool(getattr(env.cfg.path, "speed_randomize", False)),
             "speed_resample_steps": int(getattr(env.cfg.path, "speed_resample_steps", 0)),
             "speed_p_zero": float(getattr(env.cfg.path, "speed_p_zero", 0.0)),
+            "attitude": bool(getattr(env.cfg.attitude, "enable", False)),
+            "attitude_source": str(getattr(env.cfg.attitude, "source", "")),
             "map_acceptance": dict(env.map_data.acceptance),
             "reward_scales": dict(env.reward_scales),
             "n_frames": int(k),
