@@ -30,7 +30,7 @@ if not any(arg.startswith("--task") for arg in sys.argv):
 if "--headless" not in sys.argv:
     sys.argv.append("--headless")
 
-import legged_gym.envs.el_4090.envelope_cascade  # noqa: F401,E402
+import legged_gym.envs.el_4090.envelope_cascade_83  # noqa: F401,E402
 from legged_gym.envs.el_4090.envelope_adaptive_2.airy_mount import (  # noqa: E402
     load_selected_channels,
 )

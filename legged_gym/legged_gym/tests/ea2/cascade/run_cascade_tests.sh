@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run all envelope_cascade tests with the project conda env.
+# Run all envelope_cascade_83 tests with the project conda env.
 #
 # Layout:
 #   1. pytest (contracts + perception, no Isaac sim)

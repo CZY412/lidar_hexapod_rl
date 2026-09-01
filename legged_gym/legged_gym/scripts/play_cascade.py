@@ -10,7 +10,7 @@
 * 状态行 —— ``params5`` / LiDAR 刷新计数 / stale env 数 / EA2 输出有限性。
 
 依赖：``logs/<SE2 experiment>/model_*.pt``（envelop_2 步态大模型）；
-EA2 感知权重已 pin 在 ``envelope_cascade/checkpoints/``。
+EA2 感知权重已 pin 在 ``envelope_cascade_83/checkpoints/``。
 """
 
 import isaacgym  # noqa: F401  -- Isaac Gym 必须先于 legged_gym 导入
@@ -28,9 +28,9 @@ from collections import deque
 import numpy as np
 import torch
 
-import legged_gym.envs.el_4090.envelope_cascade  # noqa: F401,E402 -- 注册 el4090_cascade
+import legged_gym.envs.el_4090.envelope_cascade_83  # noqa: F401,E402 -- 注册 el4090_cascade
 from legged_gym import LEGGED_GYM_ROOT_DIR
-from legged_gym.envs.el_4090.envelope_cascade.ea2_perception import yaw_quat
+from legged_gym.envs.el_4090.envelope_cascade_83.ea2_perception import yaw_quat
 from legged_gym.utils import get_args, task_registry
 from legged_gym.utils.math_utils import quat_apply, quat_apply_yaw
 
@@ -341,7 +341,7 @@ def play(args):
     se2_ckpt = str(env_cfg.se2_policy.checkpoint).format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
     if not os.path.exists(se2_ckpt):
         raise FileNotFoundError(
-            f"SE2 步态策略未找到: {se2_ckpt}（见 envelope_cascade/checkpoints/README.md）"
+            f"SE2 步态策略未找到: {se2_ckpt}（见 envelope_cascade_83/checkpoints/README.md）"
         )
     policy = torch.jit.load(se2_ckpt, map_location=env.device)
     policy.eval()

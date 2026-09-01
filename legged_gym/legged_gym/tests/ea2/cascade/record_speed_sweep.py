@@ -16,7 +16,7 @@ if not any(arg.startswith("--task") for arg in sys.argv):
 if "--headless" not in sys.argv:
     sys.argv.append("--headless")
 
-import legged_gym.envs.el_4090.envelope_cascade  # noqa: F401,E402
+import legged_gym.envs.el_4090.envelope_cascade_83  # noqa: F401,E402
 from legged_gym.utils import get_args, task_registry  # noqa: E402
 
 SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]

@@ -63,7 +63,7 @@ class El4090CascadeCfg(El4090Envelop2Cfg):
         # checkpoints/README.md).
         network_checkpoint = (
             "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"
-            "envelope_cascade/checkpoints/haa_range.pt"
+            "envelope_cascade_83/checkpoints/haa_range.pt"
         )
 
     class se2_policy:
@@ -72,7 +72,7 @@ class El4090CascadeCfg(El4090Envelop2Cfg):
 
         checkpoint = (
             "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"
-            "envelope_cascade/checkpoints/policy_1.pt"
+            "envelope_cascade_83/checkpoints/policy_1.pt"
         )
 
     class ea2:
@@ -87,7 +87,7 @@ class El4090CascadeCfg(El4090Envelop2Cfg):
         # val R²=0.738）；旧 v2_multik 权重保留于 ea2_envelope.pt 可秒回滚
         checkpoint = (
             "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"
-            "envelope_cascade/checkpoints/ea2_envelope_v3att.pt"
+            "envelope_cascade_83/checkpoints/ea2_envelope_v3att.pt"
         )
         channel_file = (
             "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"

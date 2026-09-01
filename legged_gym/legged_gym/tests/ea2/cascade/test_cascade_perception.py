@@ -23,7 +23,7 @@ from legged_gym.envs.el_4090.envelope_adaptive_2.airy_mount import (
 from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_env import (
     assemble_observation,
 )
-from legged_gym.envs.el_4090.envelope_cascade.ea2_perception import (
+from legged_gym.envs.el_4090.envelope_cascade_83.ea2_perception import (
     Ea2Perception,
     yaw_quat,
 )

@@ -15,8 +15,8 @@ import torch
 from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_config import (
     El4090EA2Cfg,
 )
-from legged_gym.envs.el_4090.envelope_cascade.ea2_policy import Ea2Policy
-from legged_gym.envs.el_4090.envelope_cascade.envelope_bridge import EnvelopeBridge
+from legged_gym.envs.el_4090.envelope_cascade_83.ea2_policy import Ea2Policy
+from legged_gym.envs.el_4090.envelope_cascade_83.envelope_bridge import EnvelopeBridge
 from legged_gym.envs.el_4090.spider_envelop_2.el4090_spider_config import (
     El4090Envelop2Cfg,
 )
@@ -29,7 +29,7 @@ from legged_gym.utils.envelop.network.haa_swing_range import (
 )
 from legged_gym.envs.el_4090.envelope_adaptive_2 import _contracts as ea2c
 
-_CASCADE_DIR = Path(__file__).resolve().parents[3] / "envs" / "el_4090" / "envelope_cascade"
+_CASCADE_DIR = Path(__file__).resolve().parents[3] / "envs" / "el_4090" / "envelope_cascade_83"
 _PINNED_CKPT = _CASCADE_DIR / "checkpoints" / "ea2_envelope.pt"
 _LOGS_CKPT = Path(__file__).resolve().parents[4] / "logs" / "el4090_ea2" / "v2_multik" / "model_0.pt"
 

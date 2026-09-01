@@ -26,12 +26,12 @@ from __future__ import annotations
 import torch
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
-from legged_gym.envs.el_4090.envelope_cascade.ea2_perception import Ea2Perception
-from legged_gym.envs.el_4090.envelope_cascade.ea2_policy import Ea2Policy
-from legged_gym.envs.el_4090.envelope_cascade.el4090_cascade_config import (
+from legged_gym.envs.el_4090.envelope_cascade_83.ea2_perception import Ea2Perception
+from legged_gym.envs.el_4090.envelope_cascade_83.ea2_policy import Ea2Policy
+from legged_gym.envs.el_4090.envelope_cascade_83.el4090_cascade_config import (
     El4090CascadeCfg,
 )
-from legged_gym.envs.el_4090.envelope_cascade.envelope_bridge import EnvelopeBridge
+from legged_gym.envs.el_4090.envelope_cascade_83.envelope_bridge import EnvelopeBridge
 from legged_gym.envs.el_4090.spider_envelop_2.el_4090 import EL_4090_ENVELOP_2
 
 _COMMAND_NAMES = ("lin_vel_x", "lin_vel_y", "ang_vel_yaw")
@@ -71,7 +71,7 @@ class EL_4090_CASCADE(EL_4090_ENVELOP_2):
                 f"{self._cascade_bridge.fold_scale:.6f} but the pinned "
                 f"checkpoint was folded with {float(ea2.fold_scale):.6f} "
                 "(re-export the EA2 policy or update ea2.fold_scale; see "
-                "envelope_cascade/checkpoints/README.md)"
+                "envelope_cascade_83/checkpoints/README.md)"
             )
         checkpoint = str(ea2.checkpoint).format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
         self._cascade_policy = Ea2Policy(checkpoint, self.device)
