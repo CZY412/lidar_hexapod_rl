@@ -1,4 +1,4 @@
-# envelope_cascade：EA2 点云感知 → SE2 包络步态 合并演示
+# envelope_cascade_83：EA2 点云感知 → SE2 包络步态 合并演示（冻结 83 维契约）
 
 将两个已训练任务串成一条 50 Hz 推理链：
 
@@ -24,6 +24,8 @@ envelope_cascade_83/
 ├── __init__.py               # 任务注册（幂等）
 ├── el4090_cascade_config.py  # El4090Cascade83Cfg / El4090Cascade83CfgPPO
 ├── el4090_cascade_env.py     # EL_4090_CASCADE_83(EL_4090_SE2_83)
+├── se2_frozen/               # 冻结 83 维 SE2 层（env/config/envelope_condition，
+│                             #   源自 spider_envelop_2@fd527a8 逐字拷贝，勿改动）
 ├── ea2_perception.py         # 187 射线 reduced raycast + 10Hz 时钟 + obs190
 ├── ea2_policy.py             # ActorCriticRecurrent 手工构造 + strict 加载
 ├── envelope_bridge.py        # raw a5 → params5 → condition8
@@ -41,12 +43,13 @@ tests/ea2/cascade/            # 契约测试 + Isaac 环境级测试
 | SE2 步态策略 | `checkpoints/policy_1.pt`（TorchScript，83→18；`torch.jit.load` 直接消费，不依赖 rsl_rl/logs） |
 | HAA 范围网络 | `checkpoints/haa_range.pt`（`spider_envelop_2/envelop_network/haa_range.pt` 的逐字节拷贝，配置指针已覆盖为包内路径） |
 | EA2 感知代码 | `envelope_adaptive_2/` 的 `airy_mount.load_selected_channels` / `range_image.build_selected_range_image` / `el_4090_ea2_env.assemble_observation·map_actions_to_params·refresh_range_image_from_scan` / `envelope_geometry.envelope_params_to_condition` / `LidarSensor.apply_noise` / `LidarWarpKernels.draw_optimized_kernel_pointcloud` |
-| SE2 步态环境代码 | `spider_envelop_2/` 全继承（条件状态/HAA/P 控制未改动） |
+| SE2 步态环境代码 | `se2_frozen/` 冻结拷贝（源自 `spider_envelop_2@fd527a8` 逐字拷贝，83 维观测契约由 `tests/ea2/cascade/test_cascade_contracts.py` 钉死；上游 SE2 合并后转 68 维，不影响本任务。v1 基座 `spider_envelop/` 与 `utils/envelop/network/haa_swing_range` 为共享引用，两分支均未改动） |
 | 187 通道表 | `envelope_adaptive_2/selected_airy_channels.pt`（训练/部署共用） |
 
 策略权重采取**集中管理**：三个权重都 pin 在 `checkpoints/`，运行与测试均不依赖
-`logs/` 或其他任务目录；同步流程见 `checkpoints/README.md`。以上 EA2/SE2
-**代码**均为引用而非复制，上游函数签名变化会被 `tests/ea2/cascade/` 捕获。
+`logs/` 或其他任务目录；同步流程见 `checkpoints/README.md`。EA2 **代码**为引用
+（上游函数签名变化会被 `tests/ea2/cascade/` 捕获）；SE2 **代码**为 `se2_frozen/`
+冻结拷贝（上游演进被有意隔离，83 维契约由契约测试钉死）。
 
 ## 关键设计（与训练语义逐项对齐）
 

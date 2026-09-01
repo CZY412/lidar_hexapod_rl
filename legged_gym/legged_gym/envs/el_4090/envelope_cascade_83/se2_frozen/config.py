@@ -12,6 +12,15 @@ Deviation from the verbatim source (reviewed): ``symmetry_cfg
 ``legged_gym.envs.el_4090.spider_envelop.symmetry`` instead of the SE2
 re-export shim, so this package keeps zero references to
 ``spider_envelop_2``.  The loaded callable is identical.
+
+Frozen 83-dim observation layout (built by ``env.py::compute_observations``)::
+
+    [0:3]    lin_vel (scaled)     [3:6]    ang_vel (scaled)
+    [6:9]    projected gravity    [9:12]   commands [vx, vy, yaw_rate]
+    [12:30]  dof_pos (embedded)   [30:48]  dof_vel
+    [48:66]  actions              [66:69]  morphology priors (front/mid/back)
+    [69:75]  haa_range_center(6)  [75:81]  haa_range_half(6)
+    [81:83]  sin/cos gait phase
 """
 
 from legged_gym.envs.el_4090.spider_envelop.el4090_spider_config import (

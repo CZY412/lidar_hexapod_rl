@@ -179,6 +179,43 @@ def test_policy_loader_rejects_wrong_obs_dim():
         policy.act(torch.rand(2, 83))
 
 
+# ── frozen 83-dim contract ───────────────────────────────────────────────
+
+
+def test_cascade_83_frozen_observation_contract():
+    """cascade_83 is a FROZEN 83-dim legacy task (vendored from SE2 at
+    fd527a8).  Do NOT align it with the SE2 mainline, which dropped the
+    range priors and moved to 68-dim obs after the feat/el_4090_2 merge:
+    policy_1.pt is an 83-dim TorchScript and cannot consume a 68-dim obs.
+    """
+    from legged_gym.envs.el_4090.envelope_cascade_83.el4090_cascade_config import (
+        El4090Cascade83Cfg,
+    )
+
+    env = El4090Cascade83Cfg.env
+    assert env.num_observations == 83
+    assert env.num_physical_priors == 3
+    assert env.num_haa_range_observations == 12
+    scales = El4090Cascade83Cfg.normalization.obs_scales
+    assert scales.morphology_prior == 1.0
+    assert scales.haa_range_center == 1.0
+    assert scales.haa_range_half == 1.0
+
+
+def test_pinned_se2_policy_checkpoint_unchanged():
+    """policy_1.pt is the frozen 83->18 TorchScript; md5 pins the exact
+    weights the closed-loop test walks with."""
+    import hashlib
+
+    ckpt = _CASCADE_DIR / "checkpoints" / "policy_1.pt"
+    assert ckpt.exists(), f"missing pinned SE2 policy: {ckpt}"
+    md5 = hashlib.md5(ckpt.read_bytes()).hexdigest()
+    assert md5 == "fd2ed3a8caf0ed00cae0ec5d2fcdbea7", (
+        f"policy_1.pt changed (md5 {md5}); if retrained intentionally, update "
+        "this pin and checkpoints/README.md together"
+    )
+
+
 def _run_all():
     failures = 0
     for name, fn in sorted(globals().items()):
