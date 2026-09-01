@@ -184,6 +184,21 @@ python scripts/data_collection_gym/collect.py \
 
 ---
 
+## Envelope Tasks Landscape (post feat/el_4090_2 merge, 2026-09)
+
+| Task | SE2 侧观测 | 状态 |
+|---|---|---|
+| `el4090_envelop_2`（SE2 主线） | **68 维** | 合并后主线：range priors 已从策略观测移除（主分支 `6cb4e49`）。旧 83 维 checkpoint 不可加载；重训出 68 维权重前 `play_envelop_2.py` 无可用 checkpoint |
+| `el4090_ea2` | —（190 维感知） | 活跃主线：SL 数据采集与训练不受合并影响 |
+| `el4090_cascade_83` | **83 维（冻结）** | 遗留合并演示：EA2 感知 → 冻结 SE2 步态（`se2_frozen/` + `policy_1.pt` TorchScript，md5 钉死于契约测试）。`play_cascade.py --task el4090_cascade_83` |
+| `el4090_cascade_68`（规划中） | 68 维 | 未来基于新 SE2 架构 + 新训练 policy 的级联任务；EA2 GRU 权重与 `EnvelopeBridge` 可直接复用（`set_envelope_condition` 接口在 68 维主线保留） |
+
+- envelope 数学库已包化为 `el4090_envelope/`：跑包内测试前 `pip install -e ./el4090_envelope`；旧路径 `legged_gym.utils.envelop.kinematic_envelope` 仍为兼容 facade（注意本仓库的既有导入顺序约定：先 import `legged_gym.envs` 下的模块，再 import `legged_gym.utils.*`）。
+- `el4090_cascade_83` 的 PPO 训练目录独立为 `el4090_cascade_83_p_haa_range`，与 SE2 主线目录 `el_4090_envelop_2_p_haa_range` 隔离，防止 68 维产物被 83 维任务误加载。
+- 细节见 `envs/el_4090/envelope_cascade_83/README.md` 及其 `checkpoints/README.md`。
+
+---
+
 ## Notes
 
 - `wave`, `jump`, and `mammal` are first-pass behavior tasks. Expect at least one reward-scale tuning pass after visual evaluation.
