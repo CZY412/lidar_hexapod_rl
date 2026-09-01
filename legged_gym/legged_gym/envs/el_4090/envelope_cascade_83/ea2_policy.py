@@ -49,7 +49,7 @@ class Ea2Policy:
         if not checkpoint_path.exists():
             raise FileNotFoundError(
                 f"EA2 cascade checkpoint not found: {checkpoint_path} "
-                "(see envelope_cascade/checkpoints/README.md)"
+                "(see envelope_cascade_83/checkpoints/README.md)"
             )
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         missing = [key for key in _RSL_REQUIRED_KEYS if key not in checkpoint]
