@@ -8,10 +8,11 @@ from legged_gym.envs.el_4090.spider_envelop.el4090_spider_config import (
 
 class El4090Envelop2Cfg(El4090EnvelopCfg):
     class env(El4090EnvelopCfg.env):
-        # 66 proprioception + 3 priors + 12 HAA range values + sin/cos gait phase.
-        num_observations = 83
-        num_physical_priors = 3
-        num_haa_range_observations = 12
+        # 66 proprioception + sin/cos gait phase. Morphology priors and HAA
+        # ranges remain internal environment state and are not policy inputs.
+        num_observations = 68
+        num_physical_priors = 0
+        num_haa_range_observations = 0
         num_gait_phase_observations = 2
 
     class commands(El4090EnvelopCfg.commands):
@@ -23,9 +24,6 @@ class El4090Envelop2Cfg(El4090EnvelopCfg):
 
     class normalization(El4090EnvelopCfg.normalization):
         class obs_scales(El4090EnvelopCfg.normalization.obs_scales):
-            morphology_prior = 1.0
-            haa_range_center = 1.0
-            haa_range_half = 1.0
             gait_phase = 1.0
 
     class envelope:

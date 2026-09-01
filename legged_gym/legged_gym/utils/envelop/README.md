@@ -68,9 +68,15 @@ utils/envelop/morphology_prior_3d.png
 envelope + morphology condition，输出为 `[batch, 6, 2]`，最后一维依次为
 每条腿 HAA 的下限和上限。
 
-- `AnalyticHaaRangeEstimator`：解析计算，训练环境默认使用。
+- `AnalyticHaaRangeEstimator`：解析计算，用作参考标签和无 checkpoint 的实现。
 - `MonteCarloHaaRangeEstimator`：随机采样验证或生成标签。
 - `HaaRangeNetwork`：将解析/采样结果蒸馏为小型 MLP。
+
+其中 `el4090_envelop_2` 当前配置默认使用 `network`。当前 checkpoint 对环境的
+输出契约是每腿 `[lower, upper]`；网络内部虽然先构造 `center/half_range`，但会在
+`forward()` 末尾转换成上下界。68 维策略观测、18 维策略动作、完整的网络输入顺序、
+腿序映射以及替换为直接输出 `center/half_range` 网络时的适配逻辑，见
+[`envs/el_4090/ReadMe.md`](../../envs/el_4090/ReadMe.md#spider-envelop-2策略和-haa-网络接口)。
 
 训练网络：
 
