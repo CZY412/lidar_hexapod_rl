@@ -32,13 +32,13 @@ from legged_gym.envs.el_4090.envelope_cascade_83.el4090_cascade_config import (
     El4090CascadeCfg,
 )
 from legged_gym.envs.el_4090.envelope_cascade_83.envelope_bridge import EnvelopeBridge
-from legged_gym.envs.el_4090.spider_envelop_2.el_4090 import EL_4090_ENVELOP_2
+from legged_gym.envs.el_4090.envelope_cascade_83.se2_frozen.env import EL_4090_SE2_83
 
 _COMMAND_NAMES = ("lin_vel_x", "lin_vel_y", "ang_vel_yaw")
 _GEOMETRY_NAMES = ("front_width", "middle_width", "back_width", "forward_limit")
 
 
-class EL_4090_CASCADE(EL_4090_ENVELOP_2):
+class EL_4090_CASCADE(EL_4090_SE2_83):
     """Envelope-cascade EL4090: EA2 perception replaces sampled envelopes."""
 
     cfg: El4090CascadeCfg
@@ -138,7 +138,7 @@ class EL_4090_CASCADE(EL_4090_ENVELOP_2):
             self.filtered_embedded_state_default_dof_pos[env_ids] = self.default_dof_pos
         # set_envelope_condition already refreshed the HAA ranges on the
         # cascade path; the cache makes this a no-op there and covers the
-        # sampled fallback path (mirrors EL_4090_ENVELOP_2._resample_commands).
+        # sampled fallback path (mirrors EL_4090_SE2_83._resample_commands).
         if hasattr(self, "haa_range_estimator"):
             self._refresh_haa_swing_ranges(env_ids)
 

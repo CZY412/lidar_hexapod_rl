@@ -13,14 +13,14 @@ import math
 from legged_gym.envs.el_4090.envelope_adaptive_2.el_4090_ea2_config import (
     El4090EA2Cfg,
 )
-from legged_gym.envs.el_4090.spider_envelop_2.el4090_spider_config import (
-    El4090Envelop2Cfg,
-    El4090Envelop2CfgPPO,
+from legged_gym.envs.el_4090.envelope_cascade_83.se2_frozen.config import (
+    El4090Se2_83Cfg,
+    El4090Se2_83CfgPPO,
 )
 
 
-class El4090CascadeCfg(El4090Envelop2Cfg):
-    class terrain(El4090Envelop2Cfg.terrain):
+class El4090CascadeCfg(El4090Se2_83Cfg):
+    class terrain(El4090Se2_83Cfg.terrain):
         mesh_type = "trimesh"  # warp raycast mesh is built from this terrain
         terrain_length = 16.0
         terrain_width = 16.0
@@ -50,12 +50,12 @@ class El4090CascadeCfg(El4090Envelop2Cfg):
         pillar_allow_height_variation = True
         difficulty_scale = 1.0
 
-    class lidar(El4090Envelop2Cfg.lidar):
+    class lidar(El4090Se2_83Cfg.lidar):
         # The inherited v1 LiDAR stack (11x17 simple_grid) must stay OFF;
         # the EA2 187-channel perception lives under cfg.ea2.
         enable = False
 
-    class haa_swing_range(El4090Envelop2Cfg.haa_swing_range):
+    class haa_swing_range(El4090Se2_83Cfg.haa_swing_range):
         # Override the inherited pointer: the demo pins its own byte-identical
         # copy (checkpoints/haa_range.pt, md5 640627fd…) so the whole policy
         # set is self-contained.  Keep in sync with
@@ -115,6 +115,15 @@ class El4090CascadeCfg(El4090Envelop2Cfg):
         fold_scale = 0.11875
 
 
-class El4090CascadeCfgPPO(El4090Envelop2CfgPPO):
-    """Demo task: training config fully inherited from SE2 so the upcoming
-    envelop_2 checkpoint in the shared experiment dir loads unchanged."""
+class El4090CascadeCfgPPO(El4090Se2_83CfgPPO):
+    """Demo task: training config inherited from the frozen 83-dim SE2 layer.
+
+    ``runner.experiment_name`` intentionally diverges from SE2's shared
+    ``el_4090_envelop_2_p_haa_range`` dir: after the feat/el_4090_2 merge the
+    SE2 mainline retrains with 68-dim observations and would otherwise drop
+    dimension-incompatible checkpoints into the directory this task loads
+    from.
+    """
+
+    class runner(El4090Se2_83CfgPPO.runner):
+        experiment_name = "el4090_cascade_83_p_haa_range"
