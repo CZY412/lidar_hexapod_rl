@@ -26,7 +26,7 @@
 
 - `ea2_envelope.pt`：`El4090Cascade83Cfg.ea2.checkpoint` → `ea2_policy.Ea2Policy`
   （严格 state_dict 加载；遇 `empirical_normalization` 字段显式报错）。
-- `policy_1.pt`：`El4090Cascade83Cfg.se2_policy.checkpoint` → `play_cascade.py`
+- `policy_1.pt`：`El4090Cascade83Cfg.se2_policy.checkpoint` → `play_cascade_83.py`
   / 测试脚本 `torch.jit.load` 直接消费（无 rsl_rl runner 依赖）。
 - `haa_range.pt`：`El4090Cascade83Cfg.haa_swing_range.network_checkpoint`
   **覆盖**了继承的 SE2 指针；加载时 `HaaRangeNetwork.from_checkpoint` 会校验

@@ -31,7 +31,7 @@ envelope_cascade_83/
 ├── envelope_bridge.py        # raw a5 → params5 → condition8
 ├── checkpoints/              # EA2 感知权重（pin 进 git，见其 README）
 └── README.md
-scripts/play_cascade.py       # 键盘演示（SE2 大模型 checkpoint 就位后可玩）
+scripts/play_cascade_83.py    # 键盘演示（SE2 大模型 checkpoint 就位后可玩）
 tests/ea2/cascade/            # 契约测试 + Isaac 环境级测试
 ```
 
@@ -79,7 +79,7 @@ conda activate el4090; PATH=/home/t3chichi/anaconda3/envs/el4090/bin:$PATH
 cd el4090_legged_gym
 
 # 演示（策略已全部 pin 在 checkpoints/，无外部依赖）
-python legged_gym/legged_gym/scripts/play_cascade.py --task=el4090_cascade_83 --num_envs 1
+python legged_gym/legged_gym/scripts/play_cascade_83.py --task=el4090_cascade_83 --num_envs 1
 #   w/s/a/d/q/e 移动转向, 1/2/3 档位, x/空格 急停, v 点云/包络可视化, ESC 退出
 #   --max_steps N 限步运行（headless 冒烟用）
 

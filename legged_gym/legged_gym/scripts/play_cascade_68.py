@@ -1,4 +1,4 @@
-"""el4090_cascade_83 键盘 play：SE2 步态 + EA2 点云→包络感知全链路演示。
+"""el4090_cascade_68 键盘 play：SE2 步态 + EA2 点云→包络感知全链路演示。
 
 结构来源：
 
@@ -9,8 +9,10 @@
   EA2 187 点云（命中点画红球，无命中不画）；
 * 状态行 —— ``params5`` / LiDAR 刷新计数 / stale env 数 / EA2 输出有限性。
 
-依赖：``logs/<SE2 experiment>/model_*.pt``（envelop_2 步态大模型）；
-EA2 感知权重已 pin 在 ``envelope_cascade_83/checkpoints/``。
+依赖：SE2 步态策略（68→18 TorchScript）pin 在
+``envelope_cascade_68/checkpoints/policy_1.pt``（当前占位未就位，缺失时本
+脚本在加载前显式报错；导出与放置流程见该目录 README）；
+EA2 感知权重已 pin 在 ``envelope_cascade_68/checkpoints/``。
 """
 
 import isaacgym  # noqa: F401  -- Isaac Gym 必须先于 legged_gym 导入
@@ -28,13 +30,13 @@ from collections import deque
 import numpy as np
 import torch
 
-import legged_gym.envs.el_4090.envelope_cascade_83  # noqa: F401,E402 -- 注册 el4090_cascade_83
+import legged_gym.envs.el_4090.envelope_cascade_68  # noqa: F401,E402 -- 注册 el4090_cascade_68
 from legged_gym import LEGGED_GYM_ROOT_DIR
-from legged_gym.envs.el_4090.envelope_cascade_83.ea2_perception import yaw_quat
+from legged_gym.envs.el_4090.envelope_cascade_68.ea2_perception import yaw_quat
 from legged_gym.utils import get_args, task_registry
 from legged_gym.utils.math_utils import quat_apply, quat_apply_yaw
 
-TASK_NAME = "el4090_cascade_83"
+TASK_NAME = "el4090_cascade_68"
 
 # ── 按键映射（与 play_keyboard.py 一致）────────────────────────────────
 HELD_ACTIONS = {
@@ -300,7 +302,7 @@ def print_cascade_state(env, label=""):
 # ── 主流程 ──────────────────────────────────────────────────────────────
 def play(args):
     if args.task != TASK_NAME:
-        print(f"play_cascade.py 使用任务 {TASK_NAME!r}（忽略传入的 {args.task!r}）")
+        print(f"play_cascade_68.py 使用任务 {TASK_NAME!r}（忽略传入的 {args.task!r}）")
         args.task = TASK_NAME
 
     env_cfg, train_cfg = task_registry.get_cfgs(name=TASK_NAME)
@@ -341,7 +343,7 @@ def play(args):
     se2_ckpt = str(env_cfg.se2_policy.checkpoint).format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
     if not os.path.exists(se2_ckpt):
         raise FileNotFoundError(
-            f"SE2 步态策略未找到: {se2_ckpt}（见 envelope_cascade_83/checkpoints/README.md）"
+            f"SE2 步态策略未找到: {se2_ckpt}（见 envelope_cascade_68/checkpoints/README.md）"
         )
     policy = torch.jit.load(se2_ckpt, map_location=env.device)
     policy.eval()
