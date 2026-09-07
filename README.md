@@ -148,6 +148,18 @@ ranges are internal only:
   whenever the envelope changes; its outputs drive the `haa_range_violation` and
   `haa_phase_tracking` shaping rewards.
 
+The core environment implementation is
+[`spider_envelop_2/el_4090.py`](legged_gym/legged_gym/envs/el_4090/spider_envelop_2/el_4090.py).
+It implements training across multiple morphology modes, including the transition
+between spider-like and mammal-like postures, externally supplied envelope
+conditions, generated per-leg HAA swing ranges, the 68-dimensional policy
+observation, and the corresponding reward design. In addition to the inherited
+locomotion rewards for velocity tracking, body stability, contact quality, energy
+use, and actuator limits, this file adds rewards for HAA-range violations, smooth
+tripod-phase tracking, and action jerk. The reward weights and PPO hyperparameters
+are configured in
+[`el4090_spider_config.py`](legged_gym/legged_gym/envs/el_4090/spider_envelop_2/el4090_spider_config.py).
+
 Interface details, the exact 68-dim observation layout, and the HAA network
 contract: [envs/el_4090/ReadMe.md](legged_gym/legged_gym/envs/el_4090/ReadMe.md).
 
@@ -228,18 +240,52 @@ python -m $EA2_PKG.ppo_continue --arm sl_init --ckpt $EA2_RUN/<name>/model.pt --
 
 ### Robot-side locomotion policy
 
+Run the following commands from the repository root. Training outputs are written
+under `legged_gym/logs/el_4090_envelop_2_p_haa_range/`. The play script loads the
+latest run and checkpoint by default, starts with the maximum envelope and a
+forward command of 1.2 m/s, and exports the loaded policy as TorchScript.
+
 ```bash
 # train (68-dim hidden-condition policy, mainline)
 python legged_gym/legged_gym/scripts/train.py --task=el4090_envelop_2 --headless
 
-# demo (also auto-exports the policy as TorchScript — the exported artifact
-# is what a cascade task pins as its `policy_1.pt` gait checkpoint)
+# resume the latest run and checkpoint
+python legged_gym/legged_gym/scripts/train.py --task=el4090_envelop_2 --resume --headless
+
+# interactive demo using the latest checkpoint (also auto-exports the policy
+# as TorchScript; the cascade task pins this artifact as `policy_1.pt`)
 python legged_gym/legged_gym/scripts/play_envelop_2.py --task=el4090_envelop_2 --num_envs 1
+
+# play a specific training run/checkpoint
+python legged_gym/legged_gym/scripts/play_envelop_2.py --task=el4090_envelop_2 \
+    --load_run <run_name> --checkpoint <checkpoint_number> --num_envs 1
 
 # legacy v1 (condition-visible policy)
 python legged_gym/legged_gym/scripts/train.py --task=el4090_envelop --headless
 python legged_gym/legged_gym/scripts/play_envelop.py --task=el4090_envelop --num_envs 1
 ```
+
+During `play_envelop_2.py`, keep the terminal focused and use these keys:
+
+| Key | Function |
+| --- | --- |
+| `W` / `S` | Set forward / backward velocity to +1.2 / -1.2 m/s |
+| `A` / `D` | Set left / right lateral velocity to +0.8 / -0.8 m/s |
+| `Q` / `E` | Set left / right yaw rate to +0.8 / -0.8 rad/s |
+| `X` | Set all velocity commands to zero |
+| `M` | Switch to the maximum envelope (the initial envelope) |
+| `R` | Sample a random envelope |
+| `F` | Apply the front-leg mammal-like test envelope |
+| `O` | Run a smooth all-spider → all-mammal → all-spider morphology cycle |
+| `C` | Switch between rear-side and rear-top follow cameras (viewer mode only) |
+| `Esc` | Exit playback |
+
+Each motion key sets one command component and leaves the other components
+unchanged, so translation and turning can be combined. Press `X` before entering a
+new command if a full stop is required. In `--headless` mode, the viewer, follow
+camera, and real-time pacing are disabled; terminal keyboard input is available
+only when standard input is a TTY. Use `--max_steps <N>` to bound a non-interactive
+smoke test.
 
 ### Cascade demo and tests
 
