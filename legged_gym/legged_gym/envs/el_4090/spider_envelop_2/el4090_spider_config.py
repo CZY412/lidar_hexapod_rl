@@ -55,6 +55,53 @@ class El4090Envelop2Cfg(El4090EnvelopCfg):
         # preset; no temporal low-pass state is used.
         control_type = "P"
 
+    class init_state(El4090EnvelopCfg.init_state):
+            pos = [0.0, 0.0, 0.55]  # x,y,z [m]
+            default_joint_angles = {  # = target angles [rad] when action = 0.0
+                "RF_HAA": 0.0,
+                "RM_HAA": 0.0,
+                "RB_HAA": 0.0,
+                "LF_HAA": 0.0,
+                "LM_HAA": 0.0,
+                "LB_HAA": 0.0,
+    
+                "RF_HFE": 0.4036,
+                "RM_HFE": 0.4036,
+                "RB_HFE": 0.4036,
+                "LF_HFE": 0.4036,
+                "LM_HFE": 0.4036,
+                "LB_HFE": 0.4036,
+    
+                "RF_KFE": -0.55019,
+                "RM_KFE": -0.55019,
+                "RB_KFE": -0.55019,
+                "LF_KFE": -0.55019,
+                "LM_KFE": -0.55019,
+                "LB_KFE": -0.55019,
+            }
+            mammal_default_joint_angles = {
+                "RF_HAA": -1.308,
+                "RM_HAA": 1.308,
+                "RB_HAA": 1.308,
+                "LF_HAA": -1.308,
+                "LM_HAA": 1.308,
+                "LB_HAA": 1.308,
+    
+                "RF_HFE": 0.4036,
+                "RM_HFE": 0.4036,
+                "RB_HFE": 0.4036,
+                "LF_HFE": 0.4036,
+                "LM_HFE": 0.4036,
+                "LB_HFE": 0.4036,
+
+                "RF_KFE": -0.4300,
+                "RM_KFE": -0.4300,
+                "RB_KFE": -0.4300,
+                "LF_KFE": -0.4300,
+                "LM_KFE": -0.4300,
+                "LB_KFE": -0.6980,
+            }
+
     class haa_swing_range:
         # analytic, monte_carlo, or network
         method = "network"
