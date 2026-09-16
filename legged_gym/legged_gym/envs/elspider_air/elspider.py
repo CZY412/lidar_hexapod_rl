@@ -71,7 +71,13 @@ def get_elair_xysym_obs_act(obs: torch.Tensor = None, actions: torch.Tensor = No
     """
     device = obs.device if obs is not None else actions.device
     batch_size = obs.shape[0] if obs is not None else actions.shape[0]
-    
+
+    if obs_type not in ("policy", "critic"):
+        raise ValueError(
+            f"get_elair_xysym_obs_act: obs_type must be 'policy' or 'critic', "
+            f"got '{obs_type}'"
+        )
+
     if obs is not None:
         # --- Left-Right Mirrored Observations ---
         obs_lr_mirrored = obs.clone()
@@ -213,10 +219,16 @@ def get_elair_xsym_obs_act(obs: torch.Tensor = None, actions: torch.Tensor = Non
     """
     device = obs.device if obs is not None else actions.device
     batch_size = obs.shape[0] if obs is not None else actions.shape[0]
-    
+
+    if obs_type not in ("policy", "critic"):
+        raise ValueError(
+            f"get_elair_xsym_obs_act: obs_type must be 'policy' or 'critic', "
+            f"got '{obs_type}'"
+        )
+
     # Original and mirrored observations/actions
     # [batch*2, dim] where first batch is original, second batch is mirrored
-    
+
     if obs is not None:
         # Mirror the observations for ElSpider which has 6 legs
         # For policy observation, the structure is:
@@ -616,27 +628,6 @@ class ElSpider(LeggedRobot):
                         sync_all_reward)             # sync all legs for standing still
         
         return re
-    
-    def _reward_shank_perp2ground(self):
-        if not hasattr(self, 'hfe_indices'):
-            self.hfe_indices = [self.dof_names.index(name) for name in [
-                'RF_HFE', 'RM_HFE', 'RB_HFE', 'LF_HFE', 'LM_HFE', 'LB_HFE']]
-        if not hasattr(self, 'kfe_indices'):
-            self.kfe_indices = [self.dof_names.index(name) for name in [
-                'RF_KFE', 'RM_KFE', 'RB_KFE', 'LF_KFE', 'LM_KFE', 'LB_KFE']]
-        return torch.square(self.dof_pos[:, self.hfe_indices] - self.dof_pos[:, self.kfe_indices]).sum(dim=1)
-
-    def _reward_haa_nominal_pos(self):
-        if not hasattr(self, 'haa_indices'):
-            self.haa_indices = [self.dof_names.index(name) for name in [
-                'RF_HAA', 'RM_HAA', 'RB_HAA', 'LF_HAA', 'LM_HAA', 'LB_HAA']]
-        haa_nominal_pos = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=self.device)
-        # use ema to smooth the reward
-        ema = 0.01
-        self.haa_nominal_pos_ema = getattr(self, 'haa_nominal_pos_ema', torch.zeros(self.num_envs, device=self.device))
-        current_deviation = torch.square(self.dof_pos[:, self.haa_indices] - haa_nominal_pos).sum(dim=1)
-        self.haa_nominal_pos_ema = ema * current_deviation + (1 - ema) * self.haa_nominal_pos_ema
-        return self.haa_nominal_pos_ema
 
     def _reward_ang_vel_xy(self):
         # Penalize yz axes base angular velocity
@@ -700,7 +691,28 @@ class ElSpider(LeggedRobot):
             self.gym.subscribe_viewer_keyboard_event(
                 self.viewer, gymapi.KEY_V, "toggle_viewer_sync") # 焦点在仿真与显示之间切换
             
-            self.vis = GymVisualizer(self.gym, self.sim, self.viewer, self.envs)
+            self.vis = GymVisualizer(self.gym, self.sim, self.viewer, self.envs)        
+    
+    def _reward_shank_perp2ground(self):
+        if not hasattr(self, 'hfe_indices'):
+            self.hfe_indices = [self.dof_names.index(name) for name in [
+                'RF_HFE', 'RM_HFE', 'RB_HFE', 'LF_HFE', 'LM_HFE', 'LB_HFE']]
+        if not hasattr(self, 'kfe_indices'):
+            self.kfe_indices = [self.dof_names.index(name) for name in [
+                'RF_KFE', 'RM_KFE', 'RB_KFE', 'LF_KFE', 'LM_KFE', 'LB_KFE']]
+        return torch.square(self.dof_pos[:, self.hfe_indices] - self.dof_pos[:, self.kfe_indices]).sum(dim=1)
+
+    def _reward_haa_nominal_pos(self):
+        if not hasattr(self, 'haa_indices'):
+            self.haa_indices = [self.dof_names.index(name) for name in [
+                'RF_HAA', 'RM_HAA', 'RB_HAA', 'LF_HAA', 'LM_HAA', 'LB_HAA']]
+        haa_nominal_pos = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=self.device)
+        # use ema to smooth the reward
+        ema = 0.01
+        self.haa_nominal_pos_ema = getattr(self, 'haa_nominal_pos_ema', torch.zeros(self.num_envs, device=self.device))
+        current_deviation = torch.square(self.dof_pos[:, self.haa_indices] - haa_nominal_pos).sum(dim=1)
+        self.haa_nominal_pos_ema = ema * current_deviation + (1 - ema) * self.haa_nominal_pos_ema
+        return self.haa_nominal_pos_ema
 
 class ElSpiderStudent(ElSpider):
     """ElSpiderStudent class for distillation training with observation history."""

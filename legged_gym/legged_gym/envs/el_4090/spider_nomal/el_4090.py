@@ -31,7 +31,6 @@
 from time import time
 import numpy as np
 import os
-import math
 from isaacgym.torch_utils import *
 from isaacgym import gymtorch, gymapi, gymutil
 
@@ -75,12 +74,6 @@ class EL_4090(ElSpider):
         self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
 
-        if not self.headless:
-            self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
-        self._init_buffers()
-        self._prepare_reward_function()
-        self.init_done = True
-
         self.action_des = 0
         # self.action_flag = 1
 
@@ -93,6 +86,10 @@ class EL_4090(ElSpider):
         # Debug counters
         self.debug_step_counter = 0
 
+        
+
+        
+ 
     def _init_buffers(self):
         """ Initialize torch tensors which will contain simulation states and processed quantities
         """
@@ -103,6 +100,19 @@ class EL_4090(ElSpider):
         # 组2: RF (4), RB (3), LM (2)
         self.tripod_group1_indices = torch.tensor([1, 0, 5], device=self.device, dtype=torch.long)
         self.tripod_group2_indices = torch.tensor([4, 3, 2], device=self.device, dtype=torch.long)
+
+        feet_names = getattr(self, "feet_names", [f"foot_{i}" for i in range(len(self.feet_indices))])
+        group1_names = [feet_names[i] for i in self.tripod_group1_indices.cpu().tolist()]
+        group2_names = [feet_names[i] for i in self.tripod_group2_indices.cpu().tolist()]
+        print("[EL_4090 gait check]")
+        print("  feet_names:", feet_names)
+        print("  feet_indices:", self.feet_indices.detach().cpu().tolist())
+        print("  tripod_group1_indices:", self.tripod_group1_indices.detach().cpu().tolist(), "names:", group1_names)
+        print("  tripod_group2_indices:", self.tripod_group2_indices.detach().cpu().tolist(), "names:", group2_names)
+        self.feet_first_contact = torch.zeros_like(self.feet_air_time, dtype=torch.bool)
+        self.feet_air_time_on_contact = torch.zeros_like(self.feet_air_time)
+        self.episode_base_height_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.episode_base_height_count = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         
         # 初始化小腿索引 (SHANK)
         # Bodies:  ['base_link', 'LB_HIP', 'LB_THIGH', 'LB_SHANK', 'LB_FOOT', 'LF_HIP', 'LF_THIGH', 'LF_SHANK', 'LF_FOOT', 
@@ -113,47 +123,200 @@ class EL_4090(ElSpider):
         self.shank_indices = torch.zeros(len(shank_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(shank_names)):
             self.shank_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], shank_names[i])
+    
 
+    def _get_heights(self, env_ids=None):
+        """ Samples heights of the terrain at required points around each robot.
+            The points are offset by the base's position and rotated by the base's yaw
+        IMPORTANT: This method takes a lot of GPU memory.
+        Args:
+            env_ids (List[int], optional): Subset of environments for which to return the heights. Defaults to None.
 
-    def _compute_torques(self, actions):
-        # pd controller
-        actions_scaled = actions * self.cfg.control.action_scale
+        Raises:
+            NameError: [description]
 
-        control_type = self.cfg.control.control_type
-        if control_type == "P":
-            torques = self.p_gains*(actions_scaled + self.default_dof_pos - self.dof_pos) - self.d_gains*self.dof_vel
-        elif control_type == "V":
-            torques = self.p_gains*(actions_scaled - self.dof_vel) - self.d_gains * \
-                (self.dof_vel - self.last_dof_vel)/self.sim_params.dt
-        elif control_type == "T":
-            torques = actions_scaled
-        elif control_type == "DELAY":
-            # First-order lag actuator model (no FIFO/discrete pure delay):
-            #   y_dot = (u - y) / tau
-            # with exact discrete update:
-            #   y[k] = y[k-1] + alpha * (u[k] - y[k-1]), alpha = 1 - exp(-dt/tau)
-            tau = 0.015  # seconds
-            dt = self.sim_params.dt
+        Returns:
+            [type]: [description]
+        """
+        if self.cfg.terrain.mesh_type == 'plane':
+            return torch.zeros(self.num_envs, self.num_height_points, device=self.device, requires_grad=False)
+        elif self.cfg.terrain.mesh_type == 'none':
+            raise NameError("Can't measure height with terrain mesh type 'none'")
 
-            if not hasattr(self, "_delay_action_state"):
-                self._delay_action_state = actions_scaled.clone()
-
-            alpha = 1.0 - math.exp(-dt / max(tau, 1e-8))
-            self._delay_action_state += alpha * (actions_scaled - self._delay_action_state)
-
-            # Prevent cross-episode leakage for reset envs.
-            if hasattr(self, "reset_buf"):
-                reset_mask = self.reset_buf.bool()
-                if torch.any(reset_mask):
-                    self._delay_action_state[reset_mask] = actions_scaled[reset_mask]
-
-            delayed_actions = self._delay_action_state
-
-            # Use lagged target action in the same P-controller form as "P" mode.
-            torques = self.p_gains*(delayed_actions + self.default_dof_pos - self.dof_pos) - self.d_gains*self.dof_vel
+        if env_ids:
+            points = quat_apply_yaw(self.base_quat[env_ids].repeat(1, self.num_height_points),
+                                    self.height_points[env_ids]) + (self.root_states[env_ids, :3]).unsqueeze(1)
         else:
-            raise NameError(f"Unknown controller type: {control_type}")
-        return torch.clip(torques, -self.torque_limits, self.torque_limits)
+            points = quat_apply_yaw(self.base_quat.repeat(1, self.num_height_points),
+                                    self.height_points) + (self.root_states[:, :3]).unsqueeze(1)
+
+        points += self.terrain.cfg.border_size
+        points = (points/self.terrain.cfg.horizontal_scale).long()  # convert float to indices
+        px = points[:, :, 0].view(-1)
+        py = points[:, :, 1].view(-1)
+        px = torch.clip(px, 0, self.height_samples.shape[0]-2)
+        py = torch.clip(py, 0, self.height_samples.shape[1]-2)
+
+        heights1 = self.height_samples[px, py]
+        heights2 = self.height_samples[px+1, py]
+        heights3 = self.height_samples[px, py+1]
+        heights = torch.min(heights1, heights2)
+        heights = torch.min(heights, heights3)
+
+        return heights.view(self.num_envs, -1) * self.terrain.cfg.vertical_scale
+
+    def _sample_terrain_heights_at_xy(self, points_xy):
+        """Sample terrain heights at world-frame xy points.
+
+        Uses the local maximum around the query cell so step edges are not
+        underestimated for foot clearance.
+        """
+        if self.cfg.terrain.mesh_type == 'plane':
+            return torch.zeros(points_xy.shape[:-1], device=self.device, requires_grad=False)
+        elif self.cfg.terrain.mesh_type == 'none':
+            raise NameError("Can't sample height with terrain mesh type 'none'")
+
+        points = points_xy + self.terrain.cfg.border_size
+        points = (points / self.terrain.cfg.horizontal_scale).long()
+        px = torch.clip(points[..., 0].reshape(-1), 0, self.height_samples.shape[0] - 2)
+        py = torch.clip(points[..., 1].reshape(-1), 0, self.height_samples.shape[1] - 2)
+
+        heights1 = self.height_samples[px, py]
+        heights2 = self.height_samples[px + 1, py]
+        heights3 = self.height_samples[px, py + 1]
+        heights4 = self.height_samples[px + 1, py + 1]
+        heights = torch.maximum(torch.maximum(heights1, heights2), torch.maximum(heights3, heights4))
+        return heights.view(points_xy.shape[:-1]) * self.terrain.cfg.vertical_scale
+    
+
+    def compute_observations(self):
+        super().compute_observations()
+        # print(self.obs[0,66:187])
+
+    def _update_feet_contact_timers(self):
+        """Update foot contact timers once per physics step for gait rewards."""
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
+        contact_filt = torch.logical_or(contact, self.last_contacts)
+
+        air_time_next = self.feet_air_time + self.dt
+        contact_time_next = self.feet_contact_time + self.dt
+        self.feet_first_contact[:] = (self.feet_air_time > 0.) & contact_filt
+        self.feet_air_time_on_contact[:] = air_time_next
+
+        self.feet_air_time[:] = air_time_next * ~contact_filt
+        self.feet_contact_time[:] = contact_time_next * contact_filt
+        self.last_contacts[:] = contact
+
+    def _draw_debug_vis(self):
+        """ Draws visualizations for dubugging (slows down simulation a lot).
+            Default behaviour: draws height measurement points
+        """
+
+        # draw height lines
+        if not ("terrain" in self.__dir__() and self.terrain.cfg.measure_heights):
+            return
+        self.gym.clear_lines(self.viewer)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        sphere_geom = gymutil.WireframeSphereGeometry(0.02, 4, 4, None, color=(1, 1, 0))
+        for i in range(self.num_envs):
+            base_pos = (self.root_states[i, :3]).cpu().numpy()
+            heights = self.measured_heights[i].cpu().numpy()
+            height_points = quat_apply_yaw(self.base_quat[i].repeat(heights.shape[0]), self.height_points[i]).cpu().numpy()
+            for j in range(heights.shape[0]):
+                x = height_points[j, 0] + base_pos[0]
+                y = height_points[j, 1] + base_pos[1]
+                z = heights[j]
+                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
+
+
+    def post_physics_step(self):
+        """ check terminations, compute observations and rewards
+            calls self._post_physics_step_callback() for common computations
+            calls self._draw_debug_vis() if needed
+        """
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
+
+        # prepare quantities
+        self.base_pos[:] = self.root_states[:, :3]
+        self.base_quat[:] = self.root_states[:, 3:7]
+        self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
+        self.base_lin_acc[:] = self.base_lin_acc[:] * self.acc_ema + (1 - self.acc_ema) * \
+            quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10] - self.last_root_vel[:, :3]) / self.dt
+        self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        self.base_ang_acc[:] = self.base_ang_acc[:] * self.acc_ema + (1 - self.acc_ema) * \
+            quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13] - self.last_root_vel[:, 3:]) / self.dt
+        self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+
+        self.foot_positions = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, self.feet_indices, 0:3]
+        self.foot_velocities = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, self.feet_indices, 7:10]
+
+        self.episode_base_height_sum += self.base_pos[:, 2]
+        self.episode_base_height_count += 1.
+        self._update_feet_contact_timers()
+        self._post_physics_step_callback()
+
+        # compute observations, rewards, resets, ...
+        self.check_termination()
+        self.compute_reward()
+        env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+        self.reset_idx(env_ids)
+        self.compute_observations()  # in some cases a simulation step might be required to refresh some obs (for example body positions)
+
+        self.last_actions[:] = self.actions[:]
+        self.last_dof_vel[:] = self.dof_vel[:]
+        self.last_root_vel[:] = self.root_states[:, 7:13]
+
+        
+
+        # self._draw_debug_vis()
+
+    def _update_terrain_curriculum(self, env_ids):
+        """ Implements the game-inspired curriculum.
+
+        Args:
+            env_ids (List[int]): ids of environments being reset
+        """
+        # Implement Terrain curriculum
+        if not self.init_done:
+            # don't change on initial reset
+            return
+        move_up_ratio = getattr(self.cfg.terrain, "terrain_curriculum_move_up_distance_ratio", 0.5)
+        move_down_ratio = getattr(self.cfg.terrain, "terrain_curriculum_move_down_command_distance_ratio", 0.5)
+        distance = torch.norm(self.root_states[env_ids, :2] - self.env_origins[env_ids, :2], dim=1)
+        # robots that walked far enough progress to harder terains
+        move_up = distance > self.terrain.env_length * move_up_ratio
+        # robots that walked less than half of their required distance go to simpler terrains
+        move_down = (distance < torch.norm(self.commands[env_ids, :2], dim=1) * self.max_episode_length_s * move_down_ratio) * ~move_up
+        self.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
+        # Robots that solve the last level are sent to a random one
+        self.terrain_levels[env_ids] = torch.where(self.terrain_levels[env_ids] >= self.max_terrain_level,
+                                                   torch.randint_like(self.terrain_levels[env_ids], self.max_terrain_level),
+                                                   torch.clip(self.terrain_levels[env_ids], 0))  # (the minumum level is zero)
+        self.env_origins[env_ids] = self.terrain_origins[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
+
+    def update_command_curriculum(self, env_ids):
+        """ Implements a curriculum of increasing commands
+
+        Args:
+            env_ids (List[int]): ids of environments being reset
+        """
+        # If the tracking reward is above 80% of the maximum, increase the range of commands
+        tracking_threshold = getattr(self.cfg.commands, "tracking_lin_vel_curriculum_threshold", 0.8)
+        curriculum_step = getattr(self.cfg.commands, "command_curriculum_step", 0.5)
+        if torch.mean(self.episode_sums["tracking_lin_vel"][env_ids]) / self.max_episode_length > tracking_threshold * self.reward_scales["tracking_lin_vel"]:
+            self.command_ranges["lin_vel_x"][0] = np.clip(
+                self.command_ranges["lin_vel_x"][0] - curriculum_step, -self.cfg.commands.max_curriculum, 0.)
+            self.command_ranges["lin_vel_x"][1] = np.clip(
+                self.command_ranges["lin_vel_x"][1] + curriculum_step, 0., self.cfg.commands.max_curriculum)
+
+
+    
 
 
     def _debug_info(self):
@@ -199,19 +362,27 @@ class EL_4090(ElSpider):
             max_force_idx = torch.argmax(contact_forces_z).item()
             
             # Foot names for better readability
-            foot_names = ['LB', 'LF', 'LM', 'RB', 'RF', 'RM']
+            foot_names = getattr(self, "feet_names", ['LB_FOOT', 'LF_FOOT', 'LM_FOOT', 'RB_FOOT', 'RF_FOOT', 'RM_FOOT'])
+            short_foot_names = [name.replace("_FOOT", "") for name in foot_names]
             
             print(f"\n[Contact Info]")
             print(f"  Feet Contact: {contact.cpu().numpy()}")
+            print(f"  Feet Order: {short_foot_names}")
+            group1_contact = contact[self.tripod_group1_indices].cpu().numpy()
+            group2_contact = contact[self.tripod_group2_indices].cpu().numpy()
+            group1_names = [short_foot_names[i] for i in self.tripod_group1_indices.cpu().tolist()]
+            group2_names = [short_foot_names[i] for i in self.tripod_group2_indices.cpu().tolist()]
+            print(f"  Tripod Group 1 {group1_names}: {group1_contact}")
+            print(f"  Tripod Group 2 {group2_names}: {group2_contact}")
             print(f"  Contact Forces (X,Y,Z) [N]:")
-            for i, name in enumerate(foot_names):
+            for i, name in enumerate(short_foot_names):
                 fx = contact_forces[i, 0].item()
                 fy = contact_forces[i, 1].item()
                 fz = contact_forces[i, 2].item()
                 f_total = torch.norm(contact_forces[i]).item()
                 contact_str = "✓" if contact[i].item() else "✗"
                 print(f"    {name}: [{fx:7.2f}, {fy:7.2f}, {fz:7.2f}] (Total: {f_total:7.2f}) {contact_str}")
-            print(f"  Max Contact Force: {max_contact_force:.2f} N (Foot {foot_names[max_force_idx]})")
+            print(f"  Max Contact Force: {max_contact_force:.2f} N (Foot {short_foot_names[max_force_idx]})")
             print(f"  Total Ground Force: {torch.sum(contact_forces_z).item():.2f} N")
             print(f"  Feet Air Time: {self.feet_air_time[env_idx].cpu().numpy()}")
             
@@ -220,18 +391,86 @@ class EL_4090(ElSpider):
     
     def _reward_feet_air_time(self):
         # Reward long steps
-        # Need to filter the contacts because the contact reporting of PhysX is unreliable on meshes
-        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
-        contact_filt = torch.logical_or(contact, self.last_contacts)
-        self.last_contacts = contact
-        first_contact = (self.feet_air_time > 0.) * contact_filt
-        self.feet_air_time += self.dt
-        self.feet_contact_time += self.dt
-        rew_airTime = torch.sum((self.feet_air_time - 0.5) * first_contact, dim=1)  # reward only on first contact with the ground
+        air_time_target = getattr(self.cfg.rewards, "feet_air_time_target", 0.15)
+        rew_airTime = torch.sum((self.feet_air_time_on_contact - air_time_target) * self.feet_first_contact, dim=1)
         rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > 0.1  # no reward for zero command
-        self.feet_air_time *= ~contact_filt
-        self.feet_contact_time *= contact_filt
         return rew_airTime
+
+    def _reward_tripod_contact_pattern(self):
+        """Penalize contact patterns that are not two opposite tripod groups."""
+        contact_threshold = getattr(self.cfg.rewards, "tripod_contact_threshold", 1.0)
+        min_command = getattr(self.cfg.rewards, "tripod_contact_min_command", 0.1)
+
+        contact = (self.contact_forces[:, self.feet_indices, 2] > contact_threshold).float()
+        group1 = contact[:, self.tripod_group1_indices]
+        group2 = contact[:, self.tripod_group2_indices]
+
+        # Feet in the same tripod should share the same contact state.
+        group1_same = torch.var(group1, dim=1, unbiased=False)
+        group2_same = torch.var(group2, dim=1, unbiased=False)
+
+        # The two tripod groups should be opposite: one stance, one swing.
+        group1_mean = torch.mean(group1, dim=1)
+        group2_mean = torch.mean(group2, dim=1)
+        group_opposite = torch.square(group1_mean + group2_mean - 1.0)
+
+        moving = (torch.norm(self.commands[:, :2], dim=1) > min_command).float()
+        return (group1_same + group2_same + group_opposite) * moving
+
+    def _reward_feet_terrain_clearance(self):
+        """Penalize swing feet that do not clear nearby terrain."""
+        if not self.cfg.terrain.measure_heights:
+            return torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+
+        contact_threshold = getattr(self.cfg.rewards, "feet_clearance_contact_threshold", 1.0)
+        clearance = getattr(self.cfg.rewards, "feet_clearance_target", 0.12)
+        lookahead = getattr(self.cfg.rewards, "feet_clearance_lookahead", 0.15)
+        min_command = getattr(self.cfg.rewards, "feet_clearance_min_command", 0.1)
+
+        command_xy = self.commands[:, :2]
+        command_norm = torch.norm(command_xy, dim=1, keepdim=True)
+        moving = (command_norm.squeeze(1) > min_command).float()
+
+        command_dir_base = command_xy / torch.clamp(command_norm, min=1e-6)
+        command_dir_world = quat_apply_yaw(
+            self.base_quat,
+            torch.cat((command_dir_base, torch.zeros(self.num_envs, 1, device=self.device)), dim=1),
+        )[:, :2]
+
+        sample_xy = self.foot_positions[:, :, :2] + command_dir_world.unsqueeze(1) * lookahead
+        terrain_heights = self._sample_terrain_heights_at_xy(sample_xy)
+        target_foot_z = terrain_heights + clearance
+
+        swing_mask = (self.contact_forces[:, self.feet_indices, 2] <= contact_threshold).float()
+        clearance_error = torch.clamp(target_foot_z - self.foot_positions[:, :, 2], min=0.0)
+        penalty = torch.sum(torch.square(clearance_error) * swing_mask, dim=1) * moving
+
+        if getattr(self.cfg.rewards, "debug_feet_clearance", False):
+            interval = max(1, int(getattr(self.cfg.rewards, "debug_feet_clearance_interval", 100)))
+            if self.common_step_counter % interval == 0:
+                env_id = int(getattr(self.cfg.rewards, "debug_feet_clearance_env_id", 0))
+                env_id = max(0, min(env_id, self.num_envs - 1))
+                foot_names = ["LB", "LF", "LM", "RB", "RF", "RM"]
+                print("\n[feet_terrain_clearance debug]")
+                print(f"step={self.common_step_counter} env={env_id}")
+                print(f"command_xy={command_xy[env_id].detach().cpu().numpy()} "
+                      f"command_norm={command_norm[env_id, 0].item():.4f} moving={moving[env_id].item():.0f}")
+                print(f"command_dir_world={command_dir_world[env_id].detach().cpu().numpy()} "
+                      f"lookahead={lookahead:.3f} clearance={clearance:.3f}")
+                print(f"penalty_unscaled={penalty[env_id].item():.6f}")
+                for foot_id, foot_name in enumerate(foot_names[:len(self.feet_indices)]):
+                    print(
+                        f"  {foot_name}: "
+                        f"sample_xy={sample_xy[env_id, foot_id].detach().cpu().numpy()} "
+                        f"terrain_z={terrain_heights[env_id, foot_id].item():.4f} "
+                        f"foot_z={self.foot_positions[env_id, foot_id, 2].item():.4f} "
+                        f"target_z={target_foot_z[env_id, foot_id].item():.4f} "
+                        f"contact_fz={self.contact_forces[env_id, self.feet_indices[foot_id], 2].item():.4f} "
+                        f"swing={swing_mask[env_id, foot_id].item():.0f} "
+                        f"err={clearance_error[env_id, foot_id].item():.4f}"
+                    )
+
+        return penalty
  
     def _sync_reward_func(self, foot_0: int, foot_1: int, max_err=2) -> torch.Tensor:
         """Penalize desynchronization of two feet."""
@@ -277,10 +516,6 @@ class EL_4090(ElSpider):
         return sync_reward * move_condition
 
     def _reward_feet_async(self):
-        """
-        Penalize synchronization between the two tripod groups by summing all pair-wise async errors.
-
-        """
         async_reward = 0
         # Sum of async penalties for all pairs between Group 1 and Group 2
         for foot_g1 in self.tripod_group1_indices:
@@ -347,8 +582,8 @@ class EL_4090(ElSpider):
         return total_variance_penalty
 
     def _reward_shank_vertical(self):
-  
-        # 获取小腿的刚体状态: [num_envs, num_shanks, 13]
+
+         # 获取小腿的刚体状态: [num_envs, num_shanks, 13]
         # 13维度: pos(3), quat(4), lin_vel(3), ang_vel(3)
         shank_states = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, self.shank_indices, :]
         foot_states = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, self.feet_indices, :]
@@ -358,70 +593,157 @@ class EL_4090(ElSpider):
         
         # 计算小腿方向向量在XY平面的投影长度    
         horizontal_dist = torch.sum(torch.sqrt(x_error**2 + y_error**2), dim=1)
-        
 
         return horizontal_dist
 
     
-    def _reward_haa_tripod_symmetry(self):
-        """
-        奖励三角步态的HAA对称性。
-        
-        要求:
-        - Group 1 (LF, RM, LB): 组内HAA角度应该相同
-        - Group 2 (RF, LM, RB): 组内HAA角度应该相同
-        - 两组之间HAA角度应该相反
-        
-        DOF顺序 (18个DOF, 每条腿3个关节):
-        LB: HAA(0), HFE(1), KFE(2)
-        LF: HAA(3), HFE(4), KFE(5)
-        LM: HAA(6), HFE(7), KFE(8)
-        RB: HAA(9), HFE(10), KFE(11)
-        RF: HAA(12), HFE(13), KFE(14)
-        RM: HAA(15), HFE(16), KFE(17)
-        
-        Returns:
-            torch.Tensor: 惩罚值,当HAA不对称时返回正值
-        """
-        # 获取各腿的HAA角度
-        LB_HAA = self.dof_pos[:, 0]   # LB
-        LF_HAA = self.dof_pos[:, 3]   # LF
-        LM_HAA = self.dof_pos[:, 6]   # LM
-        RB_HAA = self.dof_pos[:, 9]   # RB
-        RF_HAA = self.dof_pos[:, 12]  # RF
-        RM_HAA = self.dof_pos[:, 15]  # RM
-        
-        # Group 1 (LF, RM, LB): 组内应该角度相同
-        # 计算组内两两之间的角度差的平方
-        g1_penalty = torch.square(LF_HAA - RM_HAA) + \
-                     torch.square(LF_HAA - LB_HAA) + \
-                     torch.square(RM_HAA - LB_HAA)
-        
-        # Group 2 (RF, LM, RB): 组内应该角度相同
-        g2_penalty = torch.square(RF_HAA - LM_HAA) + \
-                     torch.square(RF_HAA - RB_HAA) + \
-                     torch.square(LM_HAA - RB_HAA)
-        
-        # 两组之间应该相反: G1的平均值 + G2的平均值 ≈ 0
-        # 计算两组的平均HAA角度
-        g1_mean = (LF_HAA + RM_HAA + LB_HAA) / 3.0
-        g2_mean = (RF_HAA + LM_HAA + RB_HAA) / 3.0
-        
-        # 两组平均值应该相反(和接近0)
-        inter_group_penalty = torch.square(g1_mean + g2_mean)
-        
-        # 总惩罚
-        total_penalty = g1_penalty + g2_penalty + inter_group_penalty
-        
-        return total_penalty
-    
-    
-    def post_physics_step(self):
-        """Override post_physics_step to add debug info"""
-        super().post_physics_step()
-        # Call debug info after all computations are done
-        self._debug_info()
 
+
+    def _movement_command_mask(self):
+        lin_cmd_active = torch.norm(self.commands[:, :2], dim=1) > self.speed_min
+        if self.cfg.commands.heading_command:
+            yaw_cmd_active = torch.abs(self.commands[:, 3]) > self.speed_min
+        else:
+            yaw_cmd_active = torch.abs(self.commands[:, 2]) > self.speed_min
+        return torch.logical_or(lin_cmd_active, yaw_cmd_active)
+
+    def _sync_all_legs_penalty(self):
+        sync_terms = []
+        for foot_0 in range(len(self.feet_indices)):
+            for foot_1 in range(foot_0 + 1, len(self.feet_indices)):
+                sync_terms.append(self._sync_reward_func(foot_0, foot_1))
+        return sum(sync_terms) / len(sync_terms)
+
+    def _stand_contact_penalty(self):
+        foot_contact = self.contact_forces[:, self.feet_indices, 2] > 1.0
+        num_feet_in_contact = torch.sum(foot_contact.float(), dim=1)
+        return len(self.feet_indices) - num_feet_in_contact
+
+    def _reward_gait_wave(self):
+        # Wave gait: keep five legs supporting while one designated leg swings.
+        movement_mask = self._movement_command_mask()
+        foot_contact = self.contact_forces[:, self.feet_indices, 2] > 1.0
+
+        phase_time = self.episode_length_buf.float() * self.dt
+        wave_period = getattr(self.cfg.rewards, "wave_period", 0.72)
+        wave_clearance = getattr(self.cfg.rewards, "wave_clearance", 0.04)
+
+        desired_order = torch.tensor([0, 1, 2, 5, 4, 3], device=self.device, dtype=torch.long)
+        phase_index = torch.remainder(torch.floor(phase_time / wave_period).long(), len(desired_order))
+        swing_foot = desired_order[phase_index]
+
+        desired_mask = torch.zeros_like(foot_contact)
+        desired_mask.scatter_(1, swing_foot.unsqueeze(1), True)
+
+        extra_air_penalty = torch.sum(torch.logical_and(~foot_contact, ~desired_mask).float(), dim=1)
+        desired_contact_penalty = torch.sum(torch.logical_and(foot_contact, desired_mask).float(), dim=1)
+        support_contact_penalty = torch.sum(torch.logical_and(~foot_contact, ~desired_mask).float(), dim=1) / 5.0
+
+        swing_height = self.foot_positions[torch.arange(self.num_envs, device=self.device), swing_foot, 2]
+        swing_height_penalty = torch.relu(wave_clearance - swing_height)
+
+        movement_penalty = (
+            desired_contact_penalty
+            + support_contact_penalty
+            + extra_air_penalty
+            + swing_height_penalty
+        )
+        stand_penalty = self._stand_contact_penalty()
+        return torch.where(movement_mask, movement_penalty, stand_penalty)
+
+    def _reward_jump_sync(self):
+        # Jumping/hopping: encourage all legs to move in sync.
+        # Foot index: LB(0), LF(1), LM(2), RB(3), RF(4), RM(5)
+        movement_mask = self._movement_command_mask()
+
+        # All 15 pair-wise sync penalties for 6 legs
+        sync_all_pairs = [
+            self._sync_reward_func(0, 1), self._sync_reward_func(0, 2), self._sync_reward_func(0, 3),
+            self._sync_reward_func(0, 4), self._sync_reward_func(0, 5),
+            self._sync_reward_func(1, 2), self._sync_reward_func(1, 3),
+            self._sync_reward_func(1, 4), self._sync_reward_func(1, 5),
+            self._sync_reward_func(2, 3), self._sync_reward_func(2, 4),
+            self._sync_reward_func(2, 5), self._sync_reward_func(3, 4),
+            self._sync_reward_func(3, 5), self._sync_reward_func(4, 5),
+        ]
+        sync_all_reward = sum(sync_all_pairs) / len(sync_all_pairs)
+
+        stand_penalty = self._stand_contact_penalty()
+        return torch.where(movement_mask, sync_all_reward, stand_penalty)
+
+    def _reward_jump_takeoff(self):
+        movement_mask = self._movement_command_mask().float()
+
+        # Push phase: detect when (nearly) all legs are in contact using sync state
+        foot_contact = self.contact_forces[:, self.feet_indices, 2] > 1.0
+        num_contacts = torch.sum(foot_contact.float(), dim=1)
+        push_phase_mask = (num_contacts >= len(self.feet_indices) - 1).float()
+
+        jump_target_vertical_velocity = getattr(self.cfg.rewards, "jump_target_vertical_velocity", 0.8)
+        vertical_velocity_deficit = torch.relu(jump_target_vertical_velocity - self.base_lin_vel[:, 2])
+        return torch.square(vertical_velocity_deficit) * movement_mask * push_phase_mask
+
+    def _reward_gait_mammal(self):
+        # Mammal-style gait approximation: alternate left-side and right-side leg groups.
+        movement_mask = self._movement_command_mask()
+
+        left_group = (0, 1, 2)
+        right_group = (3, 4, 5)
+
+        sync_left = (
+            self._sync_reward_func(left_group[0], left_group[1])
+            + self._sync_reward_func(left_group[0], left_group[2])
+            + self._sync_reward_func(left_group[1], left_group[2])
+        ) / 3.0
+        sync_right = (
+            self._sync_reward_func(right_group[0], right_group[1])
+            + self._sync_reward_func(right_group[0], right_group[2])
+            + self._sync_reward_func(right_group[1], right_group[2])
+        ) / 3.0
+
+        async_cross = []
+        for left_foot in left_group:
+            for right_foot in right_group:
+                async_cross.append(self._async_reward_func(left_foot, right_foot))
+        async_cross = sum(async_cross) / len(async_cross)
+
+        movement_penalty = 0.5 * (sync_left + sync_right) + async_cross
+        stand_penalty = self._stand_contact_penalty()
+        return torch.where(movement_mask, movement_penalty, stand_penalty)
+
+    def _reward_haa_guidance_mammal(self):
+        if not hasattr(self, 'haa_indices'):
+            self.haa_indices = [self.dof_names.index(name) for name in [
+                'RF_HAA', 'RM_HAA', 'RB_HAA', 'LF_HAA', 'LM_HAA', 'LB_HAA']]
+
+        target_haa = getattr(self.cfg.rewards, 'mammal_haa_target', 1.57)
+        if isinstance(target_haa, (list, tuple)):
+            target = torch.tensor(target_haa, dtype=torch.float, device=self.device)
+        else:
+            target = torch.full((len(self.haa_indices),), target_haa, device=self.device)
+
+        movement_mask = self._movement_command_mask().float()
+        current_deviation = torch.square(self.dof_pos[:, self.haa_indices] - target).mean(dim=1)
+
+        ema = getattr(self.cfg.rewards, 'mammal_haa_guidance_ema', 0.01)
+        self.haa_guidance_mammal_ema = getattr(
+            self,
+            'haa_guidance_mammal_ema',
+            torch.zeros(self.num_envs, device=self.device),
+        )
+        self.haa_guidance_mammal_ema = (
+            ema * current_deviation + (1.0 - ema) * self.haa_guidance_mammal_ema
+        )
+        return self.haa_guidance_mammal_ema * movement_mask
+
+    def _reward_shank_perp2ground(self):
+        if not hasattr(self, 'hfe_indices'):
+            self.hfe_indices = [self.dof_names.index(name) for name in [
+                'RF_HFE', 'RM_HFE', 'RB_HFE', 'LF_HFE', 'LM_HFE', 'LB_HFE']]
+        if not hasattr(self, 'kfe_indices'):
+            self.kfe_indices = [self.dof_names.index(name) for name in [
+                'RF_KFE', 'RM_KFE', 'RB_KFE', 'LF_KFE', 'LM_KFE', 'LB_KFE']]
+        return torch.square(self.dof_pos[:, self.hfe_indices] + self.dof_pos[:, self.kfe_indices]).sum(dim=1)
 
     def _reward_stand_on_six_legs(self):
         # 低命令下：鼓励六条腿全部着地

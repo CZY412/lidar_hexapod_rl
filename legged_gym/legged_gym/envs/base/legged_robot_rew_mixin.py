@@ -53,7 +53,6 @@ class LeggedRobotRewMixin:
     def _reward_base_height(self):
         # Penalize base height away from target
         base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
-        # print(base_height)
         return torch.square(base_height - self.cfg.rewards.base_height_target)
 
     def _reward_base_foot_height(self):
@@ -84,7 +83,6 @@ class LeggedRobotRewMixin:
     # ------------ joint penalty ------------
     def _reward_torques(self):
         # Penalize torques
-        # print("torques:", self.torques[0])
         return torch.sum(torch.square(self.torques), dim=1)
 
     def _reward_dof_vel(self):
@@ -168,9 +166,7 @@ class LeggedRobotRewMixin:
         return rew_airTime
 
     def _reward_feet_contact_forces(self):
-        # # penalize high contact forces
-        # print(torch.norm(self.contact_forces[0, self.feet_indices, :], dim=-1))
-        # print(torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) - self.cfg.rewards.max_contact_force).clip(min=0.), dim=1))
+        # penalize high contact forces
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) - self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
 
     # ------------ 2 step gait penalty ------------
@@ -222,21 +218,19 @@ class LeggedRobotRewMixin:
 
     def _reward_stand_still(self):
         # Penalize motion at zero commands
-        rew = torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (torch.norm(self.commands[:, :2], dim=1) < self.speed_min)
-        # print(rew)
-        return rew
+        return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (torch.norm(self.commands[:, :2], dim=1) < self.speed_min)
 
 
     def _reward_stand_still2(self):
         # Parameters
-        contact_count_weight = 0.1
-        force_normalization_scale = 50.0
+        contact_count_weight = 0.2
+        force_normalization_scale = 10.0
         contact_time_decay_scale = 0.5
         
         # Combination weights
-        joint_position_weight = 0.5
-        contact_count_penalty_weight = 0.3
-        contact_stability_weight = 0.4
+        joint_position_weight = 2.0
+        contact_count_penalty_weight = 0.0
+        contact_stability_weight = 0.0
         contact_time_weight = 0.0
         
         # Small Cmd Mask
