@@ -21,7 +21,7 @@ from legged_gym.utils import export_policy_as_jit, get_args, task_registry
 
 
 TASK_NAME = "el4090_envelop_2"
-EXPECTED_OBS_DIM = 68
+EXPECTED_OBS_DIM = 66
 ENVELOPE_GEOMETRY_NAMES = (
     "front_width",
     "middle_width",
@@ -316,7 +316,7 @@ def play(args):
         export_policy_as_jit(ppo_runner.alg.policy, export_path)
         print("Exported policy as jit script to:", export_path)
 
-    command = {"x": 1.2, "y": 0.0, "yaw": 0.0}
+    command = {"x": 0.0, "y": 0.0, "yaw": 0.0}
     morphology_cycle = None
     camera_mode_index = 0
     camera_state = None

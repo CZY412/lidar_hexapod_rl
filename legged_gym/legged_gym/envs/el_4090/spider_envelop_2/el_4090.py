@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -26,7 +25,7 @@ from legged_gym.utils.envelop.network.haa_swing_range import (
 
 
 class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
-    """68-D locomotion policy with proprioception and gait phase."""
+    """66-D proprioceptive locomotion policy without an imposed gait clock."""
 
     cfg: El4090Envelop2Cfg
 
@@ -68,13 +67,6 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         expected_legs = {"LB", "LF", "LM", "RB", "RF", "RM"}
         if set(haa_leg_names) != expected_legs:
             raise ValueError(f"Unexpected HAA leg order: {haa_leg_names}")
-        second_tripod = {"LM", "RB", "RF"}
-        self.haa_phase_offsets = torch.tensor(
-            [math.pi if leg_name in second_tripod else 0.0 for leg_name in haa_leg_names],
-            dtype=torch.float,
-            device=self.device,
-            requires_grad=False,
-        )
         spider_haa = tuple(float(self.default_dof_pos[0, index]) for index in self.haa_indices.tolist())
         mammal_haa = tuple(float(self.mammal_default_dof_pos[0, index]) for index in self.haa_indices.tolist())
         estimator_cfg = HaaRangeConfig(
@@ -141,7 +133,7 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         self.action_history_steps[done_mask] = 0
 
     def _get_noise_scale_vec(self, cfg) -> torch.Tensor:
-        """Noise vector for the 68-D envelop_2 policy observation."""
+        """Noise vector for the 66-D envelop_2 policy observation."""
         noise_vec = torch.zeros_like(self.obs_buf[0])
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise.noise_scales
@@ -153,12 +145,10 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         noise_vec[12:30] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
         noise_vec[30:48] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
         noise_vec[48:66] = 0.0
-        noise_vec[66:68] = 0.0
         return noise_vec
 
     def compute_observations(self) -> None:
-        """Policy observes proprioception and gait phase only."""
-        gait_phase = self._get_gait_phase()
+        """Policy observes proprioception only; no external gait clock."""
         self.obs_buf = torch.cat(
             (
                 self.base_lin_vel * self.obs_scales.lin_vel,
@@ -170,8 +160,6 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
                 (self.dof_pos - self.embedded_state_default_dof_pos) * self.obs_scales.dof_pos,
                 self.dof_vel * self.obs_scales.dof_vel,
                 self.actions,
-                torch.stack((torch.sin(gait_phase), torch.cos(gait_phase)), dim=1)
-                * self.obs_scales.gait_phase,
             ),
             dim=-1,
         )
@@ -195,51 +183,6 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         lower = self.haa_swing_ranges[..., 0]
         upper = self.haa_swing_ranges[..., 1]
         return 0.5 * (lower + upper), 0.5 * (upper - lower)
-
-    def _get_gait_phase(self) -> torch.Tensor:
-        period = max(float(getattr(self.cfg.rewards, "haa_phase_period", 0.5)), 1e-6)
-        episode_time = self.episode_length_buf.to(dtype=torch.float) * self.dt
-        return torch.remainder(2.0 * math.pi * episode_time / period, 2.0 * math.pi)
-
-    def _get_haa_movement_strength(self) -> torch.Tensor:
-        min_command = float(getattr(self.cfg.rewards, "haa_phase_min_command", 0.1))
-        full_command = float(getattr(self.cfg.rewards, "haa_phase_full_command", 0.5))
-        yaw_weight = float(getattr(self.cfg.rewards, "haa_phase_yaw_weight", 0.5))
-        command_magnitude = (
-            torch.norm(self.commands[:, :2], dim=1)
-            + yaw_weight * torch.abs(self.commands[:, 2])
-        )
-        return torch.clamp(
-            (command_magnitude - min_command) / max(full_command - min_command, 1e-6),
-            0.0,
-            1.0,
-        )
-
-    def _get_haa_phase_target(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return target, availability, and command strength for each environment."""
-        center, half_range = self._get_haa_range_center_and_half()
-        min_half_range = float(self.cfg.haa_swing_range.minimum_half_range)
-        full_half_range = float(self.cfg.haa_swing_range.spider_swing_limit)
-        availability = torch.clamp(
-            (half_range - min_half_range) / max(full_half_range - min_half_range, 1e-6),
-            0.0,
-            1.0,
-        )
-        movement_strength = self._get_haa_movement_strength()
-        phase = self._get_gait_phase().unsqueeze(1) + self.haa_phase_offsets.unsqueeze(0)
-        amplitude_ratio = torch.clamp(
-            half_range.new_tensor(float(getattr(self.cfg.rewards, "haa_phase_amplitude_ratio", 0.6))),
-            0.0,
-            1.0,
-        )
-        amplitude = (
-            movement_strength.unsqueeze(1)
-            * availability
-            * amplitude_ratio
-            * half_range
-        )
-        target = center + amplitude * torch.sin(phase)
-        return target, availability, movement_strength
 
     def _make_haa_range_estimator(self, config: HaaRangeConfig):
         range_cfg = self.cfg.haa_swing_range
@@ -314,7 +257,9 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         self.envelope_state.sample(env_ids)
         if getattr(self.cfg.rewards, "reset_structure_transition_on_resample", True):
             self.embedded_state_transition_time[env_ids] = 0.0
-            self.filtered_embedded_state_default_dof_pos[env_ids] = self.default_dof_pos
+            # Do not reset the filter to the spider pose here.  It is the
+            # current smooth target, so retaining it makes the newly sampled
+            # morphology transition continuously from the previous one.
         if hasattr(self, "haa_range_estimator"):
             self._refresh_haa_swing_ranges(env_ids)
 
@@ -365,6 +310,10 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         self.action_history_steps[env_ids] = 0
         target = self._get_condition_target_dof_pos()[env_ids]
         self.embedded_state_default_dof_pos[env_ids] = target
+        # A reset starts directly in its sampled morphology.  Aligning the
+        # low-pass state avoids an artificial spider->mammal transient at the
+        # beginning of every episode.
+        self.filtered_embedded_state_default_dof_pos[env_ids] = target
         self.dof_pos[env_ids] = target
         self.dof_vel[env_ids] = 0.0
         env_ids_int32 = env_ids.to(dtype=torch.int32)
@@ -394,10 +343,81 @@ class EL_4090_ENVELOP_2(EL_4090_ENVELOP):
         valid_history = (self.action_history_steps >= 2).to(dtype=self.actions.dtype)
         return torch.sum(torch.square(second_difference), dim=1) * valid_history
 
-    def _reward_haa_phase_tracking(self) -> torch.Tensor:
-        """Track a smooth, range-aware tripod HAA target without rewarding velocity."""
-        target, _, movement_strength = self._get_haa_phase_target()
-        _, half_range = self._get_haa_range_center_and_half()
-        position = self.dof_pos[:, self.haa_indices]
-        normalized_error = (position - target) / half_range.clamp_min(1e-6)
-        return torch.mean(torch.square(normalized_error), dim=1) * movement_strength
+    def _spider_morphology_weight(self, prior_name: Optional[str] = None) -> torch.Tensor:
+        """Return a smooth 1 (spider) to 0 (mammal) morphology gate."""
+        if prior_name is not None:
+            return 1.0 - self._get_morphology_prior(prior_name)
+        priors = torch.stack(
+            [
+                self._get_morphology_prior("morphology_front_prior"),
+                self._get_morphology_prior("morphology_middle_prior"),
+                self._get_morphology_prior("morphology_back_prior"),
+            ],
+            dim=1,
+        )
+        # A mixed morphology is not a pure insect configuration.  Using the
+        # largest mammal prior prevents this guard from fighting transitions.
+        return 1.0 - torch.max(priors, dim=1).values
+
+    def _reward_stand_contact(self) -> torch.Tensor:
+        """Penalize unloaded standing feet after the morphology transition settles."""
+        threshold = float(getattr(self.cfg.rewards, "stand_contact_threshold", 1.0))
+        command_threshold = float(
+            getattr(self.cfg.rewards, "stand_command_threshold", self.speed_min)
+        )
+        contact = self.contact_forces[:, self.feet_indices, 2] > threshold
+        command_norm = torch.linalg.vector_norm(self.commands[:, :3], dim=1)
+        standing = command_norm < command_threshold
+        # During a morphology transition, feet can legitimately be unloaded
+        # while their target pose and body height settle.  Reuse the same
+        # completion gate as the gait/contact-quality rewards.
+        transition_complete = self._get_gait_reward_active_mask()
+        return (
+            torch.sum((~contact).to(self.dof_pos.dtype), dim=1)
+            * standing
+            * transition_complete
+        )
+
+    def _reward_spider_front_haa_posture(self) -> torch.Tensor:
+        """Keep front insect legs from folding too far inside their neutral spread."""
+        front_haa_indices = self.morphology_prior_haa_indices["morphology_front_prior"]
+        target = self.embedded_state_default_dof_pos[:, front_haa_indices]
+        error = torch.abs(self.dof_pos[:, front_haa_indices] - target)
+        free_error = float(
+            getattr(self.cfg.rewards, "spider_front_haa_free_error", 0.50)
+        )
+        excess = torch.relu(error - free_error)
+        command_strength = torch.linalg.vector_norm(self.commands[:, :3], dim=1)
+        moving = (command_strength > self.speed_min).to(self.dof_pos.dtype)
+        return (
+            torch.mean(torch.square(excess), dim=1)
+            * torch.square(self._spider_morphology_weight("morphology_front_prior"))
+            * moving
+        )
+
+    def _reward_spider_straightness(self) -> torch.Tensor:
+        """Give a non-saturating drift/yaw correction for straight insect walking."""
+        min_forward = float(
+            getattr(self.cfg.rewards, "spider_straight_min_forward_command", 0.15)
+        )
+        tolerance = float(
+            getattr(self.cfg.rewards, "spider_straight_command_tolerance", 0.08)
+        )
+        yaw_weight = float(getattr(self.cfg.rewards, "spider_straight_yaw_weight", 0.50))
+        straight_command = (
+            (torch.abs(self.commands[:, 0]) > min_forward)
+            & (torch.abs(self.commands[:, 1]) < tolerance)
+            & (torch.abs(self.commands[:, 2]) < tolerance)
+        ).to(self.dof_pos.dtype)
+        drift_and_yaw = (
+            torch.square(self.base_lin_vel[:, 1])
+            + yaw_weight * torch.square(self.base_ang_vel[:, 2])
+        )
+        return drift_and_yaw * torch.square(self._spider_morphology_weight()) * straight_command
+
+
+    def _reward_base_height(self):
+        # Penalize base height away from target.
+        base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
+        base_height_target = self._get_base_height_target()
+        return torch.abs(base_height - base_height_target)

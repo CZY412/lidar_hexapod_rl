@@ -1,0 +1,43 @@
+{
+  "dropped_samples": 0,
+  "input_contract": "condition [N,8], derived morphology priors",
+  "output_contract": "legacy HAA order RF/RM/RB/LF/LM/LB, [N,6,2] lower/upper radians",
+  "seed": 4090,
+  "support_source": "legged_gym/legged_gym/utils/envelop/train/export_network/legacy_haa_bootstrap.pt",
+  "teacher": "el4090_envelope.haa_rejection_ranges",
+  "teacher_config": {
+    "directions": 32,
+    "fold_bins": 257,
+    "fold_samples": 8192,
+    "min_rejected_span": 0.08,
+    "output_margin": 0.06,
+    "require_morphology_branch": true,
+    "sweep_steps": 201,
+    "synthetic_body_margin": 0.45,
+    "tolerance": 1e-05
+  },
+  "train_metrics": {
+    "endpoint_count": 2400,
+    "endpoint_mae_rad": 0.005287276115268469,
+    "endpoint_max_rad": 0.03673475980758667,
+    "estimated_remaining_margin_rad": 0.023265238851308823,
+    "margin_exhausted_endpoint_count": 0,
+    "unsafe_endpoint_count": 1339,
+    "unsafe_max_expansion_rad": 0.03673475980758667,
+    "unsafe_mean_expansion_rad": 0.0037994070444256067
+  },
+  "train_samples": 400,
+  "valid_samples": 500,
+  "validation_fraction": 0.2,
+  "validation_metrics": {
+    "endpoint_count": 600,
+    "endpoint_mae_rad": 0.00586687820032239,
+    "endpoint_max_rad": 0.03751891851425171,
+    "estimated_remaining_margin_rad": 0.022481080144643784,
+    "margin_exhausted_endpoint_count": 0,
+    "unsafe_endpoint_count": 340,
+    "unsafe_max_expansion_rad": 0.03751891851425171,
+    "unsafe_mean_expansion_rad": 0.004402088467031717
+  },
+  "validation_samples": 100
+}

@@ -8,12 +8,12 @@ from legged_gym.envs.el_4090.spider_envelop.el4090_spider_config import (
 
 class El4090Envelop2Cfg(El4090EnvelopCfg):
     class env(El4090EnvelopCfg.env):
-        # 66 proprioception + sin/cos gait phase. Morphology priors and HAA
-        # ranges remain internal environment state and are not policy inputs.
-        num_observations = 68
+        # Proprioception only. Morphology priors and HAA ranges remain internal
+        # environment state and are not policy inputs.
+        num_observations = 66
         num_physical_priors = 0
         num_haa_range_observations = 0
-        num_gait_phase_observations = 2
+        num_gait_phase_observations = 0
 
     class commands(El4090EnvelopCfg.commands):
         # Policy command is strictly [vx, vy, yaw_rate].
@@ -22,9 +22,11 @@ class El4090Envelop2Cfg(El4090EnvelopCfg):
         condition_dim = 0
         condition_names: list = []
 
-    class normalization(El4090EnvelopCfg.normalization):
-        class obs_scales(El4090EnvelopCfg.normalization.obs_scales):
-            gait_phase = 1.0
+        class ranges(El4090EnvelopCfg.commands.ranges):
+            lin_vel_x = [-1.5, 1.5]  # min max [m/s]
+            lin_vel_y = [-1.0, 1.0]   # min max [m/s]
+            ang_vel_yaw = [-1.0, 1.0]    # min max [rad/s]
+            heading = [-3.14, 3.14]
 
     class envelope:
         condition_names: list = list(El4090EnvelopCfg.commands.condition_names)
@@ -51,12 +53,14 @@ class El4090Envelop2Cfg(El4090EnvelopCfg):
             )
 
     class control(El4090EnvelopCfg.control):
-        # The environment overrides the P target with the current morphology
-        # preset; no temporal low-pass state is used.
+        # Smooth morphology-preset changes before they reach the PD controller.
+        # This prevents a sampled spider<->mammal change from producing an
+        # instantaneous joint-target jump and contact impulse.
         control_type = "P"
+        default_dof_pos_filter_tau = 0.5
 
     class init_state(El4090EnvelopCfg.init_state):
-            pos = [0.0, 0.0, 0.55]  # x,y,z [m]
+            pos = [0.0, 0.0, 0.53]  # x,y,z [m]
             default_joint_angles = {  # = target angles [rad] when action = 0.0
                 "RF_HAA": 0.0,
                 "RM_HAA": 0.0,
@@ -65,19 +69,19 @@ class El4090Envelop2Cfg(El4090EnvelopCfg):
                 "LM_HAA": 0.0,
                 "LB_HAA": 0.0,
     
-                "RF_HFE": 0.4036,
-                "RM_HFE": 0.4036,
-                "RB_HFE": 0.4036,
-                "LF_HFE": 0.4036,
-                "LM_HFE": 0.4036,
-                "LB_HFE": 0.4036,
+                "RF_HFE": 0.3020,
+                "RM_HFE": 0.3020,
+                "RB_HFE": 0.3020,
+                "LF_HFE": 0.3020,
+                "LM_HFE": 0.3020,
+                "LB_HFE": 0.3020,
     
-                "RF_KFE": -0.55019,
-                "RM_KFE": -0.55019,
-                "RB_KFE": -0.55019,
-                "LF_KFE": -0.55019,
-                "LM_KFE": -0.55019,
-                "LB_KFE": -0.55019,
+                "RF_KFE": -0.2708,
+                "RM_KFE": -0.2708,
+                "RB_KFE": -0.2708,
+                "LF_KFE": -0.2708,
+                "LM_KFE": -0.2708,
+                "LB_KFE": -0.2708,
             }
             mammal_default_joint_angles = {
                 "RF_HAA": -1.308,
@@ -87,19 +91,19 @@ class El4090Envelop2Cfg(El4090EnvelopCfg):
                 "LM_HAA": 1.308,
                 "LB_HAA": 1.308,
     
-                "RF_HFE": 0.4036,
-                "RM_HFE": 0.4036,
-                "RB_HFE": 0.4036,
-                "LF_HFE": 0.4036,
-                "LM_HFE": 0.4036,
-                "LB_HFE": 0.4036,
+                "RF_HFE": 0.3022,
+                "RM_HFE": 0.3022,
+                "RB_HFE": 0.3022,
+                "LF_HFE": 0.3022,
+                "LM_HFE": 0.3022,
+                "LB_HFE": 0.3022,
 
-                "RF_KFE": -0.4300,
-                "RM_KFE": -0.4300,
-                "RB_KFE": -0.4300,
-                "LF_KFE": -0.4300,
-                "LM_KFE": -0.4300,
-                "LB_KFE": -0.6980,
+                "RF_KFE": -0.3018,
+                "RM_KFE": -0.3018,
+                "RB_KFE": -0.3018,
+                "LF_KFE": -0.3018,
+                "LM_KFE": -0.3018,
+                "LB_KFE": -0.3018,
             }
 
     class haa_swing_range:
@@ -130,32 +134,40 @@ class El4090Envelop2Cfg(El4090EnvelopCfg):
         haa_phase_full_command = 0.5
         haa_phase_yaw_weight = 0.5
 
+        feet_air_time_target = 0.2  # 期望单脚离地时间 [s]，用于 feet_air_time 奖励
+
+        base_height_spider_target = 0.53  # 蜘蛛形态下的机身目标高度 [m]
+        base_height_mammal_target = 0.53  # 哺乳形态下的机身目标高度 [m]
+
+
         class scales:
             # Basic locomotion tracking and body stabilization.
             termination = -0.0
             tracking_lin_vel = 6
             tracking_ang_vel = 2.5
             lin_vel_z = -2
-            ang_vel_xy = -0.1
+            ang_vel_xy = -1.5   #-0.1
             orientation = -5
-            base_height = -50
+            base_height = -10
 
             # Smooth and energy-efficient joint motion.
             torques = -1e-5
             dof_vel = -1e-5
-            dof_acc = -1e-6
+            dof_acc = -1.5e-6  #-1e-6
             action_rate = -0.003
             action_jerk = -0.005
 
             # Basic foot contact and gait quality.
             feet_slip = -0.05
-            feet_air_time = 5
+            feet_air_time = 1.0
             collision = -1.0
-            stand_still = -1.5
-            feet_contact_forces = -0.03
-            feet_async = -0.1
-            feet_sync = -0.1
-            tripod_contact_pattern = -1
+            stand_still = -3.0  #-1.0
+            feet_contact_forces = -0.03  #-0.01
+            feet_async = -0.2
+            feet_sync = -0.2
+            tripod_contact_pattern = -2
+
+            # stand_contact = -5.0
 
             # Generic actuator safety limits.
             dof_pos_limits = -0.5
@@ -165,7 +177,7 @@ class El4090Envelop2Cfg(El4090EnvelopCfg):
             # Keep only the generated per-leg HAA range constraint here. A
             # phase target encourages smooth use of the available HAA range.
             haa_range_violation = -3.0
-            haa_phase_tracking = -3.0
+            # haa_phase_tracking = -3.0
 
 
 class El4090Envelop2CfgPPO(El4090EnvelopCfgPPO):
@@ -173,7 +185,7 @@ class El4090Envelop2CfgPPO(El4090EnvelopCfgPPO):
     runner_class_name = "OnPolicyRunner"
 
     class policy:
-        init_noise_std = 0.3
+        init_noise_std = 0.1
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
         activation = "elu"
@@ -201,7 +213,7 @@ class El4090Envelop2CfgPPO(El4090EnvelopCfgPPO):
 
         # logging
         save_interval = 50
-        experiment_name = "el_4090_envelop_2_p_haa_range"
+        experiment_name = "obs66_Envelop_2"
         run_name = ""
 
         # load and resume

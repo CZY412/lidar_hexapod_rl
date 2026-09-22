@@ -1209,7 +1209,7 @@ class EL_4090_ENVELOP(ElSpider):
         spider_target = getattr(
             self.cfg.rewards,
             "base_height_spider_target",
-            getattr(self.cfg.rewards, "base_height_target", 0.45),
+            getattr(self.cfg.rewards, "base_height_target", 0.53),
         )
         mammal_target = getattr(self.cfg.rewards, "base_height_mammal_target", spider_target)
         morphology_prior = self._get_body_height_morphology_prior()
