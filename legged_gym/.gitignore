@@ -79,3 +79,4 @@ legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/data/*.pt
 legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/data_*/
 legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/runs/*/
 legged_gym/scripts/play_datas/
+legged_gym/utils/envelop/*
