@@ -11,6 +11,7 @@ from legged_gym.envs.el_4090.spider_envelop.el_4090 import EL_4090_ENVELOP
 from legged_gym.envs.el_4090.spider_envelop_3.el4090_spider_config import El4090Envelop3Cfg
 from legged_gym.envs.el_4090.spider_envelop_3.modal_envelope_range import (
     ModalEnvelopeHaaRangeEstimator,
+    NoFeasibleHaaEnvelopeError,
 )
 from legged_gym.envs.el_4090.spider_envelop_3.allowed_envelope_state import (
     AllowedEnvelopeState,
@@ -171,18 +172,55 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             self.commands[env_ids, command_index] = low + torch.rand(
                 env_ids.numel(), dtype=torch.float, device=self.device,
             ) * (high - low)
-        self.envelope_state.sample(env_ids)
+        self._sample_valid_envelope_conditions(env_ids)
         if getattr(self.cfg.rewards, "reset_structure_transition_on_resample", True):
             self.embedded_state_transition_time[env_ids] = 0.0
-        self._refresh_haa_swing_ranges(env_ids)
+
+    @torch.no_grad()
+    def _sample_valid_envelope_conditions(self, env_ids: torch.Tensor) -> None:
+        """Rejection-sample geometry that admits a pose in all modal HAA domains."""
+        max_attempts = int(getattr(self.cfg.envelope_api_range, "sampling_max_attempts", 32))
+        pending = env_ids.clone()
+        last_error = None
+        for _ in range(max_attempts):
+            self.envelope_state.sample(pending)
+            accepted = []
+            for env_id in pending.tolist():
+                condition = self._get_structure_condition()[env_id:env_id + 1]
+                try:
+                    ranges, priors = self.haa_range_estimator.compute(condition)
+                except NoFeasibleHaaEnvelopeError as error:
+                    last_error = error
+                    continue
+                self.haa_swing_ranges[env_id] = ranges[0]
+                self.api_morphology_priors[env_id] = priors[0]
+                self._haa_range_condition_cache[env_id] = condition[0]
+                accepted.append(env_id)
+            if not accepted:
+                continue
+            accepted_ids = torch.tensor(accepted, dtype=torch.long, device=self.device)
+            keep = ~torch.isin(pending, accepted_ids)
+            pending = pending[keep]
+            if pending.numel() == 0:
+                return
+        raise RuntimeError(
+            f"Could not sample a feasible envelop_3 geometry after {max_attempts} attempts. "
+            "Widen envelope.ranges or increase envelope_api_range.margin. "
+            f"Last API result: {last_error}"
+        )
 
     @torch.no_grad()
     def set_envelope_condition(self, values, env_ids: Optional[torch.Tensor] = None, *,
                                derive_priors: bool = True) -> torch.Tensor:
-        updated = self.envelope_state.set(values, env_ids, derive_priors=derive_priors)
         target_ids = (torch.arange(self.num_envs, device=self.device, dtype=torch.long)
                       if env_ids is None else env_ids.to(device=self.device, dtype=torch.long))
-        self._refresh_haa_swing_ranges(target_ids)
+        previous = self.envelope_state.get(target_ids).clone()
+        updated = self.envelope_state.set(values, env_ids, derive_priors=derive_priors)
+        try:
+            self._refresh_haa_swing_ranges(target_ids)
+        except NoFeasibleHaaEnvelopeError:
+            self.envelope_state.set(previous, target_ids)
+            raise
         self.embedded_state_default_dof_pos[target_ids] = self._get_condition_target_dof_pos()[target_ids]
         return updated
 

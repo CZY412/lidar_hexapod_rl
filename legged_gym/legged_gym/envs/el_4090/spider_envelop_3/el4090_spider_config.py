@@ -51,6 +51,7 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         sweep_steps = 201
         prior_iterations = 3
         cache_precision = 3
+        sampling_max_attempts = 32
 
     class control(El4090EnvelopCfg.control):
         control_type = "P"

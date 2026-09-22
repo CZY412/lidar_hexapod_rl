@@ -13,6 +13,10 @@ _LEG_TO_PRIOR_COLUMN = {"LF": 0, "RF": 0, "LM": 1, "RM": 1, "LB": 2, "RB": 2}
 _GEOMETRY_NAMES = ("front_width", "middle_width", "back_width", "forward_limit", "backward_limit")
 
 
+class NoFeasibleHaaEnvelopeError(ValueError):
+    """The allowed polygon has no valid pose in the modal HAA domains."""
+
+
 def _package_source_root() -> Path:
     return Path(__file__).resolve().parents[3] / "utils" / "envelop" / "el4090_envelope" / "src"
 
@@ -135,7 +139,11 @@ class ModalEnvelopeHaaRangeEstimator:
         for leg_name, index in zip(self._leg_names, self._haa_indices):
             candidates = self._complement(api_result.per_haa_joint_intervals[index], float(lower[index]), float(upper[index]))
             if not candidates:
-                raise RuntimeError(f"No feasible HAA interval for {leg_name}; API mode={api_result.mode}")
+                values = ", ".join(f"{value:.3f}" for value in condition.tolist())
+                raise NoFeasibleHaaEnvelopeError(
+                    "Allowed envelope has no feasible modal HAA posture "
+                    f"(leg={leg_name}, api_mode={api_result.mode}, geometry=[{values}])."
+                )
             target = float(q[index])
             containing = [candidate for candidate in candidates if candidate[0] <= target <= candidate[1]]
             ranges.append(max(containing or candidates, key=lambda candidate: candidate[1] - candidate[0]))

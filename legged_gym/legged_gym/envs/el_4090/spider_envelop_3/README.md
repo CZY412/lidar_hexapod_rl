@@ -97,6 +97,7 @@ not alter the nominal six-vertex geometry except for `margin`.
 | `sweep_steps` | `201` | Samples per leg when scanning its HAA candidate interval. Higher values give a more accurate boundary but are slower. `51` or `101` are useful for quick debugging. |
 | `prior_iterations` | `3` | Fixed-point iterations linking range centers to the pose used by the next API query. More iterations improve consistency but cost extra API calls. |
 | `cache_precision` | `3` | Rounds each of the five geometry inputs to `0.001` m for the in-memory result cache. Higher precision has fewer cache hits; lower precision reuses approximate results more often. |
+| `sampling_max_attempts` | `32` | Maximum rejection-sampling attempts at command resampling. A sampled polygon is accepted only when all six legs have a safe HAA interval in their modal domain. |
 
 ## HAA interval and prior derivation
 
@@ -171,6 +172,14 @@ ranges.  With `commands.envelope_debug_viz = True`, the simulator draws:
 For training, select the registered task `el4090_envelop_3`.  The five geometry
 parameters are sampled whenever commands are resampled; `resampling_time` is
 inherited from the base envelope task configuration.
+
+Some narrow polygons cannot contain the capsule robot anywhere within the
+configured spider-to-mammal HAA intervals.  The API reports this as
+`api_mode=none`.  During training, `envelop_3` rejection-samples a replacement
+geometry up to `sampling_max_attempts`, so this condition does not terminate a
+run.  A manual `set_envelope_condition()` call instead raises a descriptive
+error and restores the previous valid geometry; this makes an impossible test
+condition visible rather than silently changing it.
 
 ## Which settings to change
 
