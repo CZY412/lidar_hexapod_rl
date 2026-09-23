@@ -8,10 +8,10 @@ from legged_gym.envs.el_4090.spider_envelop.el4090_spider_config import (
 
 class El4090Envelop3Cfg(El4090EnvelopCfg):
     class env(El4090EnvelopCfg.env):
-        # Proprioception only: geometry and derived priors stay internal.
-        num_observations = 66
+        # Proprioception plus six HAA [lower, upper] range pairs.
+        num_observations = 78
         num_physical_priors = 0
-        num_haa_range_observations = 0
+        num_haa_range_observations = 12
         num_gait_phase_observations = 0
 
     class commands(El4090EnvelopCfg.commands):
@@ -49,46 +49,58 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         margin = 0.05
         tolerance = 1e-6
         sweep_steps = 201
-        prior_iterations = 3
         cache_precision = 3
         sampling_max_attempts = 32
+
+        # HAA is deliberately searched only on the old spider-to-mammal
+        # segment, but there is no mammal pose or morphology interpolation.
+        # Order is LB, LF, LM, RB, RF, RM, matching Isaac HAA DOF order.
+        haa_search_ranges = [
+            [0.0, 1.308], [-1.308, 0.0], [0.0, 1.308],
+            [0.0, 1.308], [-1.308, 0.0], [0.0, 1.308],
+        ]
+
+    class haa_range_network:
+        # Five geometry inputs -> six [lower, upper] HAA intervals.
+        network_checkpoint = (
+            "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"
+            "spider_envelop_3/envelop_network/api_haa_range_network.pt"
+        )
 
     class control(El4090EnvelopCfg.control):
         control_type = "P"
         default_dof_pos_filter_tau = 0.5
 
     class init_state(El4090EnvelopCfg.init_state):
-        pos = [0.0, 0.0, 0.53]
-        # Do not change these modal endpoints independently of the envelope
-        # API: HAA centers are normalized between them and HFE/KFE follow the
-        # same derived front/middle/back prior.
+        pos = [0.0, 0.0, 0.47]
+        # The only fixed posture. HFE/KFE are pinned to these values while the
+        # API computes HAA running ranges over physical HAA joint limits.
         default_joint_angles = {
             "RF_HAA": 0.0, "RM_HAA": 0.0, "RB_HAA": 0.0,
             "LF_HAA": 0.0, "LM_HAA": 0.0, "LB_HAA": 0.0,
-            "RF_HFE": 0.3020, "RM_HFE": 0.3020, "RB_HFE": 0.3020,
-            "LF_HFE": 0.3020, "LM_HFE": 0.3020, "LB_HFE": 0.3020,
-            "RF_KFE": -0.2708, "RM_KFE": -0.2708, "RB_KFE": -0.2708,
-            "LF_KFE": -0.2708, "LM_KFE": -0.2708, "LB_KFE": -0.2708,
-        }
-        mammal_default_joint_angles = {
-            "RF_HAA": -1.308, "RM_HAA": 1.308, "RB_HAA": 1.308,
-            "LF_HAA": -1.308, "LM_HAA": 1.308, "LB_HAA": 1.308,
-            "RF_HFE": 0.3022, "RM_HFE": 0.3022, "RB_HFE": 0.3022,
-            "LF_HFE": 0.3022, "LM_HFE": 0.3022, "LB_HFE": 0.3022,
-            "RF_KFE": -0.3018, "RM_KFE": -0.3018, "RB_KFE": -0.3018,
-            "LF_KFE": -0.3018, "LM_KFE": -0.3018, "LB_KFE": -0.3018,
+            "RF_HFE": 0., "RM_HFE": 0., "RB_HFE": 0.,
+            "LF_HFE": 0., "LM_HFE": 0., "LB_HFE": 0.,
+            "RF_KFE": 0., "RM_KFE": 0., "RB_KFE": 0.,
+            "LF_KFE": 0., "LM_KFE": 0., "LB_KFE": 0.,
         }
 
     class rewards(El4090EnvelopCfg.rewards):
-        haa_range_margin = 0.0
-        haa_phase_period = 0.5
-        haa_phase_amplitude_ratio = 0.6
-        haa_phase_min_command = 0.1
-        haa_phase_full_command = 0.5
-        haa_phase_yaw_weight = 0.5
+        # A height inside this band is equally acceptable.
+        base_height_min = 0.47
+        base_height_max = 0.60
+
+        # HAA range reward: motion is rewarded only in the useful interior.
+        # The final boundary band earns no swing reward; crossing a predicted
+        # range boundary is penalized separately.
+        # Allow a small tolerance around the predicted range during learning.
+        haa_range_margin = 0.12
+        haa_range_swing_min_command = 0.10
+        haa_range_swing_velocity_clip = 4.0
+        haa_range_swing_target_excursion_ratio = 0.65
+        haa_range_swing_boundary_buffer_ratio = 0.12
+
         feet_air_time_target = 0.2
-        base_height_spider_target = 0.53
-        base_height_mammal_target = 0.53
+        # base_height_spider_target = 0.53
 
         class scales:
             termination = -0.0
@@ -108,13 +120,14 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             collision = -1.0
             stand_still = -3.0
             feet_contact_forces = -0.03
-            feet_async = -0.2
-            feet_sync = -0.2
-            tripod_contact_pattern = -2
+            feet_async = -0.1
+            feet_sync = -0.1
+            tripod_contact_pattern = -1
             dof_pos_limits = -0.5
             dof_vel_limits = -0.1
             torque_limits = -0.01
-            haa_range_violation = -3.0
+            haa_range_violation = -5.0
+            haa_range_swing = 0.5
 
 
 class El4090Envelop3CfgPPO(El4090EnvelopCfgPPO):
@@ -133,7 +146,7 @@ class El4090Envelop3CfgPPO(El4090EnvelopCfgPPO):
             use_mirror_loss = True
             mirror_loss_coeff = 0.6
             data_augmentation_func = (
-                "legged_gym.envs.el_4090.spider_envelop_3.symmetry:"
+                "legged_gym.envs.el_4090.spider_envelop_3.symmetry_obs78:"
                 "get_elair_lidar_xsym_obs_act"
             )
 
@@ -143,7 +156,7 @@ class El4090Envelop3CfgPPO(El4090EnvelopCfgPPO):
         num_steps_per_env = 24
         max_iterations = 3000
         save_interval = 50
-        experiment_name = "obs66_Envelop_3_api_ranges"
+        experiment_name = "obs78_Envelop_3_api_ranges"
         run_name = ""
         resume = False
         load_run = -1

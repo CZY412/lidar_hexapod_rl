@@ -80,3 +80,7 @@ legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/data_*/
 legged_gym/envs/el_4090/envelope_adaptive_2/sl/logs/runs/*/
 legged_gym/scripts/play_datas/
 legged_gym/utils/envelop/*
+!legged_gym/utils/envelop/train/
+!legged_gym/utils/envelop/train/train_api_haa_range.py
+!legged_gym/utils/envelop/train/visualize_api_haa_range_network.py
+!legged_gym/utils/envelop/train/README.md

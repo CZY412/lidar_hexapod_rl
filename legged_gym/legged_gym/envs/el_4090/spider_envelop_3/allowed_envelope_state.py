@@ -8,7 +8,7 @@ import torch
 
 
 class AllowedEnvelopeState:
-    """Sample or set geometry only; morphology comes from the API afterwards."""
+    """Sample or set the five external allowed-envelope geometry values."""
 
     def __init__(self, cfg, num_envs: int, device) -> None:
         self.device = torch.device(device)
@@ -38,10 +38,7 @@ class AllowedEnvelopeState:
         self,
         values: torch.Tensor | Sequence[Sequence[float]],
         env_ids: Optional[torch.Tensor] = None,
-        *,
-        derive_priors: bool = True,
     ) -> torch.Tensor:
-        del derive_priors
         target_ids = (
             torch.arange(self.num_envs, device=self.device, dtype=torch.long)
             if env_ids is None else env_ids.to(device=self.device, dtype=torch.long)
