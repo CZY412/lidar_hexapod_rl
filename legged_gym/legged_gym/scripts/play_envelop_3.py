@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES.
 
-"""Interactive playback for the 78-D network-conditioned ``el4090_envelop_3`` task."""
+"""Interactive playback for 78-D network-conditioned modal ``el4090_envelop_3``."""
 
 import play_envelop_2 as envelop_2_play
 
@@ -26,13 +26,29 @@ def _print_state(env, label, robot_index=0):
         f"{env.dof_names[index]}=[{ranges[leg, 0]:.3f}, {ranges[leg, 1]:.3f}]"
         for leg, index in enumerate(env.haa_indices.tolist())
     )
-    print(f"\n[{label}]\n  allowed envelope: {geometry}\n  network HAA ranges: {range_text}")
+    priors = torch.stack(
+        [
+            env._get_morphology_prior("morphology_front_prior")[robot_index],
+            env._get_morphology_prior("morphology_middle_prior")[robot_index],
+            env._get_morphology_prior("morphology_back_prior")[robot_index],
+        ]
+    ).detach().cpu()
+    prior_text = "  ".join(
+        f"{name}={value:.3f}"
+        for name, value in zip(("front", "middle", "back"), priors.tolist())
+    )
+    print(
+        f"\n[{label}]\n  allowed envelope: {geometry}\n"
+        f"  network HAA ranges: {range_text}\n  morphology priors: {prior_text}"
+    )
 
 
 def _apply_envelope(env, condition, *, reset_transition=True):
-    """Update the five network inputs; default pose has no transition state."""
-    del reset_transition
-    return env.set_envelope_condition(condition)
+    """Update network inputs and restart the modal-pose transition if requested."""
+    updated = env.set_envelope_condition(condition)
+    if reset_transition:
+        env.embedded_state_transition_time[:] = 0.0
+    return updated
 
 
 def _minimum_envelope_condition(env):

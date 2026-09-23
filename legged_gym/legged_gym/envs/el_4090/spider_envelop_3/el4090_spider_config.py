@@ -29,11 +29,17 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             heading = [-3.14, 3.14]
 
     class envelope:
-        # The only external training inputs. Together they define C-mode's
-        # symmetric six-vertex allowed polygon.
+        # Five geometry values are sampled externally; the three priors are
+        # deterministically derived from them, exactly as in envelop_2.
         condition_names = [
             "front_width", "middle_width", "back_width", "forward_limit", "backward_limit",
+            "morphology_front_prior", "morphology_middle_prior", "morphology_back_prior",
         ]
+        morphology_prior_mode = El4090EnvelopCfg.commands.morphology_prior_mode
+        morphology_prior_weights = El4090EnvelopCfg.commands.morphology_prior_weights
+        morphology_middle_front_follow_weight = (
+            El4090EnvelopCfg.commands.morphology_middle_front_follow_weight
+        )
 
         class ranges:
             front_width = [0.3, 0.6]
@@ -41,6 +47,15 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             back_width = [0.3, 0.6]
             forward_limit = [0.6, 0.9]
             backward_limit = [-0.9, -0.6]
+            morphology_front_prior = list(
+                El4090EnvelopCfg.commands.ranges.morphology_front_prior
+            )
+            morphology_middle_prior = list(
+                El4090EnvelopCfg.commands.ranges.morphology_middle_prior
+            )
+            morphology_back_prior = list(
+                El4090EnvelopCfg.commands.ranges.morphology_back_prior
+            )
 
     class envelope_api_range:
         # New el4090_envelope API settings. Change geometry above to alter the
@@ -52,16 +67,12 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         cache_precision = 3
         sampling_max_attempts = 32
 
-        # HAA is deliberately searched only on the old spider-to-mammal
-        # segment, but there is no mammal pose or morphology interpolation.
-        # Order is LB, LF, LM, RB, RF, RM, matching Isaac HAA DOF order.
-        haa_search_ranges = [
-            [0.0, 1.308], [-1.308, 0.0], [0.0, 1.308],
-            [0.0, 1.308], [-1.308, 0.0], [0.0, 1.308],
-        ]
 
     class haa_range_network:
         # Five geometry inputs -> six [lower, upper] HAA intervals.
+        condition_names = [
+            "front_width", "middle_width", "back_width", "forward_limit", "backward_limit",
+        ]
         network_checkpoint = (
             "{LEGGED_GYM_ROOT_DIR}/legged_gym/envs/el_4090/"
             "spider_envelop_3/envelop_network/api_haa_range_network.pt"
@@ -72,35 +83,32 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         default_dof_pos_filter_tau = 0.5
 
     class init_state(El4090EnvelopCfg.init_state):
-        pos = [0.0, 0.0, 0.47]
-        # The only fixed posture. HFE/KFE are pinned to these values while the
-        # API computes HAA running ranges over physical HAA joint limits.
+        pos = [0.0, 0.0, 0.53]
+        # Spider and mammal endpoints are interpolated with the three priors
+        # deterministically derived from the sampled envelope geometry.
         default_joint_angles = {
             "RF_HAA": 0.0, "RM_HAA": 0.0, "RB_HAA": 0.0,
             "LF_HAA": 0.0, "LM_HAA": 0.0, "LB_HAA": 0.0,
-            "RF_HFE": 0., "RM_HFE": 0., "RB_HFE": 0.,
-            "LF_HFE": 0., "LM_HFE": 0., "LB_HFE": 0.,
-            "RF_KFE": 0., "RM_KFE": 0., "RB_KFE": 0.,
-            "LF_KFE": 0., "LM_KFE": 0., "LB_KFE": 0.,
+            "RF_HFE": 0.3020, "RM_HFE": 0.3020, "RB_HFE": 0.3020,
+            "LF_HFE": 0.3020, "LM_HFE": 0.3020, "LB_HFE": 0.3020,
+            "RF_KFE": -0.2708, "RM_KFE": -0.2708, "RB_KFE": -0.2708,
+            "LF_KFE": -0.2708, "LM_KFE": -0.2708, "LB_KFE": -0.2708,
+        }
+        mammal_default_joint_angles = {
+            "RF_HAA": -1.308, "RM_HAA": 1.308, "RB_HAA": 1.308,
+            "LF_HAA": -1.308, "LM_HAA": 1.308, "LB_HAA": 1.308,
+            "RF_HFE": 0.3022, "RM_HFE": 0.3022, "RB_HFE": 0.3022,
+            "LF_HFE": 0.3022, "LM_HFE": 0.3022, "LB_HFE": 0.3022,
+            "RF_KFE": -0.3018, "RM_KFE": -0.3018, "RB_KFE": -0.3018,
+            "LF_KFE": -0.3018, "LM_KFE": -0.3018, "LB_KFE": -0.3018,
         }
 
     class rewards(El4090EnvelopCfg.rewards):
-        # A height inside this band is equally acceptable.
-        base_height_min = 0.47
-        base_height_max = 0.60
-
-        # HAA range reward: motion is rewarded only in the useful interior.
-        # The final boundary band earns no swing reward; crossing a predicted
-        # range boundary is penalized separately.
-        # Allow a small tolerance around the predicted range during learning.
-        haa_range_margin = 0.12
-        haa_range_swing_min_command = 0.10
-        haa_range_swing_velocity_clip = 4.0
-        haa_range_swing_target_excursion_ratio = 0.65
-        haa_range_swing_boundary_buffer_ratio = 0.12
+        haa_range_margin = 0.0
 
         feet_air_time_target = 0.2
-        # base_height_spider_target = 0.53
+        base_height_spider_target = 0.53
+        base_height_mammal_target = 0.53
 
         class scales:
             termination = -0.0
@@ -126,8 +134,7 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             dof_pos_limits = -0.5
             dof_vel_limits = -0.1
             torque_limits = -0.01
-            haa_range_violation = -5.0
-            haa_range_swing = 0.5
+            haa_range_violation = -3.0
 
 
 class El4090Envelop3CfgPPO(El4090EnvelopCfgPPO):

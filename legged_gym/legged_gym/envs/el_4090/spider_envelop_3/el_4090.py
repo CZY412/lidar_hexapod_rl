@@ -10,8 +10,8 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs.el_4090.spider_envelop.el_4090 import EL_4090_ENVELOP
 from legged_gym.envs.el_4090.spider_envelop_3.el4090_spider_config import El4090Envelop3Cfg
 from legged_gym.envs.el_4090.spider_envelop_3.api_haa_range_network import ApiHaaRangeNetwork
-from legged_gym.envs.el_4090.spider_envelop_3.allowed_envelope_state import (
-    AllowedEnvelopeState,
+from legged_gym.envs.el_4090.spider_envelop_2.envelope_condition import (
+    EnvelopeConditionState,
 )
 
 
@@ -24,13 +24,15 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless, task_name)
 
     def _init_buffers(self) -> None:
-        # Initialize envelop_3's five-value external state and API estimator.
+        # Keep envelop_2's eight-value condition: five geometry inputs plus
+        # the three morphology priors deterministically derived from them.
+        # The API network consumes only the five geometry values.
         EL_4090_ENVELOP._init_buffers(self)
         self.last_last_actions = torch.zeros_like(self.actions)
         self.action_history_steps = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device, requires_grad=False,
         )
-        self.envelope_state = AllowedEnvelopeState(
+        self.envelope_state = EnvelopeConditionState(
             self.cfg.envelope, self.num_envs, self.device,
         )
         self.condition_names = list(self.envelope_state.condition_names)
@@ -49,7 +51,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             device=self.device, requires_grad=False,
         )
         self._haa_range_condition_cache = torch.full(
-            (self.num_envs, self.condition_dim), float("nan"), dtype=torch.float,
+            (self.num_envs, len(self.cfg.haa_range_network.condition_names)), float("nan"), dtype=torch.float,
             device=self.device, requires_grad=False,
         )
         self._refresh_haa_swing_ranges()
@@ -61,9 +63,9 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         network = ApiHaaRangeNetwork.from_checkpoint(
             checkpoint,
             device=self.device,
-            condition_names=self.condition_names,
-            condition_low=self.condition_low,
-            condition_high=self.condition_high,
+            condition_names=self.cfg.haa_range_network.condition_names,
+            condition_low=self.condition_low[:5],
+            condition_high=self.condition_high[:5],
         )
         missing_legs = set(haa_leg_names).difference(network.leg_names)
         if missing_legs:
@@ -78,12 +80,12 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
     @torch.no_grad()
     def _refresh_haa_swing_ranges(self, env_ids=None) -> None:
         if env_ids is None:
-            condition = self._get_structure_condition()
+            condition = self._get_haa_range_network_condition()
             changed = torch.any(condition != self._haa_range_condition_cache, dim=1)
             env_ids = changed.nonzero(as_tuple=False).flatten()
         if env_ids.numel() == 0:
             return
-        condition = self._get_structure_condition()[env_ids]
+        condition = self._get_haa_range_network_condition()[env_ids]
         ranges = self.haa_range_estimator(condition)[:, self._haa_range_output_indices]
         if ranges.shape != self.haa_swing_ranges[env_ids].shape:
             raise RuntimeError(
@@ -93,14 +95,12 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         self.haa_swing_ranges[env_ids] = ranges
         self._haa_range_condition_cache[env_ids] = condition
 
-    def _get_condition_target_dof_pos(self) -> torch.Tensor:
-        """The sole embedded/controller/observation reference is spider default."""
-        return self.default_dof_pos.repeat(self.num_envs, 1)
-
-    def _get_base_height_target(self) -> torch.Tensor:
-        return torch.full(
-            (self.num_envs,), float(self.cfg.rewards.base_height_spider_target), device=self.device,
-        )
+    def _get_haa_range_network_condition(self) -> torch.Tensor:
+        """Select the network's five geometry inputs from the 2-style state."""
+        index = {name: column for column, name in enumerate(self.condition_names)}
+        return self._get_structure_condition()[
+            :, [index[name] for name in self.cfg.haa_range_network.condition_names]
+        ]
 
     def step(self, actions):
         previous_actions = self.last_actions.clone()
@@ -142,7 +142,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             self.commands[:, 0:1] * self.command_lin_vel_scale,
             self.commands[:, 1:2] * self.command_lin_vel_scale,
             self.commands[:, 2:3] * self.command_ang_vel_scale,
-            (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+            (self.dof_pos - self.embedded_state_default_dof_pos) * self.obs_scales.dof_pos,
             self.dof_vel * self.obs_scales.dof_vel,
             self.actions,
             self.haa_swing_ranges.reshape(self.num_envs, -1),
@@ -170,20 +170,20 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             self.commands[env_ids, command_index] = low + torch.rand(
                 env_ids.numel(), dtype=torch.float, device=self.device,
             ) * (high - low)
-        self._sample_valid_envelope_conditions(env_ids)
-
-    @torch.no_grad()
-    def _sample_valid_envelope_conditions(self, env_ids: torch.Tensor) -> None:
-        """Sample five network inputs and refresh their six predicted HAA ranges."""
         self.envelope_state.sample(env_ids)
         self._refresh_haa_swing_ranges(env_ids)
+        if getattr(self.cfg.rewards, "reset_structure_transition_on_resample", True):
+            self.embedded_state_transition_time[env_ids] = 0.0
 
     @torch.no_grad()
-    def set_envelope_condition(self, values, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def set_envelope_condition(
+        self, values, env_ids: Optional[torch.Tensor] = None, *, derive_priors: bool = True,
+    ) -> torch.Tensor:
         target_ids = (torch.arange(self.num_envs, device=self.device, dtype=torch.long)
                       if env_ids is None else env_ids.to(device=self.device, dtype=torch.long))
-        updated = self.envelope_state.set(values, env_ids)
+        updated = self.envelope_state.set(values, env_ids, derive_priors=derive_priors)
         self._refresh_haa_swing_ranges(target_ids)
+        self.embedded_state_default_dof_pos[target_ids] = self._get_condition_target_dof_pos()[target_ids]
         return updated
 
     def _post_physics_step_callback(self) -> None:
@@ -193,7 +193,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
     def _compute_torques(self, actions: torch.Tensor) -> torch.Tensor:
         if self.cfg.control.control_type != "P":
             return super()._compute_torques(actions)
-        target = actions * self.cfg.control.action_scale + self.default_dof_pos
+        target = actions * self.cfg.control.action_scale + self.embedded_state_default_dof_pos
         torques = self.p_gains * (target - self.dof_pos) - self.d_gains * self.dof_vel
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
@@ -203,7 +203,9 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             return
         self.last_last_actions[env_ids] = 0.0
         self.action_history_steps[env_ids] = 0
-        target = self.default_dof_pos.expand(env_ids.numel(), -1)
+        target = self._get_condition_target_dof_pos()[env_ids]
+        self.embedded_state_default_dof_pos[env_ids] = target
+        self.filtered_embedded_state_default_dof_pos[env_ids] = target
         self.dof_pos[env_ids] = target
         self.dof_vel[env_ids] = 0.0
         env_ids_int32 = env_ids.to(dtype=torch.int32)
@@ -212,68 +214,13 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         )
 
     def _reward_haa_range_violation(self) -> torch.Tensor:
-        """Penalize only positions outside the network-predicted HAA interval."""
+        """Match the original envelop_2 normalized range-violation penalty."""
         margin = float(getattr(self.cfg.rewards, "haa_range_margin", 0.0))
         lower, upper = self.haa_swing_ranges[..., 0] - margin, self.haa_swing_ranges[..., 1] + margin
         violation = torch.relu(lower - self.dof_pos[:, self.haa_indices]) + torch.relu(self.dof_pos[:, self.haa_indices] - upper)
-        normalized_violation = violation / (0.5 * (upper - lower)).clamp_min(0.10)
-        return torch.mean(torch.square(torch.clamp(normalized_violation, max=1.0)), dim=1)
-
-    def _reward_haa_range_swing(self) -> torch.Tensor:
-        """Reward useful HAA motion while withholding reward near range edges.
-
-        Motion has to reach ``target_excursion_ratio`` of the available
-        half-range to receive its full excursion factor. The final
-        ``boundary_buffer_ratio`` of either side receives no swing reward, so
-        rapidly rubbing an interval edge cannot be a rewarding strategy.
-        """
-        lower, upper = self.haa_swing_ranges[..., 0], self.haa_swing_ranges[..., 1]
-        center = 0.5 * (lower + upper)
         half_range = (0.5 * (upper - lower)).clamp_min(1e-6)
-        normalized_excursion = torch.abs(self.dof_pos[:, self.haa_indices] - center) / half_range
-
-        target_excursion = float(getattr(
-            self.cfg.rewards, "haa_range_swing_target_excursion_ratio", 0.65,
-        ))
-        boundary_buffer = float(getattr(
-            self.cfg.rewards, "haa_range_swing_boundary_buffer_ratio", 0.12,
-        ))
-        target_excursion = min(max(target_excursion, 1e-6), 1.0)
-        boundary_buffer = min(max(boundary_buffer, 1e-6), 1.0 - 1e-6)
-        excursion_factor = torch.clamp(normalized_excursion / target_excursion, max=1.0)
-        interior_factor = torch.clamp(
-            (1.0 - normalized_excursion) / boundary_buffer,
-            min=0.0,
-            max=1.0,
-        )
-        velocity_clip = max(float(getattr(
-            self.cfg.rewards, "haa_range_swing_velocity_clip", 4.0,
-        )), 1e-6)
-        velocity_factor = torch.clamp(
-            torch.abs(self.dof_vel[:, self.haa_indices]) / velocity_clip,
-            max=1.0,
-        )
-        min_command = float(getattr(self.cfg.rewards, "haa_range_swing_min_command", 0.10))
-        moving = (torch.linalg.vector_norm(self.commands[:, :3], dim=1) > min_command).to(self.dof_pos.dtype)
-        return torch.mean(velocity_factor * excursion_factor * interior_factor, dim=1) * moving
-
-    def _reward_dof_pos_limits(self) -> torch.Tensor:
-        """Keep generic joint-limit protection for HFE/KFE, not HAA ranges.
-
-        HAA's only task-specific position constraint is now
-        ``_reward_haa_range_violation`` above.
-        """
-        out_of_limits = -(self.dof_pos - self.dof_pos_limits[:, 0]).clip(max=0.0)
-        out_of_limits += (self.dof_pos - self.dof_pos_limits[:, 1]).clip(min=0.0)
-        out_of_limits[:, self.haa_indices] = 0.0
-        return torch.sum(out_of_limits, dim=1)
-
-    def _reward_stand_still(self) -> torch.Tensor:
-        """Do not pull HAA back to default while the range task is active."""
-        dof_error = torch.abs(self.dof_pos - self.default_dof_pos)
-        dof_error[:, self.haa_indices] = 0.0
-        standing = torch.linalg.vector_norm(self.commands[:, :2], dim=1) < self.speed_min
-        return torch.sum(dof_error, dim=1) * standing
+        normalized_violation = violation / half_range
+        return torch.mean(torch.square(normalized_violation), dim=1)
 
     def _reward_action_jerk(self) -> torch.Tensor:
         second_difference = self.actions - 2.0 * self.last_actions + self.last_last_actions
@@ -288,12 +235,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
 
     def _reward_base_height(self) -> torch.Tensor:
         base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
-        low = float(getattr(self.cfg.rewards, "base_height_min", 0.47))
-        high = float(getattr(self.cfg.rewards, "base_height_max", 0.60))
-        if low > high:
-            raise ValueError("rewards.base_height_min must not exceed base_height_max")
-        deviation = torch.relu(low - base_height) + torch.relu(base_height - high)
-        return torch.square(deviation)
+        return torch.abs(base_height - self._get_base_height_target())
 
     def _draw_envelope_condition_vis(self) -> None:
         """Draw the five-input polygon without invoking the replaced API estimator."""
