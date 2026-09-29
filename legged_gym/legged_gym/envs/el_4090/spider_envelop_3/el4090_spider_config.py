@@ -19,9 +19,18 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         heading_command = False
         condition_dim = 0
         condition_names = []
-        # The parent task's visualization expects the removed five-parameter
-        # envelope. Direct HAA-range v3 has no envelope polygon to draw.
-        envelope_debug_viz = False
+        # The inherited viewer hook draws a selected HAA interval in v3.
+        envelope_debug_viz = True
+        haa_range_debug_env_ids = [0]
+        haa_range_debug_leg = "LF"
+        haa_range_debug_radius = 0.22
+        haa_range_debug_samples = 33
+        haa_range_debug_arc_color = (0.0, 0.42, 0.0)
+        haa_range_debug_endpoint_color = (0.0, 0.24, 0.0)
+        haa_range_debug_marker_color = (0.90, 0.08, 0.0)
+        # Match the thick multi-line style used by envelop_2's visible envelope.
+        haa_range_debug_line_radius = 0.014
+        haa_range_debug_line_samples = 8
 
         class ranges(El4090EnvelopCfg.commands.ranges):
             lin_vel_x = [-1.5, 1.5]
@@ -29,11 +38,17 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             ang_vel_yaw = [-1.0, 1.0]
             heading = [-3.14, 3.14]
 
+        # 5% of resamples teach stable standing: half exactly zero, half near
+        # zero. The standing rewards classify both categories as stationary.
+        stand_command_probability = 0.05
+        stand_command_exact_zero_fraction = 0.5
+        stand_command_near_zero_limit = 0.05
+
     class haa_range:
         # Direct distributions for six [lower, upper] HAA intervals. Order is
         # LB, LF, LM, RB, RF, RM; LB/RB, LF/RF, and LM/RM share one interval.
         leg_names = ["LB", "LF", "LM", "RB", "RF", "RM"]
-        joint_limits = [-1.3, 1.3]
+        joint_limits = [-1.5, 1.5]
         min_width = 0.3
         max_sampling_attempts = 16
         # The midpoint of each sampled interval becomes the dynamic HAA bias
@@ -58,8 +73,8 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             "LF_HAA": 0.0, "LM_HAA": 0.0, "LB_HAA": 0.0,
             "RF_HFE": 0.2475, "RM_HFE": 0.2475, "RB_HFE": 0.2475,
             "LF_HFE": 0.2475, "LM_HFE": 0.2475, "LB_HFE": 0.2475,
-            "RF_KFE": -0.2325, "RM_KFE": -0.2325, "RB_KFE": -0.2325,
-            "LF_KFE": -0.2325, "LM_KFE": -0.2325, "LB_KFE": -0.2325,
+            "RF_KFE": -0.2475, "RM_KFE": -0.2475, "RB_KFE": -0.2475,
+            "LF_KFE": -0.2475, "LM_KFE": -0.2475, "LB_KFE": -0.2475,
         }
 
     class rewards(El4090EnvelopCfg.rewards):
@@ -75,29 +90,33 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         haa_range_compliance_softness = 0.04  # rad; soft in/out transition
 
         feet_air_time_target = 0.2
+        stand_command_threshold = 0.1
+        stand_contact_threshold = 1.0
+        stand_still_dof_vel_weight = 0.05
+        stand_still_action_rate_weight = 0.10
 
 
         class scales:
             termination = -0.0
-            collision = -1.0  # PhysX contact penalty; includes self-collisions
+            collision = -0.5  # PhysX contact penalty; includes self-collisions
             tracking_lin_vel = 6
             tracking_ang_vel = 2.5
 
             lin_vel_z = -2
-            ang_vel_xy = -1.5
+            ang_vel_xy = -1.0
             orientation = -5
             base_height = -10
 
             torques = -1e-5
             dof_vel = -1e-5
-            dof_acc = -1e-7
-            action_rate = -0.003
-            action_jerk = -0.005
+            dof_acc = -1e-6
+            action_rate = -0.02
 
             feet_slip = -0.05
             feet_air_time = 1.0
 
-            stand_still = -3.0
+            stand_still = -1.5
+            stand_contact = -1.0
             feet_contact_forces = -0.03
 
             feet_async = -0.1

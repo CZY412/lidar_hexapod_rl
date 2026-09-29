@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+import numpy as np
 import torch
 from isaacgym import gymtorch
 from typing import Optional
@@ -26,10 +30,6 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         # replaces it with an HAA interval-centre bias, without changing the
         # unique static ``default_dof_pos`` buffer.
         del self.mammal_default_dof_pos
-        self.last_last_actions = torch.zeros_like(self.actions)
-        self.action_history_steps = torch.zeros(
-            self.num_envs, dtype=torch.long, device=self.device, requires_grad=False,
-        )
         haa_leg_names = tuple(
             self.dof_names[index].split("_", 1)[0] for index in self.haa_indices.tolist()
         )
@@ -75,23 +75,6 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
     def _get_gait_reward_active_mask(self) -> torch.Tensor:
         """Keep gait rewards active immediately; envelop_3 has no posture transition."""
         return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
-
-    def step(self, actions):
-        previous_actions = self.last_actions.clone()
-        result = super().step(actions)
-        self._update_action_history(previous_actions, result[3])
-        return result
-
-    @torch.no_grad()
-    def _update_action_history(self, previous_actions: torch.Tensor, dones: torch.Tensor) -> None:
-        done_mask = dones.to(dtype=torch.bool)
-        self.last_last_actions[:] = previous_actions
-        self.action_history_steps[~done_mask] = torch.clamp(
-            self.action_history_steps[~done_mask] + 1, max=2,
-        )
-        self.last_last_actions[done_mask] = 0.0
-        self.last_actions[done_mask] = 0.0
-        self.action_history_steps[done_mask] = 0
 
     def _get_noise_scale_vec(self, cfg) -> torch.Tensor:
         """Noise vector for proprioception, target height, and HAA ranges."""
@@ -142,6 +125,16 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             self.commands[env_ids, command_index] = low + torch.rand(
                 env_ids.numel(), dtype=torch.float, device=self.device,
             ) * (high - low)
+        stand_probability = float(getattr(self.cfg.commands, "stand_command_probability", 0.05))
+        stand_mask = torch.rand(env_ids.numel(), device=self.device) < stand_probability
+        stand_ids = env_ids[stand_mask]
+        if stand_ids.numel():
+            exact_fraction = float(getattr(self.cfg.commands, "stand_command_exact_zero_fraction", 0.5))
+            exact_mask = torch.rand(stand_ids.numel(), device=self.device) < exact_fraction
+            near_limit = float(getattr(self.cfg.commands, "stand_command_near_zero_limit", 0.05))
+            near_commands = (2.0 * torch.rand(stand_ids.numel(), 3, device=self.device) - 1.0) * near_limit
+            near_commands[exact_mask] = 0.0
+            self.commands[stand_ids, :3] = near_commands
         self.haa_range_state.sample(env_ids)
         self._refresh_haa_range_bias(env_ids)
 
@@ -180,8 +173,6 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         super().reset_idx(env_ids)
         if len(env_ids) == 0:
             return
-        self.last_last_actions[env_ids] = 0.0
-        self.action_history_steps[env_ids] = 0
         target = self._get_condition_target_dof_pos()[env_ids]
         self.dof_pos[env_ids] = target
         self.dof_vel[env_ids] = 0.0
@@ -278,14 +269,15 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         return torch.sum(out_of_limits, dim=1)
 
     def _reward_stand_still(self) -> torch.Tensor:
-        """At rest, hold the static spider posture plus the HAA-centre bias."""
-        dof_error = torch.abs(self.dof_pos - self._get_condition_target_dof_pos())
-        standing = torch.linalg.vector_norm(self.commands[:, :2], dim=1) < self.speed_min
-        return torch.sum(dof_error, dim=1) * standing
-
-    def _reward_action_jerk(self) -> torch.Tensor:
-        second_difference = self.actions - 2.0 * self.last_actions + self.last_last_actions
-        return torch.sum(torch.square(second_difference), dim=1) * (self.action_history_steps >= 2).to(self.actions.dtype)
+        """Penalize pose error, joint motion, and action changes at standstill."""
+        pose_cost = torch.sum(torch.abs(self.dof_pos - self._get_condition_target_dof_pos()), dim=1)
+        velocity_weight = float(getattr(self.cfg.rewards, "stand_still_dof_vel_weight", 0.05))
+        action_weight = float(getattr(self.cfg.rewards, "stand_still_action_rate_weight", 0.10))
+        velocity_cost = velocity_weight * torch.sum(torch.square(self.dof_vel), dim=1)
+        action_cost = action_weight * torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+        threshold = float(getattr(self.cfg.rewards, "stand_command_threshold", self.speed_min))
+        standing = torch.linalg.vector_norm(self.commands[:, :3], dim=1) < threshold
+        return (pose_cost + velocity_cost + action_cost) * standing
 
     def _reward_stand_contact(self) -> torch.Tensor:
         threshold = float(getattr(self.cfg.rewards, "stand_contact_threshold", 1.0))
@@ -293,6 +285,88 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         contact = self.contact_forces[:, self.feet_indices, 2] > threshold
         standing = torch.linalg.vector_norm(self.commands[:, :3], dim=1) < command_threshold
         return torch.sum((~contact).to(self.dof_pos.dtype), dim=1) * standing * self._get_gait_reward_active_mask()
+
+    def _draw_envelope_condition_vis(self) -> None:
+        """Draw the selected leg's sampled HAA interval in the Isaac viewer.
+
+        Dark green: allowed arc and endpoint spokes. Red: instantaneous HAA.
+        This replaces the five-parameter envelope polygon removed from v3.
+        """
+        if getattr(self, "viewer", None) is None:
+            return
+        env_ids = getattr(self.cfg.commands, "haa_range_debug_env_ids", [0])
+        if isinstance(env_ids, int):
+            env_ids = [env_ids]
+        leg_name = str(getattr(self.cfg.commands, "haa_range_debug_leg", "LF"))
+        radius = float(getattr(self.cfg.commands, "haa_range_debug_radius", 0.22))
+        samples = max(3, int(getattr(self.cfg.commands, "haa_range_debug_samples", 33)))
+        arc_color = tuple(getattr(self.cfg.commands, "haa_range_debug_arc_color", (0.0, 0.42, 0.0)))
+        endpoint_color = tuple(getattr(self.cfg.commands, "haa_range_debug_endpoint_color", (0.0, 0.24, 0.0)))
+        marker_color = tuple(getattr(self.cfg.commands, "haa_range_debug_marker_color", (0.90, 0.08, 0.0)))
+        line_radius = float(getattr(self.cfg.commands, "haa_range_debug_line_radius", 0.014))
+        line_samples = max(1, int(getattr(self.cfg.commands, "haa_range_debug_line_samples", 8)))
+        self._ensure_haa_range_visualizer()
+        from legged_gym.utils.math_utils import quat_apply_yaw
+
+        leg_index = self._haa_vis_leg_names.index(leg_name)
+        dof_index = {name: index for index, name in enumerate(self.dof_names)}
+        for env_id in env_ids:
+            if env_id < 0 or env_id >= self.num_envs:
+                continue
+            q = torch.tensor(
+                [self.dof_pos[env_id, dof_index[name]].item() for name in self._haa_vis_joint_names],
+                dtype=torch.float32,
+            )
+            ranges = torch.stack([
+                self.haa_swing_ranges[env_id, self.haa_range_state.leg_names.index(leg)].detach().cpu()
+                for leg in self._haa_vis_leg_names
+            ])
+            origins, arcs, markers = self._haa_arc_geometry(
+                self._haa_vis_kinematics, q, ranges, radius=radius, samples=samples,
+            )
+            local_points = torch.cat((
+                origins[leg_index:leg_index + 1], arcs[leg_index], markers[leg_index:leg_index + 1],
+            ))
+            world_points = quat_apply_yaw(
+                self.base_quat[env_id].detach().cpu().repeat(local_points.shape[0], 1), local_points,
+            ) + self.root_states[env_id, :3].detach().cpu().unsqueeze(0)
+            origin = world_points[0].numpy()
+            arc = world_points[1:-1].numpy()
+            marker = world_points[-1].numpy()
+            # Reuse envelop_2's visible multi-line tube treatment instead of
+            # Isaac Gym's otherwise hard-to-see one-pixel debug lines.
+            points = np.concatenate((arc, origin[None], marker[None]), axis=0)
+            origin_index, marker_index = len(arc), len(arc) + 1
+            edges = [(index, index + 1) for index in range(len(arc) - 1)]
+            edge_colors = [arc_color] * len(edges)
+            edges.extend(((origin_index, 0), (origin_index, len(arc) - 1), (origin_index, marker_index)))
+            edge_colors.extend((endpoint_color, endpoint_color, marker_color))
+            vertices, colors = self._make_bold_envelope_lines(
+                points, edges, edge_colors, line_radius, line_samples,
+            )
+            self.gym.add_lines(
+                self.viewer,
+                self.envs[env_id],
+                len(colors),
+                vertices,
+                colors,
+            )
+
+    def _ensure_haa_range_visualizer(self) -> None:
+        if hasattr(self, "_haa_vis_kinematics"):
+            return
+        source_root = Path(__file__).resolve().parents[3] / "utils" / "envelop" / "el4090_envelope" / "src"
+        if str(source_root) not in sys.path:
+            sys.path.insert(0, str(source_root))
+        from el4090_envelope import BatchedUrdfKinematics, load_urdf_joints
+        from el4090_envelope.geometry import haa_arc_geometry
+        from el4090_envelope.model import EL4090_JOINT_NAMES, EL4090_LEG_NAMES
+
+        urdf = Path(__file__).resolve().parents[4] / "resources" / "robots" / "el_4090" / "urdf" / "el_4090.urdf"
+        self._haa_vis_kinematics = BatchedUrdfKinematics(load_urdf_joints(urdf))
+        self._haa_vis_joint_names = tuple(EL4090_JOINT_NAMES)
+        self._haa_vis_leg_names = tuple(EL4090_LEG_NAMES)
+        self._haa_arc_geometry = haa_arc_geometry
 
     def _reward_base_height(self) -> torch.Tensor:
         base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
