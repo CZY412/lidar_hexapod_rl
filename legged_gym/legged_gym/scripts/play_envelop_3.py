@@ -1,94 +1,146 @@
-# SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES.
+"""Interactive playback for direct random HAA ranges in ``el4090_envelop_3``."""
 
-"""Interactive playback for 78-D network-conditioned modal ``el4090_envelop_3``."""
+import os
+import select
+import sys
+import termios
+import time
+import tty
 
-import play_envelop_2 as envelop_2_play
-
+import isaacgym  # noqa: F401 -- must precede torch-backed environment imports.
 import torch
+
+from legged_gym.envs import *  # noqa: F401,F403 -- register tasks.
+from legged_gym.utils import get_args, task_registry
 
 
 TASK_NAME = "el4090_envelop_3"
-EXPECTED_OBS_DIM = 78
+EXPECTED_OBS_DIM = 79
 
 
-def _print_state(env, label, robot_index=0):
-    label = {
-        "前腿 mammal 测试包络": "最小包络",
-        "O 循环开始：全昆虫型": "O 循环开始：最大包络",
-        "O 循环中点：全哺乳型": "O 循环中点：最小包络",
-        "O 循环完成：全昆虫型": "O 循环完成：最大包络",
-    }.get(label, label)
-    condition = env._get_structure_condition()[robot_index]
-    names = list(env.condition_names)
-    geometry = "  ".join(f"{name}={condition[names.index(name)].item():.3f}" for name in names)
-    ranges = env.haa_swing_ranges[robot_index].detach().cpu()
-    range_text = "  ".join(
-        f"{env.dof_names[index]}=[{ranges[leg, 0]:.3f}, {ranges[leg, 1]:.3f}]"
-        for leg, index in enumerate(env.haa_indices.tolist())
+class KeyboardInput:
+    """Non-blocking single-key terminal input for interactive playback."""
+
+    def __enter__(self):
+        self.fd = None
+        self.old_settings = None
+        if sys.stdin.isatty():
+            self.fd = sys.stdin.fileno()
+            self.old_settings = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.fd is not None and self.old_settings is not None:
+            termios.tcsetattr(self.fd, termios.TCSANOW, self.old_settings)
+
+    def read_keys(self):
+        if self.fd is None:
+            return []
+        keys = []
+        while select.select([self.fd], [], [], 0.0)[0]:
+            key = os.read(self.fd, 1).decode(errors="ignore")
+            if key:
+                keys.append(key.lower())
+        return keys
+
+
+def _print_ranges(env, label: str) -> None:
+    ranges = env.haa_swing_ranges[0].detach().cpu()
+    text = "  ".join(
+        f"{env.dof_names[dof]}=[{ranges[leg, 0]:.3f}, {ranges[leg, 1]:.3f}]"
+        for leg, dof in enumerate(env.haa_indices.tolist())
     )
-    priors = torch.stack(
-        [
-            env._get_morphology_prior("morphology_front_prior")[robot_index],
-            env._get_morphology_prior("morphology_middle_prior")[robot_index],
-            env._get_morphology_prior("morphology_back_prior")[robot_index],
-        ]
-    ).detach().cpu()
-    prior_text = "  ".join(
-        f"{name}={value:.3f}"
-        for name, value in zip(("front", "middle", "back"), priors.tolist())
-    )
+    print(f"\n[{label}] target_height={env.cfg.rewards.target_height}\n  {text}")
+
+
+def _print_help() -> None:
     print(
-        f"\n[{label}]\n  allowed envelope: {geometry}\n"
-        f"  network HAA ranges: {range_text}\n  morphology priors: {prior_text}"
+        "\nControls: W/S forward/back, A/D lateral, Q/E yaw, X stop, "
+        "R resample direct HAA ranges, P print ranges, Esc quit."
     )
-
-
-def _apply_envelope(env, condition, *, reset_transition=True):
-    """Update network inputs and restart the modal-pose transition if requested."""
-    updated = env.set_envelope_condition(condition)
-    if reset_transition:
-        env.embedded_state_transition_time[:] = 0.0
-    return updated
-
-
-def _minimum_envelope_condition(env):
-    """Smallest five-parameter envelope inside the network training bounds."""
-    state = env.envelope_state
-    condition = (0.5 * (state.low + state.high)).unsqueeze(0).repeat(env.num_envs, 1)
-    names = list(state.condition_names)
-    for name in ("front_width", "middle_width", "back_width", "forward_limit"):
-        index = names.index(name)
-        condition[:, index] = state.low[index]
-    backward_index = names.index("backward_limit")
-    condition[:, backward_index] = state.high[backward_index]
-    return condition
-
-
-def _print_keyboard_table(follow_camera):
-    print("\n按键：W/S 前后，A/D 横移，Q/E 转向，X 停止，"
-          "M 最大包络，R 随机训练包络，F 最小包络，"
-          "O 最大/最小包络循环，ESC 退出。")
-    if follow_camera:
-        print("C：切换相机视角。")
 
 
 def main() -> None:
-    # envelop_2 already drives the same five external geometry controls.
-    envelop_2_play.TASK_NAME = TASK_NAME
-    envelop_2_play.EXPECTED_OBS_DIM = EXPECTED_OBS_DIM
-    envelop_2_play.EXPORT_POLICY = True
-    envelop_2_play._print_envelope_state = _print_state
-    envelop_2_play._apply_envelope = _apply_envelope
-    envelop_2_play._front_mammal_condition = _minimum_envelope_condition
-    envelop_2_play._all_insect_condition = envelop_2_play._maximum_envelope_condition
-    envelop_2_play._all_mammal_condition = _minimum_envelope_condition
-    envelop_2_play._print_keyboard_table = _print_keyboard_table
-    args = envelop_2_play.get_args(
-        [{"name": "--max_steps", "type": int, "help": "Stop after this many simulation steps."}]
-    )
-    envelop_2_play.FOLLOW_CAMERA = not args.headless
-    envelop_2_play.REALTIME_MODE = not args.headless
-    envelop_2_play.play(args)
+    args = get_args([{
+        "name": "--max_steps",
+        "type": int,
+        "default": 1000000,
+        "help": "Maximum playback steps; use Esc to stop interactive playback.",
+    }])
+    args.task = TASK_NAME
+    env_cfg, train_cfg = task_registry.get_cfgs(name=TASK_NAME)
+    env_cfg.env.num_envs = 1
+    env_cfg.env.episode_length_s = 1e9
+    env_cfg.noise.add_noise = False
+    env_cfg.domain_rand.randomize_friction = False
+    env_cfg.domain_rand.push_robots = False
+    env_cfg.commands.curriculum = False
+    env_cfg.commands.envelope_debug_viz = False
+    # R controls sampling explicitly, so intervals do not change unattended.
+    env_cfg.commands.resampling_time = 1e9
+    env, _ = task_registry.make_env(name=TASK_NAME, args=args, env_cfg=env_cfg)
+    env.commands[:, :3] = torch.tensor([0.0, 0.0, 0.0], device=env.device)
+    env.sample_haa_ranges()
+    env.compute_observations()
+    obs = env.get_observations()
+    if obs.shape[-1] != EXPECTED_OBS_DIM:
+        raise RuntimeError(f"Expected {EXPECTED_OBS_DIM} observations, got {obs.shape[-1]}")
+
+    train_cfg.runner.resume = True
+    runner, _ = task_registry.make_alg_runner(env=env, name=TASK_NAME, args=args, train_cfg=train_cfg)
+    policy = runner.get_inference_policy(device=env.device)
+    command = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+    _print_help()
+    _print_ranges(env, "initial direct sample")
+
+    keyboard = KeyboardInput()
+    keyboard.__enter__()
+    try:
+        if keyboard.fd is None:
+            print("stdin is not a TTY; running until --max_steps.")
+        for step in range(args.max_steps):
+            step_start = time.time()
+            stop = False
+            for key in keyboard.read_keys():
+                if key == "\x1b":
+                    stop = True
+                elif key == "w":
+                    command["x"] = 1.2
+                elif key == "s":
+                    command["x"] = -1.2
+                elif key == "a":
+                    command["y"] = 0.8
+                elif key == "d":
+                    command["y"] = -0.8
+                elif key == "q":
+                    command["yaw"] = 0.8
+                elif key == "e":
+                    command["yaw"] = -0.8
+                elif key == "x":
+                    command = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+                elif key == "r":
+                    env.sample_haa_ranges()
+                    env.compute_observations()
+                    obs = env.get_observations()
+                    _print_ranges(env, "new direct sample")
+                elif key == "p":
+                    _print_ranges(env, "current sample")
+            if stop:
+                break
+
+            env.commands[:, 0] = command["x"]
+            env.commands[:, 1] = command["y"]
+            env.commands[:, 2] = command["yaw"]
+            obs, _, _, dones, _ = env.step(policy(obs.detach()).detach())
+            if torch.any(dones):
+                _print_ranges(env, f"resampled by reset at step {step}")
+            if not args.headless:
+                sleep_time = env.dt - (time.time() - step_start)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+    finally:
+        keyboard.__exit__(None, None, None)
 
 
 if __name__ == "__main__":
