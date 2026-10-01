@@ -38,17 +38,22 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             ang_vel_yaw = [-1.0, 1.0]
             heading = [-3.14, 3.14]
 
-        # 5% of resamples teach stable standing: half exactly zero, half near
-        # zero. The standing rewards classify both categories as stationary.
+        # Keep this off during the locomotion-learning stage.  Enable it for a
+        # later standing fine-tune: 5% of resamples then become half exact-zero
+        # and half near-zero commands.
+        enable_stand_commands = False
         stand_command_probability = 0.05
         stand_command_exact_zero_fraction = 0.5
         stand_command_near_zero_limit = 0.05
 
     class haa_range:
-        # Direct distributions for six [lower, upper] HAA intervals. Order is
-        # LB, LF, LM, RB, RF, RM; LB/RB, LF/RF, and LM/RM share one interval.
+        # Five envelope values are freely sampled from the network domain.
+        # Runtime retries only for a non-finite or < 0.3 rad predicted interval;
+        # collision analysis remains an offline diagnostic.
+        network_path = "spider_envelop_3/envelop_network/api_haa_range_network.pt"
         leg_names = ["LB", "LF", "LM", "RB", "RF", "RM"]
-        joint_limits = [-1.5, 1.5]
+        # Match the HAA-network output domain exactly.
+        joint_limits = [-1.308, 1.308]
         min_width = 0.3
         max_sampling_attempts = 16
         # The midpoint of each sampled interval becomes the dynamic HAA bias
@@ -66,20 +71,23 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         default_dof_pos_filter_tau = 0.5
 
     class init_state(El4090EnvelopCfg.init_state):
-        pos = [0.0, 0.0, 0.52]
-        # Unique spider standing posture calibrated for a 0.52 m base height.
+        pos = [0.0, 0.0, 0.55]
+        # The HFE/KFE posture used when generating HAA-range network labels.
         default_joint_angles = {
             "RF_HAA": 0.0, "RM_HAA": 0.0, "RB_HAA": 0.0,
             "LF_HAA": 0.0, "LM_HAA": 0.0, "LB_HAA": 0.0,
-            "RF_HFE": 0.2475, "RM_HFE": 0.2475, "RB_HFE": 0.2475,
-            "LF_HFE": 0.2475, "LM_HFE": 0.2475, "LB_HFE": 0.2475,
-            "RF_KFE": -0.2475, "RM_KFE": -0.2475, "RB_KFE": -0.2475,
-            "LF_KFE": -0.2475, "LM_KFE": -0.2475, "LB_KFE": -0.2475,
+            "RF_HFE": 0.4050, "RM_HFE": 0.4050, "RB_HFE": 0.4050,
+            "LF_HFE": 0.4050, "LM_HFE": 0.4050, "LB_HFE": 0.4050,
+            "RF_KFE": -0.39, "RM_KFE": -0.39, "RB_KFE": -0.39,
+            "LF_KFE": -0.39, "LM_KFE": -0.39, "LB_KFE": -0.39,
         }
 
     class rewards(El4090EnvelopCfg.rewards):
         # One shared reset, observation, and reward target height.
-        target_height = 0.52
+        target_height = 0.50
+        # No cost at/above this clearance; apply a strong quadratic penalty
+        # below it. This remains independent of the cruising-height target.
+        minimum_base_height = 0.50
 
         # HAA range curriculum: keep the policy inside its sampled box without
         # prescribing a centre point or a particular HAA swing trajectory.
@@ -88,6 +96,12 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         haa_range_violation_warmup_steps = 100000
         haa_range_compliance_margin = 0.04  # keep a small buffer from edges
         haa_range_compliance_softness = 0.04  # rad; soft in/out transition
+
+        # A direct range resample changes the HAA-centre bias discontinuously.
+        # Only gait/standing objectives ramp during the resulting adjustment;
+        # safety, tracking, and HAA-bound objectives remain active.
+        haa_range_gait_reward_ramp_time = 0.4
+        haa_range_stand_reward_ramp_time = 0.2
 
         feet_air_time_target = 0.2
         stand_command_threshold = 0.1
@@ -103,25 +117,26 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             tracking_ang_vel = 2.5
 
             lin_vel_z = -2
-            ang_vel_xy = -1.0
+            ang_vel_xy = -1.5
             orientation = -5
-            base_height = -10
+            base_height = -50
+            base_height_minimum = -200
 
             torques = -1e-5
             dof_vel = -1e-5
-            dof_acc = -1e-6
-            action_rate = -0.02
+            dof_acc = -1e-7
+            action_rate = -0.003
 
             feet_slip = -0.05
             feet_air_time = 1.0
 
             stand_still = -1.5
             stand_contact = -1.0
-            feet_contact_forces = -0.03
+            feet_contact_forces = -0.05
 
-            feet_async = -0.1
-            feet_sync = -0.1
-            tripod_contact_pattern = -1
+            feet_async = -0.07
+            feet_sync = -0.07
+            tripod_contact_pattern = -3
 
             dof_pos_limits = -0.5
             dof_vel_limits = -0.1

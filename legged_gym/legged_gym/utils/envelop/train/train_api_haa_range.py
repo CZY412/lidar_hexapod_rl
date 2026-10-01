@@ -29,38 +29,86 @@ HAA_LOW = (0.0, -1.308, 0.0, 0.0, -1.308, 0.0)
 HAA_HIGH = (1.308, 0.0, 1.308, 1.308, 0.0, 1.308)
 
 
-def _load_estimator_class():
-    env_dir = Path(__file__).resolve().parents[3] / "envs/el_4090/spider_envelop_3"
-    if str(env_dir) not in sys.path:
-        sys.path.insert(0, str(env_dir))
-    from modal_envelope_range import NoFeasibleHaaEnvelopeError, SpiderEnvelopeHaaRangeEstimator
-    return NoFeasibleHaaEnvelopeError, SpiderEnvelopeHaaRangeEstimator
+class NoFeasibleHaaEnvelopeError(RuntimeError):
+    """The five-parameter envelope has no usable HAA interval."""
 
 
 class ApiRangeLabeler:
-    """CPU wrapper around the exact fixed-spider envelop_3 range algorithm."""
+    """Exact five-parameter envelope -> safe paired HAA intervals.
+
+    This deliberately calls the maintained ``el4090_envelope`` API rather
+    than a task-local copy.  HFE/KFE are pinned to the one spider default
+    posture used by envelop_3; only HAA is swept.
+    """
 
     def __init__(self, *, directions: int, margin: float, tolerance: float, sweep_steps: int) -> None:
-        no_feasible, estimator_type = _load_estimator_class()
-        self.no_feasible = no_feasible
-        # This is the one current spider default: all HAA/HFE/KFE are zero.
-        dof_names = tuple(f"{leg}_{joint}" for leg in LEG_NAMES for joint in ("HAA", "HFE", "KFE"))
-        # The API itself uses EL4090's canonical joint ordering; the estimator
-        # maps this Isaac-style order by joint name.
-        self.estimator = estimator_type(
-            argparse.Namespace(
-                directions=directions, margin=margin, tolerance=tolerance,
-                sweep_steps=sweep_steps, cache_precision=6,
-            ),
-            condition_names=CONDITION_NAMES,
-            leg_names=LEG_NAMES,
-            dof_names=dof_names,
-            spider_dof_pos=torch.zeros(len(dof_names)),
-            haa_search_ranges=tuple(zip(HAA_LOW, HAA_HIGH)),
-        )
+        self.no_feasible = NoFeasibleHaaEnvelopeError  # compatibility for visualization callers
+        source = Path(__file__).resolve().parents[1] / "el4090_envelope" / "src"
+        if str(source) not in sys.path:
+            sys.path.insert(0, str(source))
+        from el4090_envelope import (BatchedUrdfKinematics, default_el4090_capsules,
+                                     haa_rejection_ranges, load_urdf_joints,
+                                     support_directions)
+        urdf = Path(__file__).resolve().parents[4] / "resources/robots/el_4090/urdf/el_4090.urdf"
+        self.kinematics = BatchedUrdfKinematics(load_urdf_joints(urdf))
+        self.capsules = default_el4090_capsules()
+        self.haa_rejection_ranges = haa_rejection_ranges
+        self.directions = support_directions(directions)
+        self.margin, self.tolerance, self.sweep_steps = margin, tolerance, sweep_steps
+        self.lower, self.upper = self.kinematics.joint_limits(soft_fraction=1.0)
+        self.haa_indices = tuple(self.kinematics.actuated_joint_names.index(f"{leg}_HAA") for leg in LEG_NAMES)
+        self.pinned = torch.zeros(self.kinematics.num_dof)
+        # Must agree with El4090Envelop3Cfg.init_state.default_joint_angles.
+        for leg in LEG_NAMES:
+            self.pinned[self.kinematics.actuated_joint_names.index(f"{leg}_HFE")] = 0.405
+            self.pinned[self.kinematics.actuated_joint_names.index(f"{leg}_KFE")] = -0.39
+
+    def _allowed_support(self, condition: Tensor) -> Tensor:
+        front, middle, back, forward, backward = condition.tolist()
+        vertices = torch.tensor(((forward, front), (0., middle), (backward, back),
+                                 (backward, -back), (0., -middle), (forward, -front)))
+        return (vertices @ self.directions.T).amax(dim=0) + self.margin
+
+    @staticmethod
+    def _safe_segments(low: float, high: float, rejected) -> list[tuple[float, float]]:
+        result, cursor = [], low
+        for left, right in sorted(rejected):
+            # A rejected band may lie wholly outside the deliberately smaller
+            # spider training segment (the API itself uses URDF limits).
+            if right <= low or left >= high:
+                continue
+            left, right = max(left, low), min(right, high)
+            if left > cursor:
+                result.append((cursor, left))
+            cursor = max(cursor, right)
+        if cursor < high:
+            result.append((cursor, high))
+        return result
 
     def label(self, condition: Tensor) -> Tensor:
-        return self.estimator.compute(condition.unsqueeze(0))[0]
+        rejected = self.haa_rejection_ranges(
+            self.kinematics, self.capsules, self.directions,
+            self._allowed_support(condition), self.lower, self.upper, self.pinned,
+            self.haa_indices, tolerance=self.tolerance, sweep_steps=self.sweep_steps,
+        ).per_haa_joint_intervals
+        ranges = []
+        for index, joint_index in enumerate(self.haa_indices):
+            choices = self._safe_segments(HAA_LOW[index], HAA_HIGH[index], rejected[joint_index])
+            choices = [item for item in choices if item[1] - item[0] >= 0.3]
+            if not choices:
+                raise NoFeasibleHaaEnvelopeError(f"no >=0.3 rad interval for {LEG_NAMES[index]}")
+            # Prefer the interval nearest the standing HAA=0 posture.
+            ranges.append(min(choices, key=lambda item: (0.0 if item[0] <= 0 <= item[1]
+                                                           else min(abs(item[0]), abs(item[1])), - (item[1] - item[0]))))
+        output = torch.tensor(ranges, dtype=torch.float32)
+        # Coupled left/right legs need the intersection, not an average: this
+        # preserves safety for both individually computed API intervals.
+        for left, right in ((0, 3), (1, 4), (2, 5)):
+            lo, hi = max(float(output[left, 0]), float(output[right, 0])), min(float(output[left, 1]), float(output[right, 1]))
+            if hi - lo < 0.3:
+                raise NoFeasibleHaaEnvelopeError(f"paired {LEG_NAMES[left]}/{LEG_NAMES[right]} interval is too narrow")
+            output[left] = output[right] = torch.tensor((lo, hi))
+        return output
 
 
 class ApiHaaRangeNetwork(nn.Module):
@@ -84,10 +132,16 @@ class ApiHaaRangeNetwork(nn.Module):
     def forward(self, condition: Tensor) -> Tensor:
         normalized = 2.0 * (condition - self.condition_low) / (self.condition_high - self.condition_low) - 1.0
         feature = self.backbone(normalized)
-        center = self.haa_low + torch.sigmoid(self.center_head(feature)) * (self.haa_high - self.haa_low)
+        # Guarantee every prediction is suitable for HaaRangeState before the
+        # collision filter sees it: lower < upper and width >= 0.3 rad.
+        minimum_half = 0.15
+        center = self.haa_low + minimum_half + torch.sigmoid(self.center_head(feature)) * (self.haa_high - self.haa_low - 2.0 * minimum_half)
         max_half = torch.minimum(center - self.haa_low, self.haa_high - center)
-        half = torch.sigmoid(self.half_head(feature)) * max_half
-        return torch.stack((center - half, center + half), dim=-1)
+        half = minimum_half + torch.sigmoid(self.half_head(feature)) * (max_half - minimum_half)
+        ranges = torch.stack((center - half, center + half), dim=-1)
+        # The training sampler and collision checker operate on mirrored pairs.
+        pair = 0.5 * (ranges[:, :3] + ranges[:, 3:])
+        return pair[:, (0, 1, 2, 0, 1, 2)]
 
 
 def generate_dataset(labeler: ApiRangeLabeler, samples: int, seed: int) -> Dict[str, Tensor]:

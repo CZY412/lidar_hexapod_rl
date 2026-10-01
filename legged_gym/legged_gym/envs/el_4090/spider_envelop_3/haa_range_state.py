@@ -10,7 +10,15 @@ import torch
 class HaaRangeState:
     """Own valid directly sampled ``[lower, upper]`` HAA intervals."""
 
-    def __init__(self, cfg, num_envs: int, device, *, interference_checker=None) -> None:
+    def __init__(
+        self,
+        cfg,
+        num_envs: int,
+        device,
+        *,
+        interference_checker=None,
+        interference_check_batch_size: int = 64,
+    ) -> None:
         self.device = torch.device(device)
         self.num_envs = int(num_envs)
         self.leg_names = tuple(cfg.leg_names)
@@ -19,6 +27,7 @@ class HaaRangeState:
         self.min_width = float(cfg.min_width)
         self.max_attempts = int(cfg.max_sampling_attempts)
         self.interference_checker = interference_checker
+        self.interference_check_batch_size = int(interference_check_batch_size)
         size = len(self.leg_names)
         if size != 6 or self.leg_names != ("LB", "LF", "LM", "RB", "RF", "RM"):
             raise ValueError("haa_range leg_names must be LB, LF, LM, RB, RF, RM")
@@ -26,6 +35,8 @@ class HaaRangeState:
             raise ValueError("haa_range must be within valid joint bounds and have min_width >= 0.3")
         if self.max_attempts < 1:
             raise ValueError("haa_range.max_sampling_attempts must be positive")
+        if self.interference_check_batch_size < 1:
+            raise ValueError("interference_check_batch_size must be positive")
         self.ranges = torch.empty(self.num_envs, size, 2, dtype=torch.float, device=self.device)
         self.ranges[..., 0] = -0.5 * self.min_width
         self.ranges[..., 1] = 0.5 * self.min_width
@@ -44,18 +55,28 @@ class HaaRangeState:
             if not remaining.numel():
                 break
             candidate = self._sample_candidate(remaining.numel())
-            safe = (self.interference_checker.is_safe(candidate)
-                    if self.interference_checker is not None
-                    else torch.ones(remaining.numel(), dtype=torch.bool, device=self.device))
+            safe = self._is_safe(candidate)
             if safe.any():
                 self.ranges[remaining[safe]] = candidate[safe]
             remaining = remaining[~safe]
         if remaining.numel():
             fallback = self._fallback(remaining.numel())
-            if self.interference_checker is not None and not torch.all(self.interference_checker.is_safe(fallback)):
+            if not torch.all(self._is_safe(fallback)):
                 raise RuntimeError("The configured fallback HAA interval fails the self-interference check")
             self.ranges[remaining] = fallback
         return self.ranges[env_ids]
+
+    def _is_safe(self, ranges: torch.Tensor) -> torch.Tensor:
+        """Run the expensive all-corner check in bounded-size GPU batches."""
+        if self.interference_checker is None:
+            return torch.ones(ranges.shape[0], dtype=torch.bool, device=self.device)
+        batch_size = self.interference_check_batch_size
+        if ranges.shape[0] <= batch_size:
+            return self.interference_checker.is_safe(ranges)
+        return torch.cat([
+            self.interference_checker.is_safe(ranges[start:start + batch_size])
+            for start in range(0, ranges.shape[0], batch_size)
+        ], dim=0)
 
     def _sample_candidate(self, count: int) -> torch.Tensor:
         # Sample the three left/right leg-pair intervals. Each lower endpoint
@@ -86,7 +107,7 @@ class HaaRangeState:
             raise ValueError(f"Each HAA range must have width >= {self.min_width}")
         if not (torch.equal(values[:, 0], values[:, 3]) and torch.equal(values[:, 1], values[:, 4]) and torch.equal(values[:, 2], values[:, 5])):
             raise ValueError("LB/RB, LF/RF, and LM/RM must use identical HAA ranges")
-        if self.interference_checker is not None and not torch.all(self.interference_checker.is_safe(values)):
+        if not torch.all(self._is_safe(values)):
             raise ValueError("Requested HAA ranges fail the self-interference check")
         self.ranges[target_ids] = values
         return self.ranges[target_ids]

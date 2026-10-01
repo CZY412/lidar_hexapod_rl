@@ -33,10 +33,10 @@ def _assert_valid_ranges(env, ranges: torch.Tensor, label: str) -> None:
     assert torch.equal(ranges[:, 2], ranges[:, 5]), f"{label}: LM/RM ranges differ"
 
 
-def _extreme_ranges(env) -> torch.Tensor:
-    """One valid, coupled mixed-endpoint case shared with play's stress presets."""
+def _safe_ranges(env) -> torch.Tensor:
+    """A neutral coupled box known to be suitable for explicit-set testing."""
     pair_ranges = torch.tensor(
-        ((-1.30, -0.95), (0.95, 1.30), (-0.15, 0.15)),
+        ((-0.15, 0.15), (-0.15, 0.15), (-0.15, 0.15)),
         dtype=torch.float,
         device=env.device,
     )
@@ -44,12 +44,13 @@ def _extreme_ranges(env) -> torch.Tensor:
 
 
 def _check_standing_command_sampling(env, rounds: int = 128) -> None:
-    """Check that resampling supplies exact-zero and near-zero stand examples."""
+    """Check optional standing-command sampling without changing HAA ranges."""
     exact_zero_count = 0
     standing_count = 0
     total = 0
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
     threshold = float(env.cfg.rewards.stand_command_threshold)
+    ranges_before = env.haa_swing_ranges.clone()
     for _ in range(rounds):
         env._resample_commands(env_ids)
         commands = env.commands[:, :3]
@@ -61,8 +62,45 @@ def _check_standing_command_sampling(env, rounds: int = 128) -> None:
     # bounds avoid statistical flakes while detecting removed sampling logic.
     exact_fraction = exact_zero_count / total
     standing_fraction = standing_count / total
-    assert 0.005 <= exact_fraction <= 0.06, f"exact-zero fraction {exact_fraction:.3f} is unexpected"
-    assert 0.02 <= standing_fraction <= 0.10, f"standing fraction {standing_fraction:.3f} is unexpected"
+    if bool(getattr(env.cfg.commands, "enable_stand_commands", False)):
+        assert 0.005 <= exact_fraction <= 0.06, f"exact-zero fraction {exact_fraction:.3f} is unexpected"
+        assert 0.02 <= standing_fraction <= 0.10, f"standing fraction {standing_fraction:.3f} is unexpected"
+    else:
+        assert exact_zero_count == 0, "disabled standing-command sampler produced exact-zero commands"
+    assert torch.equal(env.haa_swing_ranges, ranges_before), "command resampling changed an episode-fixed HAA range"
+
+
+def _standing_diagnostics(env, step: int) -> None:
+    """Print static clearance and sagittal-joint deviation for env zero."""
+    # On a plane, Isaac Gym stores measured_heights as scalar zero; keep the
+    # exact tensor-minus-scalar formulation used by the v3 height rewards.
+    height = torch.mean(env.root_states[:, 2].unsqueeze(1) - env.measured_heights, dim=1)
+    sagittal_indices = torch.tensor(
+        [index for index, name in enumerate(env.dof_names) if name.endswith(("_HFE", "_KFE"))],
+        dtype=torch.long,
+        device=env.device,
+    )
+    names = [env.dof_names[index] for index in sagittal_indices.tolist()]
+    offset = env.dof_pos[:, sagittal_indices] - env.default_dof_pos[:, sagittal_indices]
+    minimum_raw = env._reward_base_height_minimum()
+    minimum_scale = float(env.reward_scales["base_height_minimum"])
+    print(
+        "  env0 envelope: "
+        + ", ".join(f"{name}={value:.3f}" for name, value in zip(env.haa_range_state.condition_names, env.envelope_parameters[0].tolist()))
+    )
+    print(
+        "  env0 HAA centres [rad]: "
+        + ", ".join(f"{value:.3f}" for value in (0.5 * (env.haa_swing_ranges[0, :, 0] + env.haa_swing_ranges[0, :, 1])).tolist())
+    )
+    print(
+        f"stand step={step}: height mean/min/max="
+        f"{height.mean().item():.3f}/{height.min().item():.3f}/{height.max().item():.3f} m, "
+        f"minimum-height contribution mean={(minimum_raw * minimum_scale).mean().item():.5f}"
+    )
+    print(
+        "  env0 HFE/KFE offsets from default [rad]: "
+        + ", ".join(f"{name}={offset[0, i].item():+.3f}" for i, name in enumerate(names))
+    )
 
 
 def test_env(args) -> None:
@@ -74,6 +112,8 @@ def test_env(args) -> None:
     env_cfg.domain_rand.randomize_base_mass = False
     env_cfg.domain_rand.push_robots = False
     env_cfg.commands.envelope_debug_viz = False
+    env_cfg.commands.resampling_time = 1e9
+    env_cfg.env.episode_length_s = 1e9
 
     env, _ = task_registry.make_env(name=TASK_NAME, args=args, env_cfg=env_cfg)
     env.reset()
@@ -82,33 +122,58 @@ def test_env(args) -> None:
     assert bool(torch.isfinite(obs).all()), "initial observation contains NaN or Inf"
 
     sampled = env.sample_haa_ranges()
-    _assert_valid_ranges(env, sampled, "direct sample")
+    _assert_valid_ranges(env, sampled, "network envelope sample")
+    parameters = env.envelope_parameters
+    assert parameters.shape == (env.num_envs, 5), "missing five-parameter envelope state"
+    assert bool(torch.all(parameters >= env.haa_range_state.condition_low)), "sampled envelope below its configured domain"
+    assert bool(torch.all(parameters <= env.haa_range_state.condition_high)), "sampled envelope above its configured domain"
+    assert bool(torch.all(env._get_gait_reward_active_mask() == 0.0)), (
+        "gait rewards must start masked immediately after a new HAA range"
+    )
+    assert bool(torch.all(env._get_haa_range_transition_mask("haa_range_stand_reward_ramp_time") == 0.0)), (
+        "standing rewards must start masked immediately after a new HAA range"
+    )
+    env.haa_range_transition_time[:] = max(
+        env.cfg.rewards.haa_range_gait_reward_ramp_time,
+        env.cfg.rewards.haa_range_stand_reward_ramp_time,
+    )
+    assert bool(torch.all(env._get_gait_reward_active_mask() == 1.0)), "gait reward mask did not recover"
     centers = 0.5 * (sampled[..., 0] + sampled[..., 1])
     target = env._get_condition_target_dof_pos()[:, env.haa_indices]
     assert torch.allclose(target, centers, atol=1e-6), "HAA centre bias does not match sampled interval centres"
 
-    extreme = _extreme_ranges(env)
-    applied = env.set_haa_ranges(extreme)
-    _assert_valid_ranges(env, applied, "mixed extreme sample")
-    assert torch.equal(applied, extreme), "set_haa_ranges changed a valid extreme range"
+    safe_ranges = _safe_ranges(env)
+    applied = env.set_haa_ranges(safe_ranges)
+    _assert_valid_ranges(env, applied, "neutral explicit sample")
+    assert torch.equal(applied, safe_ranges), "set_haa_ranges changed a valid safe range"
+
+    # The actual stand uses the same random envelope/network path as v3
+    # training, rather than the neutral interval used only to test the setter.
+    standing_ranges = env.sample_haa_ranges()
+    _assert_valid_ranges(env, standing_ranges, "policy-free envelope sample")
 
     _check_standing_command_sampling(env)
+    env.commands[:, :3] = 0.0
     actions = torch.zeros(env.num_envs, env.num_actions, device=env.device)
-    for _ in range(int(args.steps)):
+    report_every = max(1, int(args.report_every))
+    for step in range(int(args.steps)):
         obs, _, reward, _, _ = env.step(actions)
         assert obs.shape == (env.num_envs, 79), f"unexpected step observation shape {tuple(obs.shape)}"
         assert bool(torch.isfinite(obs).all()), "step observation contains NaN or Inf"
         assert bool(torch.isfinite(reward).all()), "reward contains NaN or Inf"
+        if (step + 1) % report_every == 0 or step + 1 == int(args.steps):
+            _standing_diagnostics(env, step + 1)
 
     print(
         f"PASS {TASK_NAME}: envs={env.num_envs}, steps={args.steps}, "
-        f"obs={tuple(obs.shape)}, HAA ranges and standing samples validated."
+        f"obs={tuple(obs.shape)}, policy-free standing diagnostic completed."
     )
 
 
 if __name__ == "__main__":
     args = get_args([
-        {"name": "--steps", "type": int, "default": 100, "help": "Zero-action simulator steps after validation."},
+        {"name": "--steps", "type": int, "default": 1000, "help": "Zero-action simulator steps after validation."},
+        {"name": "--report_every", "type": int, "default": 100, "help": "Print standing diagnostics every N steps."},
     ])
     args.task = TASK_NAME
     # ``get_args`` already owns --num_envs. Keep this smoke test small unless

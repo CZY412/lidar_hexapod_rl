@@ -1,4 +1,4 @@
-"""EL4090 task with directly sampled HAA swing ranges."""
+"""EL4090 task with five-parameter network-conditioned HAA ranges."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Optional
 
 from legged_gym.envs.el_4090.spider_envelop.el_4090 import EL_4090_ENVELOP
 from legged_gym.envs.el_4090.spider_envelop_3.el4090_spider_config import El4090Envelop3Cfg
-from legged_gym.envs.el_4090.spider_envelop_3.haa_range_state import HaaRangeState
+from legged_gym.envs.el_4090.spider_envelop_3.envelope_range_state import EnvelopeRangeState
 
 
 class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
@@ -24,7 +24,6 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless, task_name)
 
     def _init_buffers(self) -> None:
-        # HAA intervals are sampled directly; no envelope state or model is used.
         EL_4090_ENVELOP._init_buffers(self)
         # The parent task allocates this legacy morphology buffer. Envelop_3
         # replaces it with an HAA interval-centre bias, without changing the
@@ -33,13 +32,16 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         haa_leg_names = tuple(
             self.dof_names[index].split("_", 1)[0] for index in self.haa_indices.tolist()
         )
-        # Sample ranges directly. ``haa_interference.py`` remains a standalone
-        # diagnostic because checking all environments' capsule corners can be
-        # prohibitively expensive on the training GPU.
-        self.haa_range_state = HaaRangeState(self.cfg.haa_range, self.num_envs, self.device)
+        checkpoint = Path(getattr(self.cfg.haa_range, "network_path"))
+        if not checkpoint.is_absolute():
+            checkpoint = Path(__file__).resolve().parents[1] / checkpoint
+        self.haa_range_state = EnvelopeRangeState(
+            self.cfg.haa_range, self.num_envs, self.device, checkpoint=str(checkpoint),
+        )
         if haa_leg_names != self.haa_range_state.leg_names:
             raise ValueError(f"Configured HAA leg order {self.haa_range_state.leg_names} != Isaac order {haa_leg_names}")
         self.haa_swing_ranges = self.haa_range_state.get()
+        self.envelope_parameters = self.haa_range_state.get_conditions()
         self.haa_range_bias = torch.zeros(
             self.num_envs, self.num_dof, dtype=torch.float, device=self.device,
             requires_grad=False,
@@ -125,7 +127,9 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             self.commands[env_ids, command_index] = low + torch.rand(
                 env_ids.numel(), dtype=torch.float, device=self.device,
             ) * (high - low)
+        enable_stand_commands = bool(getattr(self.cfg.commands, "enable_stand_commands", False))
         stand_probability = float(getattr(self.cfg.commands, "stand_command_probability", 0.05))
+        stand_probability = stand_probability if enable_stand_commands else 0.0
         stand_mask = torch.rand(env_ids.numel(), device=self.device) < stand_probability
         stand_ids = env_ids[stand_mask]
         if stand_ids.numel():
@@ -135,7 +139,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             near_commands = (2.0 * torch.rand(stand_ids.numel(), 3, device=self.device) - 1.0) * near_limit
             near_commands[exact_mask] = 0.0
             self.commands[stand_ids, :3] = near_commands
-        self.haa_range_state.sample(env_ids)
+        # Ranges are fixed for an episode and only resampled at reset.
         self._refresh_haa_range_bias(env_ids)
 
     @torch.no_grad()
@@ -152,7 +156,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
 
     @torch.no_grad()
     def sample_haa_ranges(self, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Directly resample valid-width, left/right-coupled HAA intervals."""
+        """Resample five envelope inputs and infer their HAA intervals."""
         target_ids = (
             torch.arange(self.num_envs, device=self.device, dtype=torch.long)
             if env_ids is None else env_ids.to(device=self.device, dtype=torch.long)
@@ -173,6 +177,9 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         super().reset_idx(env_ids)
         if len(env_ids) == 0:
             return
+        self.haa_range_state.sample(env_ids)
+        self._refresh_haa_range_bias(env_ids)
+        self.embedded_state_default_dof_pos[env_ids] = self._get_condition_target_dof_pos()[env_ids]
         target = self._get_condition_target_dof_pos()[env_ids]
         self.dof_pos[env_ids] = target
         self.dof_vel[env_ids] = 0.0
@@ -371,3 +378,8 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
     def _reward_base_height(self) -> torch.Tensor:
         base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
         return torch.square(base_height - self._get_base_height_target())
+
+    def _reward_base_height_minimum(self) -> torch.Tensor:
+        base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
+        minimum = float(getattr(self.cfg.rewards, "minimum_base_height", 0.50))
+        return torch.square(torch.clamp(minimum - base_height, min=0.0))

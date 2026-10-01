@@ -1,4 +1,4 @@
-"""Interactive playback for direct random HAA ranges in ``el4090_envelop_3``."""
+"""Interactive playback for v3's five-parameter envelope/range pipeline."""
 
 import os
 import select
@@ -16,18 +16,6 @@ from legged_gym.utils import get_args, task_registry
 
 TASK_NAME = "el4090_envelop_3"
 EXPECTED_OBS_DIM = 79
-
-# Three entries map to the coupled LB/RB, LF/RF, LM/RM pairs.  The first four
-# make endpoint directions easy to inspect; the final full-width box is a
-# deliberate stress case and may self-contact, which is useful for validation.
-EXTREME_HAA_PRESETS = (
-    ("neutral narrow", ((-0.15, 0.15), (-0.15, 0.15), (-0.15, 0.15))),
-    ("all negative edge", ((-1.30, -0.95), (-1.30, -0.95), (-1.30, -0.95))),
-    ("all positive edge", ((0.95, 1.30), (0.95, 1.30), (0.95, 1.30))),
-    ("alternating edges", ((-1.30, -0.95), (0.95, 1.30), (-0.15, 0.15))),
-    ("full mechanical span (stress)", ((-1.30, 1.30), (-1.30, 1.30), (-1.30, 1.30))),
-)
-
 
 class KeyboardInput:
     """Non-blocking single-key terminal input for interactive playback."""
@@ -58,37 +46,36 @@ class KeyboardInput:
 
 def _print_ranges(env, label: str) -> None:
     ranges = env.haa_swing_ranges[0].detach().cpu()
-    text = "  ".join(
+    range_text = "  ".join(
         f"{env.dof_names[dof]}=[{ranges[leg, 0]:.3f}, {ranges[leg, 1]:.3f}]"
         for leg, dof in enumerate(env.haa_indices.tolist())
     )
+    condition = env.envelope_parameters[0].detach().cpu()
+    condition_text = ", ".join(
+        f"{name}={value:.3f}"
+        for name, value in zip(env.haa_range_state.condition_names, condition)
+    )
+    haa_bias = env.haa_range_bias[0, env.haa_indices].detach().cpu()
     leg_name = str(env.cfg.commands.haa_range_debug_leg)
     leg_index = env.haa_range_state.leg_names.index(leg_name)
     dof_index = env.haa_indices.tolist()[leg_index]
     current = env.dof_pos[0, dof_index].item()
     print(
-        f"\n[{label}] target_height={env.cfg.rewards.target_height}\n  {text}\n"
+        f"\n[{label}] target_height={env.cfg.rewards.target_height}\n"
+        f"  envelope: {condition_text}\n"
+        f"  HAA ranges: {range_text}\n"
+        f"  HAA centre bias: "
+        f"{', '.join(f'{value:.3f}' for value in haa_bias.tolist())}\n"
         f"  viewer highlight: {leg_name}_HAA=[{ranges[leg_index, 0]:.3f}, {ranges[leg_index, 1]:.3f}], "
         f"current={current:.3f} (dark-green arc, red marker)"
     )
 
 
-def _set_extreme_preset(env, preset_index: int) -> None:
-    """Apply one coupled HAA stress preset to every playback environment."""
-    name, pair_ranges = EXTREME_HAA_PRESETS[preset_index]
-    ranges = torch.tensor(pair_ranges, dtype=torch.float, device=env.device)
-    pair_to_leg = torch.tensor((0, 1, 2, 0, 1, 2), dtype=torch.long, device=env.device)
-    ranges = ranges[pair_to_leg].unsqueeze(0).repeat(env.num_envs, 1, 1)
-    env.set_haa_ranges(ranges)
-    env.compute_observations()
-    _print_ranges(env, f"extreme preset {preset_index + 1}/{len(EXTREME_HAA_PRESETS)}: {name}")
-
-
 def _print_help() -> None:
     print(
         "\nControls: W/S forward/back, A/D lateral, Q/E yaw, X stop, "
-        "R resample direct HAA ranges, T cycle extreme HAA presets, "
-        "P print ranges, Esc quit."
+        "R resample five envelope parameters and infer HAA ranges, "
+        "P print envelope/ranges/bias, Esc quit."
     )
 
 
@@ -116,7 +103,9 @@ def main() -> None:
     # the removed five-parameter envelope polygon.
     env_cfg.commands.envelope_debug_viz = True
     env_cfg.commands.haa_range_debug_leg = args.haa_debug_leg.upper()
-    # R controls sampling explicitly, so intervals do not change unattended.
+    # R controls the same free five-parameter sampling as training, so ranges
+    # do not change unattended during playback.  Collision is intentionally
+    # not evaluated here, matching the current v3 training path.
     env_cfg.commands.resampling_time = 1e9
     env, _ = task_registry.make_env(name=TASK_NAME, args=args, env_cfg=env_cfg)
     env.commands[:, :3] = torch.tensor([0.0, 0.0, 0.0], device=env.device)
@@ -130,9 +119,8 @@ def main() -> None:
     runner, _ = task_registry.make_alg_runner(env=env, name=TASK_NAME, args=args, train_cfg=train_cfg)
     policy = runner.get_inference_policy(device=env.device)
     command = {"x": 0.0, "y": 0.0, "yaw": 0.0}
-    extreme_preset_index = -1
     _print_help()
-    _print_ranges(env, "initial direct sample")
+    _print_ranges(env, "initial envelope/network sample")
 
     keyboard = KeyboardInput()
     keyboard.__enter__()
@@ -163,11 +151,7 @@ def main() -> None:
                     env.sample_haa_ranges()
                     env.compute_observations()
                     obs = env.get_observations()
-                    _print_ranges(env, "new direct sample")
-                elif key == "t":
-                    extreme_preset_index = (extreme_preset_index + 1) % len(EXTREME_HAA_PRESETS)
-                    _set_extreme_preset(env, extreme_preset_index)
-                    obs = env.get_observations()
+                    _print_ranges(env, "new envelope/network sample")
                 elif key == "p":
                     _print_ranges(env, "current sample")
             if stop:
