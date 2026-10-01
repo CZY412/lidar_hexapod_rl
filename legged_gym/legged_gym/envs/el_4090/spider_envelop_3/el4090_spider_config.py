@@ -19,8 +19,14 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         heading_command = False
         condition_dim = 0
         condition_names = []
-        # The inherited viewer hook draws a selected HAA interval in v3.
+        # The v3 viewer draws this five-parameter footprint as well as the
+        # selected HAA interval.  Make the footprint deliberately prominent.
         envelope_debug_viz = True
+        envelope_debug_env_ids = [0]
+        envelope_debug_ground_z_offset = 0.03
+        envelope_debug_color = (0.0, 0.95, 1.0)
+        envelope_debug_line_radius = 0.025
+        envelope_debug_line_samples = 12
         haa_range_debug_env_ids = [0]
         haa_range_debug_leg = "LF"
         haa_range_debug_radius = 0.22
@@ -84,7 +90,7 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
 
     class rewards(El4090EnvelopCfg.rewards):
         # One shared reset, observation, and reward target height.
-        target_height = 0.50
+        target_height = 0.55
         # No cost at/above this clearance; apply a strong quadratic penalty
         # below it. This remains independent of the cruising-height target.
         minimum_base_height = 0.50
@@ -97,13 +103,19 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         haa_range_compliance_margin = 0.04  # keep a small buffer from edges
         haa_range_compliance_softness = 0.04  # rad; soft in/out transition
 
+        # Feet are constrained by the five sampled (hidden) envelope values,
+        # independently of the HAA interval reward.  Positive margin is a
+        # geometric tolerance outside the footprint, in metres.
+        envelope_constraint_margin = 0.0
+        envelope_constraint_min_command = 0.15
+
         # A direct range resample changes the HAA-centre bias discontinuously.
         # Only gait/standing objectives ramp during the resulting adjustment;
         # safety, tracking, and HAA-bound objectives remain active.
         haa_range_gait_reward_ramp_time = 0.4
         haa_range_stand_reward_ramp_time = 0.2
 
-        feet_air_time_target = 0.2
+        feet_air_time_target = 0.1
         stand_command_threshold = 0.1
         stand_contact_threshold = 1.0
         stand_still_dof_vel_weight = 0.05
@@ -144,6 +156,8 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
 
             haa_range_violation = -1.5
             haa_range_compliance = 0.30
+            
+            envelope_constraint = -20.0
 
 
 class El4090Envelop3CfgPPO(El4090EnvelopCfgPPO):

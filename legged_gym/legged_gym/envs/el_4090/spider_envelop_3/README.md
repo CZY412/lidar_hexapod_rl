@@ -45,9 +45,14 @@ python legged_gym/legged_gym/utils/envelop/train/visualize_api_haa_range_network
 cd legged_gym/legged_gym
 python scripts/train.py --task el4090_envelop_3
 
-# 5. Interactive playback. R performs the same free five-parameter sampling
-#    and range-network inference as training; collision is not checked.
+# 5. Interactive playback. It starts from an extreme-envelope case. Each T
+#    press resets first then advances to the next of six cases, so the PD
+#    posture and root state match the displayed case. R performs a one-off
+#    random training sample; N/B also select cases.
 python scripts/play_envelop_3.py
+
+# Optional unattended rotation, in seconds per case.
+python scripts/play_envelop_3.py --extreme_case_hold_s 8
 ```
 
 `--steps 21` is a `21^5` grid. Start with `--steps 7` for a quick diagnostic
@@ -67,6 +72,23 @@ evaluated in this rollout path.
 
 The optional offline collision report has `feasible_mask` and `grid_axes` for
 analysis, but it does not constrain runtime sampling.
+
+## Envelope-footprint constraint reward
+
+`envelope_constraint` is enabled with scale `-20.0`. It uses the hidden,
+sampled five-vector—not the HAA intervals—to form the base-yaw-frame hexagon
+whose upper boundary is linearly interpolated through
+`(backward_limit, back_width)`, `(0, middle_width)`, and
+`(forward_limit, front_width)`; the lower boundary is its mirror image.
+
+For every foot, v3 transforms its world position into that frame and computes
+the longitudinal excess beyond `[backward_limit, forward_limit]` plus the
+lateral excess beyond the interpolated half-width. The unscaled value is the
+mean over six feet of the sum of their squared excesses (metres squared). It is
+zero inside the footprint. It only applies when the norm of the three-component
+command, including yaw, exceeds `envelope_constraint_min_command` (`0.15`).
+Set `envelope_constraint_margin` above zero only when a geometric tolerance
+outside the footprint is desired.
 
 ## HAA range reward
 

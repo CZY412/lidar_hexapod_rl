@@ -8,11 +8,13 @@ from pathlib import Path
 import numpy as np
 import torch
 from isaacgym import gymtorch
+from isaacgym.torch_utils import quat_conjugate
 from typing import Optional
 
 from legged_gym.envs.el_4090.spider_envelop.el_4090 import EL_4090_ENVELOP
 from legged_gym.envs.el_4090.spider_envelop_3.el4090_spider_config import El4090Envelop3Cfg
 from legged_gym.envs.el_4090.spider_envelop_3.envelope_range_state import EnvelopeRangeState
+from legged_gym.utils.math_utils import quat_apply_yaw
 
 
 class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
@@ -226,6 +228,65 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         softness = max(float(getattr(self.cfg.rewards, "haa_range_compliance_softness", 0.04)), 1e-6)
         return torch.mean(torch.sigmoid(signed_interior_distance / softness), dim=1)
 
+    def _reward_envelope_constraint(self) -> torch.Tensor:
+        """Return squared planar foot penetration outside the sampled envelope.
+
+        V3 does not expose its five envelope parameters to the policy, but the
+        simulator keeps them in ``envelope_parameters``.  The reward therefore
+        uses the same sampled input that was passed to the HAA-range network,
+        rather than attempting to reconstruct an envelope from its six output
+        intervals.  A positive ``envelope_constraint_margin`` is a tolerance:
+        it expands the allowable footprint by that many metres on every face.
+        """
+        values = self.envelope_parameters
+        names = self.haa_range_state.condition_names
+        index = {name: position for position, name in enumerate(names)}
+        front_width = values[:, index["front_width"]].unsqueeze(1)
+        middle_width = values[:, index["middle_width"]].unsqueeze(1)
+        back_width = values[:, index["back_width"]].unsqueeze(1)
+        x_front = values[:, index["forward_limit"]].unsqueeze(1)
+        x_back = values[:, index["backward_limit"]].unsqueeze(1)
+
+        margin = float(getattr(self.cfg.rewards, "envelope_constraint_margin", 0.0))
+        x_front = x_front + margin
+        x_back = x_back - margin
+        front_width = front_width + margin
+        middle_width = middle_width + margin
+        back_width = back_width + margin
+
+        # Transform each foot from world coordinates into the base-yaw frame.
+        foot_rel_world = self.foot_positions - self.base_pos.unsqueeze(1)
+        foot_rel_flat = foot_rel_world.reshape(-1, 3)
+        base_quat_flat = self.base_quat.unsqueeze(1).expand(-1, foot_rel_world.shape[1], -1).reshape(-1, 4)
+        foot_local = quat_apply_yaw(
+            quat_conjugate(base_quat_flat), foot_rel_flat,
+        ).reshape(self.num_envs, -1, 3)
+        foot_x, foot_y = foot_local[..., 0], foot_local[..., 1]
+
+        # The footprint is the symmetric hexagon
+        # (x_front, +/-front_width), (0, +/-middle_width),
+        # (x_back, +/-back_width).  Clamp x for the lateral interpolation so
+        # a foot beyond an end cap incurs independent longitudinal and lateral
+        # excess instead of extrapolating a sloped side indefinitely.
+        x_on_footprint = torch.clamp(foot_x, min=x_back, max=x_front)
+        back_fraction = (x_on_footprint - x_back) / (-x_back).clamp_min(1e-6)
+        front_fraction = x_on_footprint / x_front.clamp_min(1e-6)
+        half_width_back = back_width + back_fraction * (middle_width - back_width)
+        half_width_front = middle_width + front_fraction * (front_width - middle_width)
+        half_width = torch.where(x_on_footprint >= 0.0, half_width_front, half_width_back)
+
+        x_excess = torch.relu(x_back - foot_x) + torch.relu(foot_x - x_front)
+        y_excess = torch.relu(torch.abs(foot_y) - half_width)
+        penalty = torch.mean(torch.square(x_excess) + torch.square(y_excess), dim=1)
+
+        min_command = float(getattr(self.cfg.rewards, "envelope_constraint_min_command", 0.0))
+        if min_command > 0.0:
+            # Include yaw: turning needs the same footprint protection even
+            # when its linear-velocity command is zero.
+            moving = torch.linalg.vector_norm(self.commands[:, :3], dim=1) > min_command
+            penalty = penalty * moving.to(penalty.dtype)
+        return penalty
+
     def _reward_haa_range_swing(self) -> torch.Tensor:
         """Reward useful HAA motion while withholding reward near range edges.
 
@@ -293,12 +354,56 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         standing = torch.linalg.vector_norm(self.commands[:, :3], dim=1) < command_threshold
         return torch.sum((~contact).to(self.dof_pos.dtype), dim=1) * standing * self._get_gait_reward_active_mask()
 
-    def _draw_envelope_condition_vis(self) -> None:
-        """Draw the selected leg's sampled HAA interval in the Isaac viewer.
+    def _envelope_debug_points_world(self, env_id: int) -> np.ndarray:
+        """Convert v3's five sampled envelope values into a ground footprint."""
+        condition = self.envelope_parameters[env_id]
+        names = self.haa_range_state.condition_names
+        value = {name: condition[index] for index, name in enumerate(names)}
+        local_z = torch.zeros((), dtype=torch.float, device=self.device)
+        local_points = torch.stack((
+            torch.stack((value["forward_limit"], value["front_width"], local_z)),
+            torch.stack((torch.zeros_like(local_z), value["middle_width"], local_z)),
+            torch.stack((value["backward_limit"], value["back_width"], local_z)),
+            torch.stack((value["backward_limit"], -value["back_width"], local_z)),
+            torch.stack((torch.zeros_like(local_z), -value["middle_width"], local_z)),
+            torch.stack((value["forward_limit"], -value["front_width"], local_z)),
+        ))
+        from legged_gym.utils.math_utils import quat_apply_yaw
 
-        Dark green: allowed arc and endpoint spokes. Red: instantaneous HAA.
-        This replaces the five-parameter envelope polygon removed from v3.
+        translation = self.root_states[env_id, :3].clone()
+        translation[2] = self.env_origins[env_id, 2] + float(
+            getattr(self.cfg.commands, "envelope_debug_ground_z_offset", 0.03)
+        )
+        return (quat_apply_yaw(
+            self.base_quat[env_id].repeat(local_points.shape[0], 1), local_points,
+        ) + translation.unsqueeze(0)).detach().cpu().numpy()
+
+    def _draw_five_parameter_envelope_vis(self) -> None:
+        """Draw a thick cyan footprint for the current v3 envelope parameters."""
+        if getattr(self, "viewer", None) is None:
+            return
+        env_ids = getattr(self.cfg.commands, "envelope_debug_env_ids", [0])
+        if isinstance(env_ids, int):
+            env_ids = [env_ids]
+        color = tuple(getattr(self.cfg.commands, "envelope_debug_color", (0.0, 0.95, 1.0)))
+        radius = float(getattr(self.cfg.commands, "envelope_debug_line_radius", 0.025))
+        samples = max(1, int(getattr(self.cfg.commands, "envelope_debug_line_samples", 12)))
+        edges = ((0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0), (1, 4))
+        for env_id in env_ids:
+            if env_id < 0 or env_id >= self.num_envs:
+                continue
+            vertices, colors = self._make_bold_envelope_lines(
+                self._envelope_debug_points_world(env_id), edges, [color] * len(edges), radius, samples,
+            )
+            self.gym.add_lines(self.viewer, self.envs[env_id], len(colors), vertices, colors)
+
+    def _draw_envelope_condition_vis(self) -> None:
+        """Draw the v3 footprint plus the selected leg's sampled HAA interval.
+
+        Cyan: five-parameter envelope footprint. Dark green: allowed HAA arc
+        and endpoint spokes. Red: instantaneous HAA position.
         """
+        self._draw_five_parameter_envelope_vis()
         if getattr(self, "viewer", None) is None:
             return
         env_ids = getattr(self.cfg.commands, "haa_range_debug_env_ids", [0])
