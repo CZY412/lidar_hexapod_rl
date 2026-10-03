@@ -48,6 +48,15 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             self.num_envs, self.num_dof, dtype=torch.float, device=self.device,
             requires_grad=False,
         )
+        # This timer is only reset by runtime envelope replacements.  Initial
+        # sampling and episode resets start with the constraint fully active.
+        envelope_ramp_time = max(float(getattr(
+            self.cfg.rewards, "envelope_constraint_reward_ramp_time", 0.0,
+        )), 0.0)
+        self.envelope_constraint_transition_time = torch.full(
+            (self.num_envs,), envelope_ramp_time, dtype=torch.float,
+            device=self.device, requires_grad=False,
+        )
         all_env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         self.haa_range_state.sample(all_env_ids)
         self._refresh_haa_range_bias(all_env_ids)
@@ -79,6 +88,23 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
     def _get_gait_reward_active_mask(self) -> torch.Tensor:
         """Keep gait rewards active immediately; envelop_3 has no posture transition."""
         return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+
+    def _get_envelope_constraint_transition_mask(self) -> torch.Tensor:
+        """Linearly restore the footprint cost after an external replacement."""
+        ramp_time = float(getattr(
+            self.cfg.rewards, "envelope_constraint_reward_ramp_time", 0.0,
+        ))
+        if ramp_time <= 0.0:
+            return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+        return torch.clamp(self.envelope_constraint_transition_time / ramp_time, 0.0, 1.0)
+
+    def _start_envelope_constraint_transition(self, env_ids: torch.Tensor) -> None:
+        if env_ids.numel() != 0:
+            self.envelope_constraint_transition_time[env_ids] = 0.0
+
+    def _post_physics_step_callback(self) -> None:
+        super()._post_physics_step_callback()
+        self.envelope_constraint_transition_time += self.dt
 
     def _get_noise_scale_vec(self, cfg) -> torch.Tensor:
         """Noise vector for proprioception, target height, and HAA ranges."""
@@ -154,6 +180,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         ranges = self.haa_range_state.set(values, target_ids)
         self._refresh_haa_range_bias(target_ids)
         self.embedded_state_default_dof_pos[target_ids] = self._get_condition_target_dof_pos()[target_ids]
+        self._start_envelope_constraint_transition(target_ids)
         return ranges
 
     @torch.no_grad()
@@ -166,6 +193,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         ranges = self.haa_range_state.sample(target_ids)
         self._refresh_haa_range_bias(target_ids)
         self.embedded_state_default_dof_pos[target_ids] = self._get_condition_target_dof_pos()[target_ids]
+        self._start_envelope_constraint_transition(target_ids)
         return ranges
 
     def _compute_torques(self, actions: torch.Tensor) -> torch.Tensor:
@@ -182,6 +210,11 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         self.haa_range_state.sample(env_ids)
         self._refresh_haa_range_bias(env_ids)
         self.embedded_state_default_dof_pos[env_ids] = self._get_condition_target_dof_pos()[env_ids]
+        # Reset places the robot at the new target, so it is not a runtime
+        # reference jump and does not need a grace interval.
+        self.envelope_constraint_transition_time[env_ids] = max(float(getattr(
+            self.cfg.rewards, "envelope_constraint_reward_ramp_time", 0.0,
+        )), 0.0)
         target = self._get_condition_target_dof_pos()[env_ids]
         self.dof_pos[env_ids] = target
         self.dof_vel[env_ids] = 0.0
@@ -229,7 +262,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         return torch.mean(torch.sigmoid(signed_interior_distance / softness), dim=1)
 
     def _reward_envelope_constraint(self) -> torch.Tensor:
-        """Return squared planar foot penetration outside the sampled envelope.
+        """Return planar foot penetration outside the sampled envelope.
 
         V3 does not expose its five envelope parameters to the policy, but the
         simulator keeps them in ``envelope_parameters``.  The reward therefore
@@ -277,7 +310,11 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
 
         x_excess = torch.relu(x_back - foot_x) + torch.relu(foot_x - x_front)
         y_excess = torch.relu(torch.abs(foot_y) - half_width)
-        penalty = torch.mean(torch.square(x_excess) + torch.square(y_excess), dim=1)
+        # Keep the error in metres rather than squaring it. The squared form
+        # made ordinary centimetre-scale violations almost invisible after
+        # averaging over six feet, so it did not give the policy a useful
+        # incentive to recover into the footprint.
+        penalty = torch.mean(x_excess + y_excess, dim=1)
 
         min_command = float(getattr(self.cfg.rewards, "envelope_constraint_min_command", 0.0))
         if min_command > 0.0:
@@ -285,7 +322,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             # when its linear-velocity command is zero.
             moving = torch.linalg.vector_norm(self.commands[:, :3], dim=1) > min_command
             penalty = penalty * moving.to(penalty.dtype)
-        return penalty
+        return penalty * self._get_envelope_constraint_transition_mask()
 
     def _reward_haa_range_swing(self) -> torch.Tensor:
         """Reward useful HAA motion while withholding reward near range edges.
@@ -321,9 +358,20 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             torch.abs(self.dof_vel[:, self.haa_indices]) / velocity_clip,
             max=1.0,
         )
-        min_command = float(getattr(self.cfg.rewards, "haa_range_swing_min_command", 0.10))
-        moving = (torch.linalg.vector_norm(self.commands[:, :3], dim=1) > min_command).to(self.dof_pos.dtype)
-        return torch.mean(velocity_factor * excursion_factor * interior_factor, dim=1) * moving
+        # This is deliberately gated by fore/aft command only.  Lateral
+        # tracking and yawing already have their own objectives; rewarding
+        # HAA activity for them made unnecessary inward/outward leg motions a
+        # viable way to collect this reward.
+        min_forward_command = float(getattr(
+            self.cfg.rewards, "haa_range_swing_min_forward_command", 0.10,
+        ))
+        forward_commanded = (
+            torch.abs(self.commands[:, 0]) > min_forward_command
+        ).to(self.dof_pos.dtype)
+        return (
+            torch.mean(velocity_factor * excursion_factor * interior_factor, dim=1)
+            * forward_commanded
+        )
 
     def _reward_dof_pos_limits(self) -> torch.Tensor:
         """Keep generic joint-limit protection for HFE/KFE, not HAA ranges.

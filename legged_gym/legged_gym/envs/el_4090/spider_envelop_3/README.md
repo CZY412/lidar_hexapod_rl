@@ -75,7 +75,7 @@ analysis, but it does not constrain runtime sampling.
 
 ## Envelope-footprint constraint reward
 
-`envelope_constraint` is enabled with scale `-20.0`. It uses the hidden,
+`envelope_constraint` is enabled with scale `-70.0`. It uses the hidden,
 sampled five-vector—not the HAA intervals—to form the base-yaw-frame hexagon
 whose upper boundary is linearly interpolated through
 `(backward_limit, back_width)`, `(0, middle_width)`, and
@@ -84,19 +84,29 @@ whose upper boundary is linearly interpolated through
 For every foot, v3 transforms its world position into that frame and computes
 the longitudinal excess beyond `[backward_limit, forward_limit]` plus the
 lateral excess beyond the interpolated half-width. The unscaled value is the
-mean over six feet of the sum of their squared excesses (metres squared). It is
-zero inside the footprint. It only applies when the norm of the three-component
+mean over six feet of those excess distances (metres), without squaring them.
+It is zero inside the footprint. It only applies when the norm of the three-component
 command, including yaw, exceeds `envelope_constraint_min_command` (`0.15`).
 Set `envelope_constraint_margin` above zero only when a geometric tolerance
 outside the footprint is desired.
 
+When a runtime caller invokes `set_haa_ranges()` or `sample_haa_ranges()`, the
+new envelope can be smaller than the current stance. To avoid assigning that
+instantaneous reference jump to the policy, the constraint weight ramps
+linearly from zero to full strength over
+`envelope_constraint_reward_ramp_time` (default `0.4 s`). Episode resets start
+with the constraint fully active.
+
 ## HAA range reward
 
-The range is a constraint, not an HAA trajectory reference. A small smooth
-compliance reward applies anywhere in the interval interior. A Huber penalty
-applies outside it and ramps from 10% to its configured strength over the first
-100,000 control steps. There is no mandatory HAA swing reward, so locomotion
-and foot-contact rewards may choose the gait that works best inside the range.
+The range remains a constraint, not an HAA trajectory reference. A small
+smooth compliance reward applies anywhere in the interval interior, and a Huber
+penalty applies outside it and ramps from 10% to its configured strength over
+the first 100,000 control steps. During a sufficiently large fore/aft velocity
+command, `haa_range_swing` additionally rewards HAA velocity at a useful
+mid-range excursion. It is zero near either interval edge, so it cannot reward
+boundary rubbing. This gives forward locomotion an incentive to use the
+available HAA range without prescribing a fixed HAA phase target.
 
 The interval centre supplies a separate **PD posture bias**. It is added only
 to the six HAA entries of the immutable spider `default_dof_pos`; HFE/KFE keep

@@ -77,20 +77,20 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         default_dof_pos_filter_tau = 0.5
 
     class init_state(El4090EnvelopCfg.init_state):
-        pos = [0.0, 0.0, 0.55]
+        pos = [0.0, 0.0, 0.52]
         # The HFE/KFE posture used when generating HAA-range network labels.
         default_joint_angles = {
             "RF_HAA": 0.0, "RM_HAA": 0.0, "RB_HAA": 0.0,
             "LF_HAA": 0.0, "LM_HAA": 0.0, "LB_HAA": 0.0,
-            "RF_HFE": 0.4050, "RM_HFE": 0.4050, "RB_HFE": 0.4050,
-            "LF_HFE": 0.4050, "LM_HFE": 0.4050, "LB_HFE": 0.4050,
-            "RF_KFE": -0.39, "RM_KFE": -0.39, "RB_KFE": -0.39,
-            "LF_KFE": -0.39, "LM_KFE": -0.39, "LB_KFE": -0.39,
+            "RF_HFE": 0.3020, "RM_HFE": 0.3020, "RB_HFE": 0.3020,
+            "LF_HFE": 0.3020, "LM_HFE": 0.3020, "LB_HFE": 0.3020,
+            "RF_KFE": -0.2708, "RM_KFE": -0.2708, "RB_KFE": -0.2708,
+            "LF_KFE": -0.2708, "LM_KFE": -0.2708, "LB_KFE": -0.2708,
         }
 
     class rewards(El4090EnvelopCfg.rewards):
         # One shared reset, observation, and reward target height.
-        target_height = 0.55
+        target_height = 0.52
         # No cost at/above this clearance; apply a strong quadratic penalty
         # below it. This remains independent of the cruising-height target.
         minimum_base_height = 0.50
@@ -102,12 +102,24 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         haa_range_violation_warmup_steps = 100000
         haa_range_compliance_margin = 0.04  # keep a small buffer from edges
         haa_range_compliance_softness = 0.04  # rad; soft in/out transition
+        # During commanded fore/aft locomotion, make use of the available HAA
+        # travel instead of merely resting at the interval centre.  The swing
+        # reward is zero close to either limit, so it cannot be harvested by
+        # repeatedly pushing into a range boundary.
+        haa_range_swing_target_excursion_ratio = 0.50
+        haa_range_swing_boundary_buffer_ratio = 0.15
+        haa_range_swing_velocity_clip = 4.0
+        haa_range_swing_min_forward_command = 0.10
 
         # Feet are constrained by the five sampled (hidden) envelope values,
         # independently of the HAA interval reward.  Positive margin is a
         # geometric tolerance outside the footprint, in metres.
         envelope_constraint_margin = 0.0
         envelope_constraint_min_command = 0.15
+        # When a runtime caller replaces the five hidden envelope inputs, the
+        # feet cannot satisfy a newly smaller footprint in the same control
+        # tick.  Restore this penalty linearly after the replacement.
+        envelope_constraint_reward_ramp_time = 0.4
 
         # A direct range resample changes the HAA-centre bias discontinuously.
         # Only gait/standing objectives ramp during the resulting adjustment;
@@ -124,7 +136,7 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
 
         class scales:
             termination = -0.0
-            collision = -0.5  # PhysX contact penalty; includes self-collisions
+            collision = -1  # PhysX contact penalty; includes self-collisions
             tracking_lin_vel = 6
             tracking_ang_vel = 2.5
 
@@ -138,13 +150,13 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             dof_vel = -1e-5
             dof_acc = -1e-7
             action_rate = -0.003
-
+ 
             feet_slip = -0.05
             feet_air_time = 1.0
 
             stand_still = -1.5
             stand_contact = -1.0
-            feet_contact_forces = -0.05
+            feet_contact_forces = -0.15
 
             feet_async = -0.07
             feet_sync = -0.07
@@ -155,9 +167,13 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             torque_limits = -0.01
 
             haa_range_violation = -1.5
-            haa_range_compliance = 0.30
+            # Keep the interval an interior constraint, not a static posture
+            # target.  A separate, forward-command-gated term rewards useful
+            # in-range HAA motion.
+            haa_range_compliance = 0.08
+            haa_range_swing = 0.20
             
-            envelope_constraint = -20.0
+            envelope_constraint = -70.
 
 
 class El4090Envelop3CfgPPO(El4090EnvelopCfgPPO):
@@ -174,7 +190,7 @@ class El4090Envelop3CfgPPO(El4090EnvelopCfgPPO):
         class symmetry_cfg:
             use_data_augmentation = True
             use_mirror_loss = True
-            mirror_loss_coeff = 0.6
+            mirror_loss_coeff = 1.0
             data_augmentation_func = (
                 "legged_gym.envs.el_4090.spider_envelop_3.symmetry_obs79:"
                 "get_elair_lidar_xsym_obs_act"
