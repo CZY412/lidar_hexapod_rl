@@ -31,8 +31,8 @@ class HaaRangeState:
         size = len(self.leg_names)
         if size != 6 or self.leg_names != ("LB", "LF", "LM", "RB", "RF", "RM"):
             raise ValueError("haa_range leg_names must be LB, LF, LM, RB, RF, RM")
-        if self.joint_low >= self.joint_high or self.min_width < 0.3 or self.min_width > self.joint_high - self.joint_low:
-            raise ValueError("haa_range must be within valid joint bounds and have min_width >= 0.3")
+        if self.joint_low >= self.joint_high or self.min_width < 0.2 or self.min_width > self.joint_high - self.joint_low:
+            raise ValueError("haa_range must be within valid joint bounds and have min_width >= 0.2")
         if self.max_attempts < 1:
             raise ValueError("haa_range.max_sampling_attempts must be positive")
         if self.interference_check_batch_size < 1:
@@ -80,7 +80,7 @@ class HaaRangeState:
 
     def _sample_candidate(self, count: int) -> torch.Tensor:
         # Sample the three left/right leg-pair intervals. Each lower endpoint
-        # is chosen first, then its upper endpoint; this enforces width >= 0.3.
+        # is chosen first, then its upper endpoint; this enforces min_width.
         lower = self.joint_low + torch.rand(count, 3, device=self.device) * (
             self.joint_high - self.joint_low - self.min_width
         )

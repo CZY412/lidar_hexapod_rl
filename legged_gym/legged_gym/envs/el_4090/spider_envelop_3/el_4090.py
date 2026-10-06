@@ -200,6 +200,13 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         if self.cfg.control.control_type != "P":
             return super()._compute_torques(actions)
         target = actions * self.cfg.control.action_scale + self._get_condition_target_dof_pos()
+        # HAA actions express gait inside the selected interval, not a way to
+        # cancel its centre bias.  Hard-project their *joint targets* so this
+        # remains true even when an early policy explores saturated actions.
+        target[:, self.haa_indices] = torch.maximum(
+            torch.minimum(target[:, self.haa_indices], self.haa_swing_ranges[..., 1]),
+            self.haa_swing_ranges[..., 0],
+        )
         torques = self.p_gains * (target - self.dof_pos) - self.d_gains * self.dof_vel
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
@@ -251,7 +258,7 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         """Reward being anywhere in the safe interior, without a pose target."""
         lower, upper = self.haa_swing_ranges[..., 0], self.haa_swing_ranges[..., 1]
         margin = float(getattr(self.cfg.rewards, "haa_range_compliance_margin", 0.04))
-        # The sampled minimum width is 0.3 rad, so this remains a non-empty
+        # The sampled minimum width is 0.2 rad, so this remains a non-empty
         # interior with the default 0.04 rad margin.
         interior_lower, interior_upper = lower + margin, upper - margin
         signed_interior_distance = torch.minimum(
@@ -396,11 +403,68 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         return (pose_cost + velocity_cost + action_cost) * standing
 
     def _reward_stand_contact(self) -> torch.Tensor:
-        threshold = float(getattr(self.cfg.rewards, "stand_contact_threshold", 1.0))
+        """At rest, require both legs in every front/middle/rear pair to load."""
+        threshold = float(getattr(self.cfg.rewards, "stand_contact_threshold", 10.0))
+        pair_threshold = float(getattr(self.cfg.rewards, "stand_pair_force_threshold", 30.0))
         command_threshold = float(getattr(self.cfg.rewards, "stand_command_threshold", self.speed_min))
-        contact = self.contact_forces[:, self.feet_indices, 2] > threshold
+        normal_forces = self.contact_forces[:, self.feet_indices, 2].clamp_min(0.0)
+        loaded_feet = normal_forces >= threshold
         standing = torch.linalg.vector_norm(self.commands[:, :3], dim=1) < command_threshold
-        return torch.sum((~contact).to(self.dof_pos.dtype), dim=1) * standing * self._get_gait_reward_active_mask()
+        # Foot order is [LB, LF, LM, RB, RF, RM].  Each pair must have both
+        # feet loaded and enough combined force; a middle-leg biped therefore
+        # cannot pass as a stationary six-leg pose.
+        leg_pairs = ((1, 4), (2, 5), (0, 3))  # front, middle, rear
+        missing_loaded_feet = (~loaded_feet).sum(dim=1).to(normal_forces.dtype)
+        invalid_pairs = torch.zeros(self.num_envs, device=self.device, dtype=normal_forces.dtype)
+        for pair in leg_pairs:
+            pair_loaded = loaded_feet[:, pair].all(dim=1)
+            pair_loaded &= normal_forces[:, pair].sum(dim=1) >= pair_threshold
+            invalid_pairs += (~pair_loaded).to(normal_forces.dtype)
+        return (missing_loaded_feet + invalid_pairs) * standing * self._get_gait_reward_active_mask()
+
+    def _reward_tripod_contact_pattern(self) -> torch.Tensor:
+        """Require the active support phase to be a complete front/middle/rear tripod."""
+        contact_threshold = float(getattr(self.cfg.rewards, "tripod_contact_threshold", 1.0))
+        support_threshold = float(getattr(self.cfg.rewards, "support_foot_force_threshold", 10.0))
+        min_command = float(getattr(self.cfg.rewards, "tripod_contact_min_command", 0.1))
+        normal_forces = self.contact_forces[:, self.feet_indices, 2].clamp_min(0.0)
+        contact = (normal_forces > contact_threshold).to(self.dof_pos.dtype)
+        supporting = (normal_forces >= support_threshold).to(self.dof_pos.dtype)
+        group1, group2 = contact[:, self.tripod_group1_indices], contact[:, self.tripod_group2_indices]
+        group1_same = torch.var(group1, dim=1, unbiased=False)
+        group2_same = torch.var(group2, dim=1, unbiased=False)
+        group_opposite = torch.square(group1.mean(dim=1) + group2.mean(dim=1) - 1.0)
+
+        forces_g1 = normal_forces[:, self.tripod_group1_indices]
+        forces_g2 = normal_forces[:, self.tripod_group2_indices]
+        active_support = torch.where(
+            (forces_g1.sum(dim=1) >= forces_g2.sum(dim=1)).unsqueeze(1),
+            supporting[:, self.tripod_group1_indices],
+            supporting[:, self.tripod_group2_indices],
+        )
+        missing_support_legs = 3.0 - active_support.sum(dim=1)
+        moving = torch.linalg.vector_norm(self.commands[:, :2], dim=1) > min_command
+        return (
+            group1_same + group2_same + group_opposite + missing_support_legs
+        ) * moving.to(self.dof_pos.dtype) * self._get_gait_reward_active_mask()
+
+    def _reward_contact_force_balance(self) -> torch.Tensor:
+        """Penalize missing or uneven load within the active support tripod."""
+        min_command = float(getattr(self.cfg.rewards, "tripod_contact_min_command", 0.1))
+        min_force = float(getattr(self.cfg.rewards, "support_foot_force_threshold", 10.0))
+        normal_forces = self.contact_forces[:, self.feet_indices, 2].clamp_min(0.0)
+        forces_g1 = normal_forces[:, self.tripod_group1_indices]
+        forces_g2 = normal_forces[:, self.tripod_group2_indices]
+        active_forces = torch.where(
+            (forces_g1.sum(dim=1) >= forces_g2.sum(dim=1)).unsqueeze(1), forces_g1, forces_g2
+        )
+        minimum_load_error = torch.relu(min_force - active_forces).sum(dim=1) / min_force
+        force_shares = active_forces / active_forces.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        equal_share_error = 3.0 * torch.square(force_shares - 1.0 / 3.0).sum(dim=1)
+        moving = torch.linalg.vector_norm(self.commands[:, :2], dim=1) > min_command
+        return (
+            minimum_load_error + equal_share_error
+        ) * moving.to(self.dof_pos.dtype) * self._get_gait_reward_active_mask()
 
     def _envelope_debug_points_world(self, env_id: int) -> np.ndarray:
         """Convert v3's five sampled envelope values into a ground footprint."""

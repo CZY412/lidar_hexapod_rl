@@ -3,9 +3,9 @@
 
 The label is a *safe/running* interval, never a rejected interval.  For each
 leg the API's rejected intervals are complemented inside its physical URDF HAA
-limits. The selected safe segment contains spider default HAA=0 when possible.
-Otherwise front legs choose the negative (forward-splay) side and middle/rear
-legs choose the positive (rearward-splay) side.
+limits.  It is restricted to [-1.5, 0] for front legs (forward) and [0, 1.5]
+for middle/rear legs (backward).  A sample is ``none`` when any coupled running
+interval is narrower than 0.2 rad.
 """
 
 from __future__ import annotations
@@ -24,13 +24,34 @@ CONDITION_NAMES = ("front_width", "middle_width", "back_width", "forward_limit",
 LEG_NAMES = ("LB", "LF", "LM", "RB", "RF", "RM")
 CONDITION_LOW = (0.3, 0.3, 0.3, 0.6, -0.9)
 CONDITION_HIGH = (0.6, 0.7, 0.6, 0.9, -0.6)
-# LB, LF, LM, RB, RF, RM. These are search bounds only, not a mammal pose.
-HAA_LOW = (0.0, -1.308, 0.0, 0.0, -1.308, 0.0)
-HAA_HIGH = (1.308, 0.0, 1.308, 1.308, 0.0, 1.308)
+# LB, LF, LM, RB, RF, RM.  These are directional running domains, not a pose.
+HAA_LOW = (0.0, -1.5, 0.0, 0.0, -1.5, 0.0)
+HAA_HIGH = (1.5, 0.0, 1.5, 1.5, 0.0, 1.5)
+MIN_RUNNING_WIDTH = 0.2
+LABEL_SOURCE = "fixed-spider API directional rejection-complement running intervals"
 
 
 class NoFeasibleHaaEnvelopeError(RuntimeError):
     """The five-parameter envelope has no usable HAA interval."""
+
+
+def select_largest_running_segment(
+    segments: Sequence[tuple[float, float]],
+    *,
+    minimum_width: float = MIN_RUNNING_WIDTH,
+) -> tuple[float, float]:
+    """Return one contiguous running component, or report ``none``.
+
+    Rejection can split a directional domain into several components.  They
+    must not be joined because the gap is rejected; the largest component is
+    the range exported to the controller.
+    """
+    candidates = [segment for segment in segments if segment[1] - segment[0] >= minimum_width]
+    if not candidates:
+        raise NoFeasibleHaaEnvelopeError(
+            f"none: no >= {minimum_width:.1f} rad contiguous running interval"
+        )
+    return max(candidates, key=lambda segment: (segment[1] - segment[0], -abs(0.5 * (segment[0] + segment[1]))))
 
 
 class ApiRangeLabeler:
@@ -60,8 +81,8 @@ class ApiRangeLabeler:
         self.pinned = torch.zeros(self.kinematics.num_dof)
         # Must agree with El4090Envelop3Cfg.init_state.default_joint_angles.
         for leg in LEG_NAMES:
-            self.pinned[self.kinematics.actuated_joint_names.index(f"{leg}_HFE")] = 0.405
-            self.pinned[self.kinematics.actuated_joint_names.index(f"{leg}_KFE")] = -0.39
+            self.pinned[self.kinematics.actuated_joint_names.index(f"{leg}_HFE")] = 0.3020
+            self.pinned[self.kinematics.actuated_joint_names.index(f"{leg}_KFE")] = -0.2708
 
     def _allowed_support(self, condition: Tensor) -> Tensor:
         front, middle, back, forward, backward = condition.tolist()
@@ -94,19 +115,22 @@ class ApiRangeLabeler:
         ranges = []
         for index, joint_index in enumerate(self.haa_indices):
             choices = self._safe_segments(HAA_LOW[index], HAA_HIGH[index], rejected[joint_index])
-            choices = [item for item in choices if item[1] - item[0] >= 0.3]
-            if not choices:
-                raise NoFeasibleHaaEnvelopeError(f"no >=0.3 rad interval for {LEG_NAMES[index]}")
-            # Prefer the interval nearest the standing HAA=0 posture.
-            ranges.append(min(choices, key=lambda item: (0.0 if item[0] <= 0 <= item[1]
-                                                           else min(abs(item[0]), abs(item[1])), - (item[1] - item[0]))))
+            # A rejection set can split the directional domain.  A controller
+            # needs one contiguous interval, so retain the largest feasible
+            # segment rather than joining separated safe components.
+            try:
+                ranges.append(select_largest_running_segment(choices))
+            except NoFeasibleHaaEnvelopeError as error:
+                raise NoFeasibleHaaEnvelopeError(f"{error} for {LEG_NAMES[index]}") from error
         output = torch.tensor(ranges, dtype=torch.float32)
         # Coupled left/right legs need the intersection, not an average: this
         # preserves safety for both individually computed API intervals.
         for left, right in ((0, 3), (1, 4), (2, 5)):
             lo, hi = max(float(output[left, 0]), float(output[right, 0])), min(float(output[left, 1]), float(output[right, 1]))
-            if hi - lo < 0.3:
-                raise NoFeasibleHaaEnvelopeError(f"paired {LEG_NAMES[left]}/{LEG_NAMES[right]} interval is too narrow")
+            if hi - lo < MIN_RUNNING_WIDTH:
+                raise NoFeasibleHaaEnvelopeError(
+                    f"none: paired {LEG_NAMES[left]}/{LEG_NAMES[right]} running interval is too narrow"
+                )
             output[left] = output[right] = torch.tensor((lo, hi))
         return output
 
@@ -133,8 +157,8 @@ class ApiHaaRangeNetwork(nn.Module):
         normalized = 2.0 * (condition - self.condition_low) / (self.condition_high - self.condition_low) - 1.0
         feature = self.backbone(normalized)
         # Guarantee every prediction is suitable for HaaRangeState before the
-        # collision filter sees it: lower < upper and width >= 0.3 rad.
-        minimum_half = 0.15
+        # collision filter sees it: lower < upper and width >= 0.2 rad.
+        minimum_half = 0.1
         center = self.haa_low + minimum_half + torch.sigmoid(self.center_head(feature)) * (self.haa_high - self.haa_low - 2.0 * minimum_half)
         max_half = torch.minimum(center - self.haa_low, self.haa_high - center)
         half = minimum_half + torch.sigmoid(self.half_head(feature)) * (max_half - minimum_half)
@@ -147,25 +171,36 @@ class ApiHaaRangeNetwork(nn.Module):
 def generate_dataset(labeler: ApiRangeLabeler, samples: int, seed: int) -> Dict[str, Tensor]:
     generator = torch.Generator(device="cpu").manual_seed(seed)
     low, high = torch.tensor(CONDITION_LOW), torch.tensor(CONDITION_HIGH)
-    conditions, ranges, attempts = [], [], 0
+    conditions, ranges, attempts, none_count = [], [], 0, 0
     while len(conditions) < samples:
         attempts += 1
         condition = low + torch.rand(len(CONDITION_NAMES), generator=generator) * (high - low)
         try:
             interval = labeler.label(condition)
         except labeler.no_feasible:
+            none_count += 1
             continue
         conditions.append(condition)
         ranges.append(interval)
         if len(conditions) % 100 == 0 or len(conditions) == samples:
             print(f"labels: {len(conditions)}/{samples}, acceptance={len(conditions) / attempts:.1%}")
     return {"conditions": torch.stack(conditions), "ranges": torch.stack(ranges),
+            # Explicit aliases make this artifact usable as the runtime
+            # valid-envelope bank as well as supervised-training data.
+            "valid_conditions": torch.stack(conditions),
+            "valid_ranges": torch.stack(ranges),
             "condition_names": CONDITION_NAMES, "leg_names": LEG_NAMES,
             "condition_low": low, "condition_high": high,
-            "label_source": "fixed-spider API safe HAA intervals"}
+            "label_source": LABEL_SOURCE,
+            "attempts": attempts, "none_count": none_count}
 
 
 def train(dataset: Dict[str, Tensor], args) -> Dict[str, object]:
+    if dataset.get("label_source") != LABEL_SOURCE:
+        raise ValueError(
+            "Dataset uses the legacy neutral/trimmed HAA labels. Regenerate it "
+            "without --train-only before fitting the directional running-range network."
+        )
     inputs, targets = dataset["conditions"].float(), dataset["ranges"].float()
     count = inputs.shape[0]
     permutation = torch.randperm(count, generator=torch.Generator().manual_seed(args.seed))
@@ -196,7 +231,13 @@ def train(dataset: Dict[str, Tensor], args) -> Dict[str, object]:
             "output_names": ("lower", "upper"), "condition_low": torch.tensor(CONDITION_LOW),
             "condition_high": torch.tensor(CONDITION_HIGH), "haa_low": torch.tensor(HAA_LOW),
             "haa_high": torch.tensor(HAA_HIGH), "validation_mse": best_validation,
-            "label_source": "fixed-spider API safe HAA intervals"}
+            "label_source": LABEL_SOURCE,
+            "running_min_width": MIN_RUNNING_WIDTH,
+            # Keep the exact algorithm-approved inputs with the network. RL
+            # reset samples only from this bank; it never asks the regressor
+            # to invent a running interval for a rejection-range ``none``.
+            "valid_conditions": inputs.detach().cpu(),
+            "valid_ranges": targets.detach().cpu()}
 
 
 def parse_args() -> argparse.Namespace:

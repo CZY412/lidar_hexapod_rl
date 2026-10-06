@@ -54,13 +54,15 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
 
     class haa_range:
         # Five envelope values are freely sampled from the network domain.
-        # Runtime retries only for a non-finite or < 0.3 rad predicted interval;
+        # Runtime retries only for a non-finite or < 0.2 rad predicted interval;
         # collision analysis remains an offline diagnostic.
-        network_path = "spider_envelop_3/envelop_network/api_haa_range_network.pt"
+        # The directional rejection-range network and its 20k-entry valid
+        # envelope bank.  This path is resolved from ``envs/el_4090``.
+        network_path = "../../utils/envelop/data/api_haa_range_network.pt"
         leg_names = ["LB", "LF", "LM", "RB", "RF", "RM"]
         # Match the HAA-network output domain exactly.
-        joint_limits = [-1.308, 1.308]
-        min_width = 0.3
+        joint_limits = [-1.5, 1.5]
+        min_width = 0.2
         max_sampling_attempts = 16
         # The midpoint of each sampled interval becomes the dynamic HAA bias
         # added to (but never written into) the unique spider default posture.
@@ -77,7 +79,7 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         default_dof_pos_filter_tau = 0.5
 
     class init_state(El4090EnvelopCfg.init_state):
-        pos = [0.0, 0.0, 0.52]
+        pos = [0.0, 0.0, 0.53]
         # The HFE/KFE posture used when generating HAA-range network labels.
         default_joint_angles = {
             "RF_HAA": 0.0, "RM_HAA": 0.0, "RB_HAA": 0.0,
@@ -90,7 +92,7 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
 
     class rewards(El4090EnvelopCfg.rewards):
         # One shared reset, observation, and reward target height.
-        target_height = 0.52
+        target_height = 0.53
         # No cost at/above this clearance; apply a strong quadratic penalty
         # below it. This remains independent of the cruising-height target.
         minimum_base_height = 0.50
@@ -129,7 +131,13 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
 
         feet_air_time_target = 0.1
         stand_command_threshold = 0.1
-        stand_contact_threshold = 1.0
+        # Binary contact detects foot events.  Support terms use a higher
+        # force so a lightly touching front/back toe cannot satisfy them.
+        stand_contact_threshold = 10.0
+        stand_pair_force_threshold = 30.0
+        support_foot_force_threshold = 10.0
+        tripod_contact_threshold = 1.0
+        tripod_contact_min_command = 0.1
         stand_still_dof_vel_weight = 0.05
         stand_still_action_rate_weight = 0.10
 
@@ -156,11 +164,12 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
 
             stand_still = -1.5
             stand_contact = -1.0
-            feet_contact_forces = -0.15
+            feet_contact_forces = -0.5
 
             feet_async = -0.07
             feet_sync = -0.07
-            tripod_contact_pattern = -3
+            tripod_contact_pattern = -2.5
+            contact_force_balance = -1.0
 
             dof_pos_limits = -0.5
             dof_vel_limits = -0.1
@@ -171,9 +180,9 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             # target.  A separate, forward-command-gated term rewards useful
             # in-range HAA motion.
             haa_range_compliance = 0.08
-            haa_range_swing = 0.20
+            haa_range_swing = 0.50
             
-            envelope_constraint = -70.
+            envelope_constraint = -20.
 
 
 class El4090Envelop3CfgPPO(El4090EnvelopCfgPPO):

@@ -55,6 +55,11 @@ python scripts/play_envelop_3.py
 python scripts/play_envelop_3.py --extreme_case_hold_s 8
 ```
 
+Playback also exports the loaded locomotion actor as TorchScript to
+`logs/obs79_Envelop_3_direct_haa_ranges/exported/policies/policy_1.pt`, matching
+the v1/v2 deployment workflow.  The exported actor consumes the v3 79-element
+observation (including the 12 HAA-range endpoints).
+
 `--steps 21` is a `21^5` grid. Start with `--steps 7` for a quick diagnostic
 check. If you use the offline collision report after changing the checkpoint,
 rebuild it so the report describes the new model.

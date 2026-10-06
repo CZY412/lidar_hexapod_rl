@@ -24,8 +24,8 @@ class ApiHaaRangeNetwork(nn.Module):
         self.center_head, self.half_head = nn.Linear(width, 6), nn.Linear(width, 6)
         self.register_buffer("condition_low", torch.tensor((.3, .3, .3, .6, -.9)))
         self.register_buffer("condition_high", torch.tensor((.6, .7, .6, .9, -.6)))
-        self.register_buffer("haa_low", torch.tensor((0., -1.308, 0., 0., -1.308, 0.)))
-        self.register_buffer("haa_high", torch.tensor((1.308, 0., 1.308, 1.308, 0., 1.308)))
+        self.register_buffer("haa_low", torch.tensor((0., -1.5, 0., 0., -1.5, 0.)))
+        self.register_buffer("haa_high", torch.tensor((1.5, 0., 1.5, 1.5, 0., 1.5)))
 
     def forward(self, condition: torch.Tensor) -> torch.Tensor:
         normalized = 2.0 * (condition - self.condition_low) / (self.condition_high - self.condition_low) - 1.0
@@ -56,11 +56,30 @@ class EnvelopeRangeState(HaaRangeState):
         payload = torch.load(path, map_location="cpu")
         if tuple(payload.get("condition_names", ())) != self.condition_names or tuple(payload.get("output_names", ())) != ("lower", "upper"):
             raise ValueError(f"{path} is not a five-parameter HAA-range checkpoint")
+        expected_low = torch.tensor((0., -1.5, 0., 0., -1.5, 0.))
+        expected_high = torch.tensor((1.5, 0., 1.5, 1.5, 0., 1.5))
+        if not (
+            torch.equal(payload.get("haa_low"), expected_low)
+            and torch.equal(payload.get("haa_high"), expected_high)
+        ):
+            raise ValueError(
+                f"{path} uses the legacy HAA domain; regenerate labels and retrain "
+                "with train_api_haa_range.py for the [-1.5, 1.5] running ranges"
+            )
         self.network = ApiHaaRangeNetwork(tuple(payload["hidden_dims"])).to(self.device)
         self.network.load_state_dict(payload["state_dict"])
         self.network.eval()
         self.condition_low = self.network.condition_low.detach().clone()
         self.condition_high = self.network.condition_high.detach().clone()
+        bank = payload.get("valid_conditions")
+        if not isinstance(bank, torch.Tensor) or bank.ndim != 2 or bank.shape[1] != len(self.condition_names) or bank.shape[0] == 0:
+            raise ValueError(
+                f"{path} has no valid-envelope bank; regenerate labels and retrain so "
+                "RL never samples a rejection-range 'none' envelope"
+            )
+        if torch.any(bank < self.condition_low.cpu()) or torch.any(bank > self.condition_high.cpu()):
+            raise ValueError(f"{path} contains an out-of-domain valid-envelope bank entry")
+        self.valid_conditions = bank.to(device=self.device, dtype=torch.float)
         self.conditions = torch.empty(num_envs, 5, device=self.device)
 
     def get_conditions(self, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -91,12 +110,15 @@ class EnvelopeRangeState(HaaRangeState):
         if not env_ids.numel():
             return self.ranges[env_ids]
         remaining = env_ids
+        # ``valid_conditions`` contains only five-vectors for which the exact
+        # rejection-range algorithm found all six coupled running intervals.
+        # Use it instead of uniform sampling over the whole box, where ``none``
+        # has no valid regression target.
         for _ in range(self.max_attempts):
             if not remaining.numel():
                 break
-            condition = self.condition_low + torch.rand(remaining.numel(), 5, device=self.device) * (
-                self.condition_high - self.condition_low
-            )
+            indices = torch.randint(self.valid_conditions.shape[0], (remaining.numel(),), device=self.device)
+            condition = self.valid_conditions[indices]
             ranges = self.network(condition)
             valid = self._network_range_is_valid(ranges)
             if valid.any():
@@ -105,7 +127,7 @@ class EnvelopeRangeState(HaaRangeState):
             remaining = remaining[~valid]
         if remaining.numel():
             raise RuntimeError(
-                "HAA range network did not produce width >= 0.3 rad within "
+                "HAA range network did not produce a >= 0.2-rad running range within "
                 f"{self.max_attempts} random envelope samples."
             )
         return self.ranges[env_ids]

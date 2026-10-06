@@ -6,17 +6,26 @@ import sys
 import termios
 import time
 import tty
+from typing import Optional
 
 import isaacgym  # noqa: F401 -- must precede torch-backed environment imports.
 from isaacgym import gymtorch
 import torch
 
+from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs import *  # noqa: F401,F403 -- register tasks.
-from legged_gym.utils import get_args, task_registry
+from legged_gym.utils import export_policy_as_jit, get_args, task_registry
+from legged_gym.utils.envelop.train.train_api_haa_range import (
+    ApiRangeLabeler,
+    NoFeasibleHaaEnvelopeError,
+)
 
 
 TASK_NAME = "el4090_envelop_3"
 EXPECTED_OBS_DIM = 79
+# Keep v3 aligned with the v1/v2 playback workflow: loading a checkpoint in
+# play also produces the standalone TorchScript actor used by deployment.
+EXPORT_POLICY = True
 # These are deliberately corners of the range-network input box rather than
 # hand-written HAA intervals.  Thus every case exercises the exact same
 # envelope -> network -> HAA-range path as v3 training.
@@ -131,17 +140,26 @@ def _apply_envelope_condition(env, condition: torch.Tensor) -> torch.Tensor:
     return ranges
 
 
-def _valid_extreme_cases(env):
-    """Keep only corner cases accepted by the currently loaded range net."""
+def _validate_envelope_condition(labeler, condition: torch.Tensor) -> Optional[torch.Tensor]:
+    """Run the exact rejection-range gate used to create the training bank."""
+    try:
+        return labeler.label(condition[0].detach().cpu())
+    except NoFeasibleHaaEnvelopeError as error:
+        values = ", ".join(f"{value:.3f}" for value in condition[0].detach().cpu().tolist())
+        print(f"[ENVELOPE NONE] [{values}] is not runnable: {error}. Selection was not applied.")
+        return None
+
+
+def _valid_extreme_cases(env, labeler):
+    """Keep only corners accepted by the exact rejection-range algorithm."""
     state = env.haa_range_state
     valid_cases = []
     for name, bounds in EXTREME_ENVELOPE_CASES:
         condition = _extreme_envelope_condition(env, bounds)
-        ranges = state.network(condition)
-        if bool(state._network_range_is_valid(ranges).all()):
+        if _validate_envelope_condition(labeler, condition) is not None:
             valid_cases.append((name, bounds))
         else:
-            print(f"Skipping invalid extreme envelope case: {name}")
+            print(f"Skipping NONE extreme envelope case: {name}")
     if not valid_cases:
         raise RuntimeError("The HAA-range network rejected every extreme envelope case")
     return tuple(valid_cases)
@@ -185,6 +203,13 @@ def main() -> None:
         "default": 1000000,
         "help": "Maximum playback steps; use Esc to stop interactive playback.",
     }, {
+        "name": "--envelope",
+        "type": float,
+        "nargs": 5,
+        "default": None,
+        "metavar": ("FRONT_W", "MIDDLE_W", "BACK_W", "FORWARD_X", "BACKWARD_X"),
+        "help": "Apply one explicit five-parameter envelope after exact rejection-range validation.",
+    }, {
         "name": "--haa_debug_leg",
         "type": str,
         "default": "LF",
@@ -212,19 +237,37 @@ def main() -> None:
     # not evaluated here, matching the current v3 training path.
     env_cfg.commands.resampling_time = 1e9
     env, _ = task_registry.make_env(name=TASK_NAME, args=args, env_cfg=env_cfg)
+    labeler = ApiRangeLabeler(directions=32, margin=.05, tolerance=1e-6, sweep_steps=201)
     command = {"x": 0.0, "y": 0.0, "yaw": 0.0}
-    extreme_cases = _valid_extreme_cases(env)
+    extreme_cases = _valid_extreme_cases(env, labeler)
     case_index = 0
     auto_cycle = args.extreme_case_hold_s > 0.0
     hold_steps = max(1, round(args.extreme_case_hold_s / env.dt)) if auto_cycle else None
     case_name, case_bounds = extreme_cases[case_index]
-    obs = _reset_to_envelope_condition(env, _extreme_envelope_condition(env, case_bounds), command)
+    initial_condition = _extreme_envelope_condition(env, case_bounds)
+    if args.envelope is not None:
+        initial_condition = torch.tensor(args.envelope, dtype=torch.float, device=env.device).view(1, 5)
+        initial_condition = initial_condition.repeat(env.num_envs, 1)
+        if _validate_envelope_condition(labeler, initial_condition) is None:
+            raise ValueError("--envelope is NONE; choose a rejection-range-valid five-vector")
+        case_name = "explicit validated envelope"
+    obs = _reset_to_envelope_condition(env, initial_condition, command)
     if obs.shape[-1] != EXPECTED_OBS_DIM:
         raise RuntimeError(f"Expected {EXPECTED_OBS_DIM} observations, got {obs.shape[-1]}")
 
     train_cfg.runner.resume = True
     runner, _ = task_registry.make_alg_runner(env=env, name=TASK_NAME, args=args, train_cfg=train_cfg)
     policy = runner.get_inference_policy(device=env.device)
+    if EXPORT_POLICY:
+        export_path = os.path.join(
+            LEGGED_GYM_ROOT_DIR,
+            "logs",
+            train_cfg.runner.experiment_name,
+            "exported",
+            "policies",
+        )
+        export_policy_as_jit(runner.alg.policy, export_path)
+        print("Exported policy as jit script to:", export_path)
     _print_help()
     _print_ranges(env, f"initial extreme case 1/{len(extreme_cases)}: {case_name}")
 
