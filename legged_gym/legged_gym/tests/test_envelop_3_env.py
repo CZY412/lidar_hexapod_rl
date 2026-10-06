@@ -9,6 +9,7 @@ extreme range.  It is a simulator smoke test, not a policy-quality benchmark.
 """
 
 import isaacgym  # noqa: F401 -- must precede torch-backed environment imports.
+from isaacgym import gymapi, gymtorch
 import torch
 
 from legged_gym.envs import *  # noqa: F401,F403 -- register tasks.
@@ -17,6 +18,63 @@ from legged_gym.utils import get_args, task_registry
 
 TASK_NAME = "el4090_envelop_3"
 PAIR_TO_LEG = torch.tensor((0, 1, 2, 0, 1, 2), dtype=torch.long)
+PANEL_KEYS = (
+    ("front_width", gymapi.KEY_1),
+    ("middle_width", gymapi.KEY_2),
+    ("back_width", gymapi.KEY_3),
+    ("forward_limit", gymapi.KEY_4),
+    ("backward_limit", gymapi.KEY_5),
+)
+
+
+def _print_control_panel(env, values: torch.Tensor, active: int) -> None:
+    """Print the five-value viewer control panel and the applied V3 posture."""
+    names = env.haa_range_state.condition_names
+    low, high = env.haa_range_state.condition_low, env.haa_range_state.condition_high
+    print("\n=== V3 envelope control panel (focus the Isaac Gym viewer) ===")
+    print("1..5 select parameter | Q decrease | E increase | R random valid | 0 midpoint | P print")
+    for index, (name, _) in enumerate(PANEL_KEYS):
+        marker = ">" if index == active else " "
+        print(f"{marker} {index + 1}. {name:15s} = {values[index].item():+.3f} "
+              f"[{low[index].item():+.3f}, {high[index].item():+.3f}]")
+    target = env._get_condition_target_dof_pos()[0, env.haa_indices]
+    default = env.default_dof_pos[0, env.haa_indices]
+    bias = env.haa_range_bias[0, env.haa_indices]
+    actual = env.dof_pos[0, env.haa_indices]
+    print("HAA actual pose in viewer (red marker) = default + bias:")
+    for leg, dof_index in enumerate(env.haa_indices.tolist()):
+        print(f"  {env.dof_names[dof_index]:6s}: default={default[leg]:+.3f} "
+              f"bias={bias[leg]:+.3f} target={target[leg]:+.3f} actual={actual[leg]:+.3f}")
+
+
+def _apply_panel_values(env, values: torch.Tensor) -> None:
+    """Run envelope -> range network and place the simulator at default+bias."""
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    condition = values.to(device=env.device, dtype=torch.float).unsqueeze(0).repeat(env.num_envs, 1)
+    env.haa_range_state.set_conditions(condition, env_ids)
+    env._refresh_haa_range_bias(env_ids)
+    target = env._get_condition_target_dof_pos()
+    env.embedded_state_default_dof_pos[:] = target
+    env.filtered_embedded_state_default_dof_pos[:] = target
+    env.dof_pos[env_ids] = target[env_ids]
+    env.dof_vel[env_ids] = 0.0
+    env.actions[env_ids] = 0.0
+    env.last_actions[env_ids] = 0.0
+    env.gym.set_dof_state_tensor_indexed(
+        env.sim, gymtorch.unwrap_tensor(env.dof_state),
+        gymtorch.unwrap_tensor(env_ids.to(dtype=torch.int32)), len(env_ids),
+    )
+    env.compute_observations()
+
+
+def _subscribe_panel_keys(env) -> None:
+    for index, (_, key) in enumerate(PANEL_KEYS):
+        env.gym.subscribe_viewer_keyboard_event(env.viewer, key, f"panel_select_{index}")
+    env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_Q, "panel_decrease")
+    env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_E, "panel_increase")
+    env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_R, "panel_random")
+    env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_0, "panel_midpoint")
+    env.gym.subscribe_viewer_keyboard_event(env.viewer, gymapi.KEY_P, "panel_print")
 
 
 def _assert_valid_ranges(env, ranges: torch.Tensor, label: str) -> None:
@@ -49,7 +107,9 @@ def _check_standing_command_sampling(env, rounds: int = 128) -> None:
     standing_count = 0
     total = 0
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
-    threshold = float(env.cfg.rewards.stand_command_threshold)
+    # v1's standing objective uses the environment threshold directly; v3 no
+    # longer carries a separate standing-only reward setting.
+    threshold = float(getattr(env.cfg.rewards, "stand_command_threshold", env.speed_min))
     ranges_before = env.haa_swing_ranges.clone()
     for _ in range(rounds):
         env._resample_commands(env_ids)
@@ -82,8 +142,6 @@ def _standing_diagnostics(env, step: int) -> None:
     )
     names = [env.dof_names[index] for index in sagittal_indices.tolist()]
     offset = env.dof_pos[:, sagittal_indices] - env.default_dof_pos[:, sagittal_indices]
-    minimum_raw = env._reward_base_height_minimum()
-    minimum_scale = float(env.reward_scales["base_height_minimum"])
     print(
         "  env0 envelope: "
         + ", ".join(f"{name}={value:.3f}" for name, value in zip(env.haa_range_state.condition_names, env.envelope_parameters[0].tolist()))
@@ -94,8 +152,7 @@ def _standing_diagnostics(env, step: int) -> None:
     )
     print(
         f"stand step={step}: height mean/min/max="
-        f"{height.mean().item():.3f}/{height.min().item():.3f}/{height.max().item():.3f} m, "
-        f"minimum-height contribution mean={(minimum_raw * minimum_scale).mean().item():.5f}"
+        f"{height.mean().item():.3f}/{height.min().item():.3f}/{height.max().item():.3f} m"
     )
     print(
         "  env0 HFE/KFE offsets from default [rad]: "
@@ -111,7 +168,9 @@ def test_env(args) -> None:
     env_cfg.domain_rand.randomize_friction = False
     env_cfg.domain_rand.randomize_base_mass = False
     env_cfg.domain_rand.push_robots = False
-    env_cfg.commands.envelope_debug_viz = False
+    # In viewer mode draw the five-parameter footprint, HAA range arc, and
+    # actual joint marker so default+bias is visible on the simulated robot.
+    env_cfg.commands.envelope_debug_viz = not args.headless
     env_cfg.commands.resampling_time = 1e9
     env_cfg.env.episode_length_s = 1e9
 
@@ -127,17 +186,9 @@ def test_env(args) -> None:
     assert parameters.shape == (env.num_envs, 5), "missing five-parameter envelope state"
     assert bool(torch.all(parameters >= env.haa_range_state.condition_low)), "sampled envelope below its configured domain"
     assert bool(torch.all(parameters <= env.haa_range_state.condition_high)), "sampled envelope above its configured domain"
-    assert bool(torch.all(env._get_gait_reward_active_mask() == 0.0)), (
-        "gait rewards must start masked immediately after a new HAA range"
+    assert bool(torch.all(env._get_gait_reward_active_mask() == 1.0)), (
+        "v1-style rewards must not be masked after an HAA-range sample"
     )
-    assert bool(torch.all(env._get_haa_range_transition_mask("haa_range_stand_reward_ramp_time") == 0.0)), (
-        "standing rewards must start masked immediately after a new HAA range"
-    )
-    env.haa_range_transition_time[:] = max(
-        env.cfg.rewards.haa_range_gait_reward_ramp_time,
-        env.cfg.rewards.haa_range_stand_reward_ramp_time,
-    )
-    assert bool(torch.all(env._get_gait_reward_active_mask() == 1.0)), "gait reward mask did not recover"
     centers = 0.5 * (sampled[..., 0] + sampled[..., 1])
     target = env._get_condition_target_dof_pos()[:, env.haa_indices]
     assert torch.allclose(target, centers, atol=1e-6), "HAA centre bias does not match sampled interval centres"
@@ -155,8 +206,49 @@ def test_env(args) -> None:
     _check_standing_command_sampling(env)
     env.commands[:, :3] = 0.0
     actions = torch.zeros(env.num_envs, env.num_actions, device=env.device)
+    panel_values = env.envelope_parameters[0].detach().clone()
+    active_panel_parameter = 0
+    panel_step = float(args.panel_step)
+    if not args.headless:
+        _subscribe_panel_keys(env)
+        _apply_panel_values(env, panel_values)
+        _print_control_panel(env, panel_values, active_panel_parameter)
     report_every = max(1, int(args.report_every))
     for step in range(int(args.steps)):
+        if not args.headless:
+            # Poll before env.step(): BaseTask.render() also drains viewer
+            # actions, so this must happen before its render call.
+            panel_changed = False
+            for event in env.gym.query_viewer_action_events(env.viewer):
+                if event.value <= 0:
+                    continue
+                if event.action.startswith("panel_select_"):
+                    active_panel_parameter = int(event.action.rsplit("_", 1)[1])
+                    _print_control_panel(env, panel_values, active_panel_parameter)
+                elif event.action == "panel_decrease":
+                    panel_values[active_panel_parameter] -= panel_step
+                    panel_changed = True
+                elif event.action == "panel_increase":
+                    panel_values[active_panel_parameter] += panel_step
+                    panel_changed = True
+                elif event.action == "panel_random":
+                    bank = env.haa_range_state.valid_conditions
+                    panel_values = bank[torch.randint(bank.shape[0], (), device=env.device)].detach().clone()
+                    panel_changed = True
+                elif event.action == "panel_midpoint":
+                    panel_values = 0.5 * (
+                        env.haa_range_state.condition_low + env.haa_range_state.condition_high
+                    )
+                    panel_changed = True
+                elif event.action == "panel_print":
+                    _print_control_panel(env, panel_values, active_panel_parameter)
+            if panel_changed:
+                panel_values = torch.maximum(
+                    torch.minimum(panel_values, env.haa_range_state.condition_high),
+                    env.haa_range_state.condition_low,
+                )
+                _apply_panel_values(env, panel_values)
+                _print_control_panel(env, panel_values, active_panel_parameter)
         obs, _, reward, _, _ = env.step(actions)
         assert obs.shape == (env.num_envs, 79), f"unexpected step observation shape {tuple(obs.shape)}"
         assert bool(torch.isfinite(obs).all()), "step observation contains NaN or Inf"
@@ -172,12 +264,15 @@ def test_env(args) -> None:
 
 if __name__ == "__main__":
     args = get_args([
-        {"name": "--steps", "type": int, "default": 1000, "help": "Zero-action simulator steps after validation."},
+        {"name": "--steps", "type": int, "default": 1000000,
+         "help": "Zero-action simulator steps after validation; use Ctrl+C or close the viewer to stop."},
         {"name": "--report_every", "type": int, "default": 100, "help": "Print standing diagnostics every N steps."},
+        {"name": "--panel_step", "type": float, "default": 0.01,
+         "help": "Increment in metres for Q/E envelope-panel adjustments."},
     ])
     args.task = TASK_NAME
     # ``get_args`` already owns --num_envs. Keep this smoke test small unless
     # the caller explicitly supplies its built-in override.
     if args.num_envs is None:
-        args.num_envs = 3
+        args.num_envs = 1
     test_env(args)

@@ -230,54 +230,8 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
             self.sim, gymtorch.unwrap_tensor(self.dof_state), gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32),
         )
 
-    def _reward_haa_range_violation(self) -> torch.Tensor:
-        """Gently discourage leaving the sampled HAA interval.
-
-        The old clipped quadratic saturated for a large initial violation, so
-        it supplied no distinction between "slightly outside" and "far
-        outside".  This Huber penalty remains smooth at the boundary and is
-        annealed from a small weight, allowing early walking exploration.
-        """
-        lower, upper = self.haa_swing_ranges[..., 0], self.haa_swing_ranges[..., 1]
-        outside = torch.relu(lower - self.dof_pos[:, self.haa_indices])
-        outside += torch.relu(self.dof_pos[:, self.haa_indices] - upper)
-        softness = max(float(getattr(self.cfg.rewards, "haa_range_violation_softness", 0.25)), 1e-6)
-        normalized = outside / softness
-        huber = torch.where(
-            normalized <= 1.0,
-            0.5 * torch.square(normalized),
-            normalized - 0.5,
-        )
-        initial = float(getattr(self.cfg.rewards, "haa_range_violation_initial_weight", 0.10))
-        warmup_steps = max(int(getattr(self.cfg.rewards, "haa_range_violation_warmup_steps", 1)), 1)
-        progress = min(float(self.common_step_counter) / warmup_steps, 1.0)
-        curriculum_weight = initial + (1.0 - initial) * progress
-        return torch.mean(huber, dim=1) * curriculum_weight
-
-    def _reward_haa_range_compliance(self) -> torch.Tensor:
-        """Reward being anywhere in the safe interior, without a pose target."""
-        lower, upper = self.haa_swing_ranges[..., 0], self.haa_swing_ranges[..., 1]
-        margin = float(getattr(self.cfg.rewards, "haa_range_compliance_margin", 0.04))
-        # The sampled minimum width is 0.2 rad, so this remains a non-empty
-        # interior with the default 0.04 rad margin.
-        interior_lower, interior_upper = lower + margin, upper - margin
-        signed_interior_distance = torch.minimum(
-            self.dof_pos[:, self.haa_indices] - interior_lower,
-            interior_upper - self.dof_pos[:, self.haa_indices],
-        )
-        softness = max(float(getattr(self.cfg.rewards, "haa_range_compliance_softness", 0.04)), 1e-6)
-        return torch.mean(torch.sigmoid(signed_interior_distance / softness), dim=1)
-
     def _reward_envelope_constraint(self) -> torch.Tensor:
-        """Return planar foot penetration outside the sampled envelope.
-
-        V3 does not expose its five envelope parameters to the policy, but the
-        simulator keeps them in ``envelope_parameters``.  The reward therefore
-        uses the same sampled input that was passed to the HAA-range network,
-        rather than attempting to reconstruct an envelope from its six output
-        intervals.  A positive ``envelope_constraint_margin`` is a tolerance:
-        it expands the allowable footprint by that many metres on every face.
-        """
+        """V1 envelope penalty, adapted to V3's symmetric five-value input."""
         values = self.envelope_parameters
         names = self.haa_range_state.condition_names
         index = {name: position for position, name in enumerate(names)}
@@ -303,11 +257,9 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         ).reshape(self.num_envs, -1, 3)
         foot_x, foot_y = foot_local[..., 0], foot_local[..., 1]
 
-        # The footprint is the symmetric hexagon
-        # (x_front, +/-front_width), (0, +/-middle_width),
-        # (x_back, +/-back_width).  Clamp x for the lateral interpolation so
-        # a foot beyond an end cap incurs independent longitudinal and lateral
-        # excess instead of extrapolating a sloped side indefinitely.
+        # V1's piecewise-linear footprint calculation.  V3 stores a single
+        # half-width for each longitudinal station, so its left/right bounds
+        # are the corresponding positive/negative values.
         x_on_footprint = torch.clamp(foot_x, min=x_back, max=x_front)
         back_fraction = (x_on_footprint - x_back) / (-x_back).clamp_min(1e-6)
         front_fraction = x_on_footprint / x_front.clamp_min(1e-6)
@@ -315,156 +267,63 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         half_width_front = middle_width + front_fraction * (front_width - middle_width)
         half_width = torch.where(x_on_footprint >= 0.0, half_width_front, half_width_back)
 
-        x_excess = torch.relu(x_back - foot_x) + torch.relu(foot_x - x_front)
-        y_excess = torch.relu(torch.abs(foot_y) - half_width)
-        # Keep the error in metres rather than squaring it. The squared form
-        # made ordinary centimetre-scale violations almost invisible after
-        # averaging over six feet, so it did not give the policy a useful
-        # incentive to recover into the footprint.
-        penalty = torch.mean(x_excess + y_excess, dim=1)
+        x_violation = torch.relu(x_back - foot_x) + torch.relu(foot_x - x_front)
+        y_violation = torch.relu(-half_width - foot_y) + torch.relu(foot_y - half_width)
+        penalty = torch.mean(torch.square(x_violation) + torch.square(y_violation), dim=1)
 
         min_command = float(getattr(self.cfg.rewards, "envelope_constraint_min_command", 0.0))
         if min_command > 0.0:
-            # Include yaw: turning needs the same footprint protection even
-            # when its linear-velocity command is zero.
-            moving = torch.linalg.vector_norm(self.commands[:, :3], dim=1) > min_command
+            moving = torch.norm(self.commands[:, :2], dim=1) > min_command
             penalty = penalty * moving.to(penalty.dtype)
-        return penalty * self._get_envelope_constraint_transition_mask()
+        return penalty
 
-    def _reward_haa_range_swing(self) -> torch.Tensor:
-        """Reward useful HAA motion while withholding reward near range edges.
+    def _reward_embedded_state_dof_pos(self) -> torch.Tensor:
+        """Keep every joint near V3's ``default_pos + HAA bias`` posture.
 
-        Motion has to reach ``target_excursion_ratio`` of the available
-        half-range to receive its full excursion factor. The final
-        ``boundary_buffer_ratio`` of either side receives no swing reward, so
-        rapidly rubbing an interval edge cannot be a rewarding strategy.
+        The HAA centre bias is the only morphology change in V3.  HFE and KFE
+        are deliberately compared to their unmodified default positions using
+        the tighter base tolerance, rather than being skipped with HAA.
+        """
+        target = self._get_condition_target_dof_pos()
+        pos_error = torch.abs(self.dof_pos - target)
+        base_tolerance = float(getattr(self.cfg.rewards, "embedded_state_dof_pos_tolerance", 0.0))
+        tolerance = torch.full_like(pos_error, base_tolerance)
+        haa_tolerance = float(getattr(self.cfg.rewards, "embedded_state_haa_pos_tolerance", base_tolerance))
+        tolerance[:, self.haa_indices] = haa_tolerance
+        return torch.mean(torch.square(torch.clamp(pos_error - tolerance, min=0.0)), dim=1)
+
+    def _reward_embedded_state_dof_vel(self) -> torch.Tensor:
+        """Apply V1's recovery-speed cost against the same V3 target."""
+        target = self._get_condition_target_dof_pos()
+        pos_error = torch.mean(torch.abs(self.dof_pos - target), dim=1)
+        transition_mask = (
+            pos_error > getattr(self.cfg.rewards, "structure_transition_error_threshold", 0.05)
+        ).float()
+        return torch.mean(torch.square(self.dof_vel), dim=1) * transition_mask
+
+    def _reward_morphology_haa_range(self) -> torch.Tensor:
+        """Penalize actual HAA positions outside their network-predicted ranges.
+
+        The name is retained for compatibility with v1 experiment configs;
+        V3 has no mammal prior.  Unlike action-target clipping, this checks
+        the simulated joint position, so overshoot is still penalized.
         """
         lower, upper = self.haa_swing_ranges[..., 0], self.haa_swing_ranges[..., 1]
-        center = 0.5 * (lower + upper)
-        half_range = (0.5 * (upper - lower)).clamp_min(1e-6)
-        normalized_excursion = torch.abs(self.dof_pos[:, self.haa_indices] - center) / half_range
-
-        target_excursion = float(getattr(
-            self.cfg.rewards, "haa_range_swing_target_excursion_ratio", 0.65,
-        ))
-        boundary_buffer = float(getattr(
-            self.cfg.rewards, "haa_range_swing_boundary_buffer_ratio", 0.12,
-        ))
-        target_excursion = min(max(target_excursion, 1e-6), 1.0)
-        boundary_buffer = min(max(boundary_buffer, 1e-6), 1.0 - 1e-6)
-        excursion_factor = torch.clamp(normalized_excursion / target_excursion, max=1.0)
-        interior_factor = torch.clamp(
-            (1.0 - normalized_excursion) / boundary_buffer,
-            min=0.0,
-            max=1.0,
-        )
-        velocity_clip = max(float(getattr(
-            self.cfg.rewards, "haa_range_swing_velocity_clip", 4.0,
-        )), 1e-6)
-        velocity_factor = torch.clamp(
-            torch.abs(self.dof_vel[:, self.haa_indices]) / velocity_clip,
-            max=1.0,
-        )
-        # This is deliberately gated by fore/aft command only.  Lateral
-        # tracking and yawing already have their own objectives; rewarding
-        # HAA activity for them made unnecessary inward/outward leg motions a
-        # viable way to collect this reward.
-        min_forward_command = float(getattr(
-            self.cfg.rewards, "haa_range_swing_min_forward_command", 0.10,
-        ))
-        forward_commanded = (
-            torch.abs(self.commands[:, 0]) > min_forward_command
-        ).to(self.dof_pos.dtype)
-        return (
-            torch.mean(velocity_factor * excursion_factor * interior_factor, dim=1)
-            * forward_commanded
-        )
-
-    def _reward_dof_pos_limits(self) -> torch.Tensor:
-        """Keep generic joint-limit protection for HFE/KFE, not HAA ranges.
-
-        HAA's only task-specific position constraint is now
-        ``_reward_haa_range_violation`` above.
-        """
-        out_of_limits = -(self.dof_pos - self.dof_pos_limits[:, 0]).clip(max=0.0)
-        out_of_limits += (self.dof_pos - self.dof_pos_limits[:, 1]).clip(min=0.0)
-        out_of_limits[:, self.haa_indices] = 0.0
-        return torch.sum(out_of_limits, dim=1)
-
-    def _reward_stand_still(self) -> torch.Tensor:
-        """Penalize pose error, joint motion, and action changes at standstill."""
-        pose_cost = torch.sum(torch.abs(self.dof_pos - self._get_condition_target_dof_pos()), dim=1)
-        velocity_weight = float(getattr(self.cfg.rewards, "stand_still_dof_vel_weight", 0.05))
-        action_weight = float(getattr(self.cfg.rewards, "stand_still_action_rate_weight", 0.10))
-        velocity_cost = velocity_weight * torch.sum(torch.square(self.dof_vel), dim=1)
-        action_cost = action_weight * torch.sum(torch.square(self.actions - self.last_actions), dim=1)
-        threshold = float(getattr(self.cfg.rewards, "stand_command_threshold", self.speed_min))
-        standing = torch.linalg.vector_norm(self.commands[:, :3], dim=1) < threshold
-        return (pose_cost + velocity_cost + action_cost) * standing
+        haa_pos = self.dof_pos[:, self.haa_indices]
+        violation = torch.relu(lower - haa_pos) + torch.relu(haa_pos - upper)
+        return torch.mean(torch.square(violation), dim=1)
 
     def _reward_stand_contact(self) -> torch.Tensor:
-        """At rest, require both legs in every front/middle/rear pair to load."""
-        threshold = float(getattr(self.cfg.rewards, "stand_contact_threshold", 10.0))
-        pair_threshold = float(getattr(self.cfg.rewards, "stand_pair_force_threshold", 30.0))
+        """At zero or near-zero command, require six-foot contact and equal load."""
         command_threshold = float(getattr(self.cfg.rewards, "stand_command_threshold", self.speed_min))
-        normal_forces = self.contact_forces[:, self.feet_indices, 2].clamp_min(0.0)
-        loaded_feet = normal_forces >= threshold
+        force_threshold = float(getattr(self.cfg.rewards, "stand_contact_threshold", 10.0))
         standing = torch.linalg.vector_norm(self.commands[:, :3], dim=1) < command_threshold
-        # Foot order is [LB, LF, LM, RB, RF, RM].  Each pair must have both
-        # feet loaded and enough combined force; a middle-leg biped therefore
-        # cannot pass as a stationary six-leg pose.
-        leg_pairs = ((1, 4), (2, 5), (0, 3))  # front, middle, rear
-        missing_loaded_feet = (~loaded_feet).sum(dim=1).to(normal_forces.dtype)
-        invalid_pairs = torch.zeros(self.num_envs, device=self.device, dtype=normal_forces.dtype)
-        for pair in leg_pairs:
-            pair_loaded = loaded_feet[:, pair].all(dim=1)
-            pair_loaded &= normal_forces[:, pair].sum(dim=1) >= pair_threshold
-            invalid_pairs += (~pair_loaded).to(normal_forces.dtype)
-        return (missing_loaded_feet + invalid_pairs) * standing * self._get_gait_reward_active_mask()
 
-    def _reward_tripod_contact_pattern(self) -> torch.Tensor:
-        """Require the active support phase to be a complete front/middle/rear tripod."""
-        contact_threshold = float(getattr(self.cfg.rewards, "tripod_contact_threshold", 1.0))
-        support_threshold = float(getattr(self.cfg.rewards, "support_foot_force_threshold", 10.0))
-        min_command = float(getattr(self.cfg.rewards, "tripod_contact_min_command", 0.1))
         normal_forces = self.contact_forces[:, self.feet_indices, 2].clamp_min(0.0)
-        contact = (normal_forces > contact_threshold).to(self.dof_pos.dtype)
-        supporting = (normal_forces >= support_threshold).to(self.dof_pos.dtype)
-        group1, group2 = contact[:, self.tripod_group1_indices], contact[:, self.tripod_group2_indices]
-        group1_same = torch.var(group1, dim=1, unbiased=False)
-        group2_same = torch.var(group2, dim=1, unbiased=False)
-        group_opposite = torch.square(group1.mean(dim=1) + group2.mean(dim=1) - 1.0)
-
-        forces_g1 = normal_forces[:, self.tripod_group1_indices]
-        forces_g2 = normal_forces[:, self.tripod_group2_indices]
-        active_support = torch.where(
-            (forces_g1.sum(dim=1) >= forces_g2.sum(dim=1)).unsqueeze(1),
-            supporting[:, self.tripod_group1_indices],
-            supporting[:, self.tripod_group2_indices],
-        )
-        missing_support_legs = 3.0 - active_support.sum(dim=1)
-        moving = torch.linalg.vector_norm(self.commands[:, :2], dim=1) > min_command
-        return (
-            group1_same + group2_same + group_opposite + missing_support_legs
-        ) * moving.to(self.dof_pos.dtype) * self._get_gait_reward_active_mask()
-
-    def _reward_contact_force_balance(self) -> torch.Tensor:
-        """Penalize missing or uneven load within the active support tripod."""
-        min_command = float(getattr(self.cfg.rewards, "tripod_contact_min_command", 0.1))
-        min_force = float(getattr(self.cfg.rewards, "support_foot_force_threshold", 10.0))
-        normal_forces = self.contact_forces[:, self.feet_indices, 2].clamp_min(0.0)
-        forces_g1 = normal_forces[:, self.tripod_group1_indices]
-        forces_g2 = normal_forces[:, self.tripod_group2_indices]
-        active_forces = torch.where(
-            (forces_g1.sum(dim=1) >= forces_g2.sum(dim=1)).unsqueeze(1), forces_g1, forces_g2
-        )
-        minimum_load_error = torch.relu(min_force - active_forces).sum(dim=1) / min_force
-        force_shares = active_forces / active_forces.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        equal_share_error = 3.0 * torch.square(force_shares - 1.0 / 3.0).sum(dim=1)
-        moving = torch.linalg.vector_norm(self.commands[:, :2], dim=1) > min_command
-        return (
-            minimum_load_error + equal_share_error
-        ) * moving.to(self.dof_pos.dtype) * self._get_gait_reward_active_mask()
+        missing_contacts = (normal_forces < force_threshold).sum(dim=1).to(normal_forces.dtype)
+        force_shares = normal_forces / normal_forces.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        equal_load_error = 6.0 * torch.sum(torch.square(force_shares - 1.0 / 6.0), dim=1)
+        return (missing_contacts + equal_load_error) * standing.to(normal_forces.dtype)
 
     def _envelope_debug_points_world(self, env_id: int) -> np.ndarray:
         """Convert v3's five sampled envelope values into a ground footprint."""
@@ -591,12 +450,3 @@ class EL_4090_ENVELOP_3(EL_4090_ENVELOP):
         self._haa_vis_joint_names = tuple(EL4090_JOINT_NAMES)
         self._haa_vis_leg_names = tuple(EL4090_LEG_NAMES)
         self._haa_arc_geometry = haa_arc_geometry
-
-    def _reward_base_height(self) -> torch.Tensor:
-        base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
-        return torch.square(base_height - self._get_base_height_target())
-
-    def _reward_base_height_minimum(self) -> torch.Tensor:
-        base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
-        minimum = float(getattr(self.cfg.rewards, "minimum_base_height", 0.50))
-        return torch.square(torch.clamp(minimum - base_height, min=0.0))

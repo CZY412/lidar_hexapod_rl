@@ -44,9 +44,9 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
             ang_vel_yaw = [-1.0, 1.0]
             heading = [-3.14, 3.14]
 
-        # Keep this off during the locomotion-learning stage.  Enable it for a
-        # later standing fine-tune: 5% of resamples then become half exact-zero
-        # and half near-zero commands.
+        # Do not inject standing commands during locomotion training.  The
+        # standing-contact reward remains available for externally supplied
+        # zero or near-zero commands.
         enable_stand_commands = False
         stand_command_probability = 0.05
         stand_command_exact_zero_fraction = 0.5
@@ -84,105 +84,69 @@ class El4090Envelop3Cfg(El4090EnvelopCfg):
         default_joint_angles = {
             "RF_HAA": 0.0, "RM_HAA": 0.0, "RB_HAA": 0.0,
             "LF_HAA": 0.0, "LM_HAA": 0.0, "LB_HAA": 0.0,
-            "RF_HFE": 0.3020, "RM_HFE": 0.3020, "RB_HFE": 0.3020,
-            "LF_HFE": 0.3020, "LM_HFE": 0.3020, "LB_HFE": 0.3020,
-            "RF_KFE": -0.2708, "RM_KFE": -0.2708, "RB_KFE": -0.2708,
-            "LF_KFE": -0.2708, "LM_KFE": -0.2708, "LB_KFE": -0.2708,
+            "RF_HFE": 0.3022, "RM_HFE": 0.3022, "RB_HFE": 0.3022,
+            "LF_HFE": 0.3022, "LM_HFE": 0.3022, "LB_HFE": 0.3022,
+            "RF_KFE": -0.3018, "RM_KFE": -0.3018, "RB_KFE": -0.3018,
+            "LF_KFE": -0.3018, "LM_KFE": -0.3018, "LB_KFE": -0.3018,
         }
 
     class rewards(El4090EnvelopCfg.rewards):
-        # One shared reset, observation, and reward target height.
+        # Keep the v1 locomotion objective.  V3 only changes how the HAA
+        # interval is sampled and observed; it does not add a second gait or
+        # posture objective on top of v1.
         target_height = 0.53
-        # No cost at/above this clearance; apply a strong quadratic penalty
-        # below it. This remains independent of the cruising-height target.
-        minimum_base_height = 0.50
-
-        # HAA range curriculum: keep the policy inside its sampled box without
-        # prescribing a centre point or a particular HAA swing trajectory.
-        haa_range_violation_softness = 0.25  # rad; Huber transition scale
-        haa_range_violation_initial_weight = 0.10
-        haa_range_violation_warmup_steps = 100000
-        haa_range_compliance_margin = 0.04  # keep a small buffer from edges
-        haa_range_compliance_softness = 0.04  # rad; soft in/out transition
-        # During commanded fore/aft locomotion, make use of the available HAA
-        # travel instead of merely resting at the interval centre.  The swing
-        # reward is zero close to either limit, so it cannot be harvested by
-        # repeatedly pushing into a range boundary.
-        haa_range_swing_target_excursion_ratio = 0.50
-        haa_range_swing_boundary_buffer_ratio = 0.15
-        haa_range_swing_velocity_clip = 4.0
-        haa_range_swing_min_forward_command = 0.10
-
-        # Feet are constrained by the five sampled (hidden) envelope values,
-        # independently of the HAA interval reward.  Positive margin is a
-        # geometric tolerance outside the footprint, in metres.
-        envelope_constraint_margin = 0.0
-        envelope_constraint_min_command = 0.15
-        # When a runtime caller replaces the five hidden envelope inputs, the
-        # feet cannot satisfy a newly smaller footprint in the same control
-        # tick.  Restore this penalty linearly after the replacement.
-        envelope_constraint_reward_ramp_time = 0.4
-
-        # A direct range resample changes the HAA-centre bias discontinuously.
-        # Only gait/standing objectives ramp during the resulting adjustment;
-        # safety, tracking, and HAA-bound objectives remain active.
-        haa_range_gait_reward_ramp_time = 0.4
-        haa_range_stand_reward_ramp_time = 0.2
-
-        feet_air_time_target = 0.1
-        stand_command_threshold = 0.1
-        # Binary contact detects foot events.  Support terms use a higher
-        # force so a lightly touching front/back toe cannot satisfy them.
-        stand_contact_threshold = 10.0
-        stand_pair_force_threshold = 30.0
-        support_foot_force_threshold = 10.0
+        max_contact_force = 400.0
+        feet_air_time_target = 0.25
         tripod_contact_threshold = 1.0
         tripod_contact_min_command = 0.1
-        stand_still_dof_vel_weight = 0.05
-        stand_still_action_rate_weight = 0.10
-
+        envelope_constraint_margin = 0.0
+        envelope_constraint_min_command = 0.15
+        stand_command_threshold = 0.1
+        stand_contact_threshold = 10.0
+        # Embedded-state target is ``default_dof_pos + haa_range_bias``.
+        # HFE/KFE keep the base tolerance; only HAA receives the wider range.
+        embedded_state_dof_pos_tolerance = 0.12
+        embedded_state_haa_pos_tolerance = 0.35
+        structure_transition_error_threshold = 0.10
 
         class scales:
             termination = -0.0
-            collision = -1  # PhysX contact penalty; includes self-collisions
+            collision = -1.0
             tracking_lin_vel = 6
             tracking_ang_vel = 2.5
 
             lin_vel_z = -2
-            ang_vel_xy = -1.5
+            ang_vel_xy = -0.1
             orientation = -5
             base_height = -50
-            base_height_minimum = -200
 
             torques = -1e-5
             dof_vel = -1e-5
             dof_acc = -1e-7
-            action_rate = -0.003
- 
             feet_slip = -0.05
-            feet_air_time = 1.0
+            feet_air_time = 3.0
 
+            embedded_state_dof_pos = -5.0
+            embedded_state_dof_vel = -0.02
+            # Reuse the v1 reward slot to keep actual HAA positions inside
+            # the per-leg interval inferred by the range network.
+            morphology_haa_range = -3.0
+
+            collision = -1.0
+            action_rate = -0.001
             stand_still = -1.5
             stand_contact = -1.0
-            feet_contact_forces = -0.5
-
-            feet_async = -0.07
-            feet_sync = -0.07
-            tripod_contact_pattern = -2.5
-            contact_force_balance = -1.0
 
             dof_pos_limits = -0.5
             dof_vel_limits = -0.1
             torque_limits = -0.01
+            feet_contact_forces = -0.05
 
-            haa_range_violation = -1.5
-            # Keep the interval an interior constraint, not a static posture
-            # target.  A separate, forward-command-gated term rewards useful
-            # in-range HAA motion.
-            haa_range_compliance = 0.08
-            haa_range_swing = 0.50
-            
-            envelope_constraint = -20.
+            feet_async = -0.05
+            feet_sync = -0.05
+            tripod_contact_pattern = -2.0
+
+            envelope_constraint = -20.0
 
 
 class El4090Envelop3CfgPPO(El4090EnvelopCfgPPO):
